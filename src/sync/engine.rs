@@ -28,7 +28,9 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 
 use super::merge::{merge_text, merge_value};
-use super::{Backend, Conflict, NoteData, RemoteNote, Snapshot};
+use super::{Backend, Conflict, RemoteNote, Snapshot};
+#[cfg(test)]
+use super::NoteData;
 use crate::model::{new_id, Folder, Note, NoteSync, Store, Tombstone};
 
 const MAX_ROUNDS: usize = 4;

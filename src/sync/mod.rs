@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod bitwarden;
+pub mod cloudkit;
 pub mod engine;
 pub mod merge;
 pub mod sqlite;
@@ -28,6 +29,8 @@ pub enum BackendConfig {
     Bitwarden(bitwarden::Config),
     /// A SQLite database file, e.g. on a network share or in a synced folder.
     Sqlite(sqlite::Config),
+    /// Records in a CloudKit container's private database.
+    CloudKit(cloudkit::Config),
 }
 
 impl BackendConfig {
@@ -36,6 +39,7 @@ impl BackendConfig {
             BackendConfig::Local => "Local",
             BackendConfig::Bitwarden(_) => "Bitwarden",
             BackendConfig::Sqlite(_) => "SQLite",
+            BackendConfig::CloudKit(_) => "CloudKit",
         }
     }
 }
@@ -158,5 +162,6 @@ pub fn open(config: &BackendConfig, secret: Option<String>) -> anyhow::Result<Bo
         BackendConfig::Local => anyhow::bail!("the local account isn't synced"),
         BackendConfig::Bitwarden(c) => Ok(Box::new(bitwarden::BitwardenBackend::open(c, secret)?)),
         BackendConfig::Sqlite(c) => Ok(Box::new(sqlite::SqliteBackend::open(c)?)),
+        BackendConfig::CloudKit(c) => Ok(Box::new(cloudkit::CloudKitBackend::open(c, secret)?)),
     }
 }
