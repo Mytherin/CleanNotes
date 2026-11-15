@@ -67,6 +67,11 @@ pub struct App {
     worker: Worker,
     pub location: Location,
     pub selected: Option<String>,
+    /// Notes selected together with Ctrl+Click or Shift+Click (including
+    /// `selected`); empty when just one note is selected.
+    pub multi: Vec<String>,
+    /// Where a Shift+Click range starts.
+    anchor: Option<String>,
     pub editor: Option<Editor>,
     pub focus: Pane,
     /// The toolbar search (searches all notes).
@@ -130,6 +135,8 @@ impl App {
             db,
             worker,
             selected: None,
+            multi: Vec::new(),
+            anchor: None,
             editor: None,
             focus: Pane::List,
             search: String::new(),
@@ -277,9 +284,15 @@ impl App {
     }
 
     pub fn select(&mut self, id: Option<String>) {
+        self.anchor = id.clone();
         if self.selected == id {
+            if !self.multi.is_empty() {
+                self.multi.clear();
+                self.editor = id.and_then(|id| self.store.note(&id).map(|n| Editor::new(&id, &n.body)));
+            }
             return;
         }
+        self.multi.clear();
         self.flush_editor();
         // A new note left empty goes away.
         if let Some(old) = self.selected.take() {
@@ -351,6 +364,65 @@ impl App {
         e.focus_requested = true;
         self.editor = Some(e);
         self.focus = Pane::Note;
+    }
+
+    /// The selected notes: several after Ctrl/Shift+Click, else the one.
+    pub fn selected_ids(&self) -> Vec<String> {
+        if self.multi.len() > 1 {
+            self.multi.clone()
+        } else {
+            self.selected.iter().cloned().collect()
+        }
+    }
+
+    pub fn is_selected(&self, id: &str) -> bool {
+        if self.multi.len() > 1 {
+            self.multi.iter().any(|m| m == id)
+        } else {
+            self.selected.as_deref() == Some(id)
+        }
+    }
+
+    /// A click on a note in the list or gallery: Ctrl+Click adds or removes
+    /// it, Shift+Click selects everything from the last plain click to it.
+    pub fn click_note(&mut self, id: &str, m: egui::Modifiers) {
+        if m.shift {
+            let anchor = self.anchor.clone().or_else(|| self.selected.clone()).unwrap_or_else(|| id.to_owned());
+            let a = self.shown.iter().position(|s| *s == anchor);
+            let b = self.shown.iter().position(|s| s == id);
+            let range = match (a, b) {
+                (Some(a), Some(b)) => self.shown[a.min(b)..=a.max(b)].to_vec(),
+                _ => vec![id.to_owned()],
+            };
+            self.set_multi(range, id, Some(anchor));
+        } else if m.command {
+            let mut set = self.selected_ids();
+            if let Some(i) = set.iter().position(|s| s == id) {
+                if set.len() > 1 {
+                    set.remove(i);
+                }
+            } else {
+                set.push(id.to_owned());
+            }
+            let primary = if set.iter().any(|s| s == id) { id.to_owned() } else { set.last().cloned().unwrap_or_default() };
+            self.set_multi(set, &primary, Some(id.to_owned()));
+        } else {
+            self.select(Some(id.to_owned()));
+        }
+    }
+
+    /// Selects `set` (in list order), showing `primary` if it's just one.
+    fn set_multi(&mut self, mut set: Vec<String>, primary: &str, anchor: Option<String>) {
+        set.sort_by_key(|s| self.shown.iter().position(|x| x == s).unwrap_or(usize::MAX));
+        set.dedup();
+        self.select(Some(primary.to_owned()));
+        self.anchor = anchor;
+        if set.len() > 1 {
+            self.flush_editor();
+            self.editor = None;
+            self.format_open = false;
+            self.multi = set;
+        }
     }
 
     pub fn duplicate_note(&mut self, id: &str) {
@@ -426,7 +498,10 @@ impl App {
             let folder = self.store.note(&notes[0].0).map(|n| n.folder.clone()).unwrap_or_default();
             self.go_to(Location::Folder(folder));
         }
-        self.select(Some(notes[0].0.clone()));
+        let ids: Vec<String> = notes.iter().map(|(id, ..)| id.clone()).collect();
+        // `shown` is last frame's list, so put the notes in it for ordering.
+        self.shown = self.visible_notes();
+        self.set_multi(ids, &notes[0].0, Some(notes[0].0.clone()));
         self.focus = Pane::List;
         self.redo_deletes.push(Deletion { notes, location: d.location });
         true
@@ -489,6 +564,12 @@ impl App {
             n.pinned = !n.pinned;
             n.touch();
             self.unsaved.insert(id.to_owned());
+        }
+    }
+
+    pub fn move_notes(&mut self, ids: &[String], folder: &str) {
+        for id in ids {
+            self.move_note(id, folder);
         }
     }
 
@@ -819,9 +900,7 @@ impl App {
             }
         }
         if pressed(cmd, Key::Backspace) || pressed(cmd, Key::Delete) {
-            if let Some(id) = self.selected.clone() {
-                self.delete_notes(vec![id]);
-            }
+            self.delete_notes(self.selected_ids());
         }
         // The notes list.
         if self.focus == Pane::List && self.rename.is_none() && !ctx.wants_keyboard_input() {
@@ -831,10 +910,21 @@ impl App {
             if pressed(Modifiers::NONE, Key::ArrowUp) {
                 self.step_selection(-1);
             }
+            // Shift+↑/↓ select a range, like Shift+Click.
+            if pressed(Modifiers::SHIFT, Key::ArrowDown) {
+                self.extend_selection(1);
+            }
+            if pressed(Modifiers::SHIFT, Key::ArrowUp) {
+                self.extend_selection(-1);
+            }
+            if pressed(cmd, Key::A) && !self.shown.is_empty() {
+                let all = self.shown.clone();
+                let primary = self.selected.clone().unwrap_or_else(|| all[0].clone());
+                let anchor = self.anchor.clone();
+                self.set_multi(all, &primary, anchor);
+            }
             if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
-                if let Some(id) = self.selected.clone() {
-                    self.delete_notes(vec![id]);
-                }
+                self.delete_notes(self.selected_ids());
             }
             if pressed(Modifiers::NONE, Key::Enter) || pressed(Modifiers::NONE, Key::Tab) {
                 if let Some(e) = &mut self.editor {
@@ -843,6 +933,21 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Grows or shrinks a Shift selection by one note.
+    fn extend_selection(&mut self, d: i32) {
+        let shown = self.shown.clone();
+        let Some(cur) = self.selected.clone() else { return self.step_selection(d) };
+        let anchor = self.anchor.clone().unwrap_or_else(|| cur.clone());
+        // The moving end is the selected note farthest from the anchor.
+        let ids = self.selected_ids();
+        let a = shown.iter().position(|s| *s == anchor).unwrap_or(0);
+        let end = ids.iter().filter_map(|s| shown.iter().position(|x| x == s)).max_by_key(|&i| (i as i64 - a as i64).abs()).unwrap_or(a);
+        let next = (end as i64 + d as i64).clamp(0, shown.len() as i64 - 1) as usize;
+        let range = shown[a.min(next)..=a.max(next)].to_vec();
+        self.set_multi(range, &shown[next].clone(), Some(anchor));
+        self.scroll_list = true;
     }
 
     fn step_selection(&mut self, d: i32) {

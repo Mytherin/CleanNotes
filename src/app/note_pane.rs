@@ -65,6 +65,10 @@ impl App {
 
         let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::LEFT)));
+        if self.multi.len() > 1 {
+            self.several_selected(&mut child, p, area);
+            return;
+        }
         let Some(id) = self.selected.clone() else {
             let msg = if self.shown.is_empty() { "" } else { "No Note Selected" };
             child.painter().text(area.center(), Align2::CENTER_CENTER, msg, theme::font(15.0), p.secondary);
@@ -101,6 +105,29 @@ impl App {
             }
         }
         self.link_sheet(ui.ctx(), p);
+    }
+
+    /// With several notes selected: a little stack of them and a count.
+    fn several_selected(&self, ui: &mut Ui, p: &Palette, area: Rect) {
+        let c = area.center() - Vec2::new(0.0, 40.0);
+        let painter = ui.painter();
+        let n = self.multi.len();
+        for i in (0..n.min(3)).rev() {
+            let off = i as f32 * 8.0;
+            let r = Rect::from_center_size(c + Vec2::new(off, -off), Vec2::new(120.0, 150.0));
+            painter.rect(r, 10.0, p.card, egui::Stroke::new(1.0_f32, p.separator));
+            if i == 0 {
+                let title = self.store.note(&self.multi[0]).map(|n| n.title()).unwrap_or_default();
+                let t = super::sidebar::truncate(&title, 100.0, ui);
+                painter.text(r.left_top() + Vec2::new(10.0, 14.0), Align2::LEFT_CENTER, t, theme::bold_font(10.5), p.text);
+                for k in 0..5 {
+                    let y = r.top() + 32.0 + k as f32 * 12.0;
+                    let w = if k == 4 { 50.0 } else { 96.0 };
+                    painter.line_segment([Pos2::new(r.left() + 10.0, y), Pos2::new(r.left() + 10.0 + w, y)], egui::Stroke::new(3.0_f32, p.separator));
+                }
+            }
+        }
+        painter.text(c + Vec2::new(0.0, 110.0), Align2::CENTER_CENTER, format!("{n} Notes Selected"), theme::font(15.0), p.secondary);
     }
 
     fn deleted_banner(&mut self, ui: &mut Ui, p: &Palette, id: &str) {

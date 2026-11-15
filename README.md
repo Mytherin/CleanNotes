@@ -45,6 +45,7 @@ Ctrl on Windows and Linux is ⌘ on macOS.
 | Ctrl+Backspace (Delete or Backspace in the list) | Delete note |
 | Ctrl+Z, Ctrl+Shift+Z (in the list or sidebar) | Undo, redo deleting notes: they come back pinned and dated as before |
 | ↑ / ↓, Enter or Tab | Move through the list, go into the note |
+| Ctrl+Click, Shift+Click, Shift+↑/↓, Ctrl+A (in the list) | Select several notes: add or remove one, or a range; then delete, move (drag or "Move to"), pin or copy them together |
 | Ctrl+, | Settings |
 | Ctrl+Shift+T / H / J / B | Title / Heading / Subheading / Body |
 | Ctrl+Shift+M | Monospaced |

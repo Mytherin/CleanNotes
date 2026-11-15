@@ -7,9 +7,9 @@ use super::{App, Confirm, Location, Pane, Rename, TOOLBAR_H};
 use crate::icons::{self, Icon};
 use crate::theme::{self, Palette};
 
-/// What's being dragged onto a folder.
+/// The notes being dragged onto a folder.
 #[derive(Clone, Debug)]
-pub struct NoteDrag(pub String);
+pub struct NoteDrag(pub Vec<String>);
 
 const ROW_H: f32 = 28.0;
 
@@ -201,7 +201,7 @@ impl App {
         }
         // Notes dropped here move here.
         if let Some(drag) = resp.dnd_release_payload::<NoteDrag>() {
-            self.move_note(&drag.0, id);
+            self.move_notes(&drag.0, id);
         }
         let account = self.store.folder(id).map(|f| f.account.clone());
         resp.context_menu(|ui| {
