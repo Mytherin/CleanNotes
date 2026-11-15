@@ -133,7 +133,7 @@ Notes go into a [Standard Notes](https://standardnotes.com) account (`api.standa
 - Notes deleted for good are deleted in Standard Notes too.
 - Sign in with your email and password (and your authenticator code if you use two-factor authentication). The password is never stored: signing in derives your keys, and only the session and the key that unlocks your items keys are kept, in the OS credential store. Only accounts on protocol 004 work (the Standard Notes apps offer to upgrade older ones); items in shared vaults and hardware-key two-factor aren't supported.
 
-The app speaks Standard Notes' client protocol itself (`src/sync/standardnotes/`): Argon2id root keys, XChaCha20-Poly1305 with the client's authenticated data, items keys, PKCE sign-in, session refresh and the paged items sync. It's compiled in but behind the `standardnotes` Cargo feature until Settings has a form for it.
+The app speaks Standard Notes' client protocol itself (`src/sync/standardnotes/`): Argon2id root keys, XChaCha20-Poly1305 with the client's authenticated data, items keys, PKCE sign-in, session refresh and the paged items sync. Add an account under Settings → Accounts → + → Standard Notes (standardnotes.com or a self-hosted server; two-factor codes are asked for when needed).
 
 ### SQLite database
 

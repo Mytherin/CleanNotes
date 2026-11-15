@@ -10,7 +10,7 @@ use super::{modal, App, Confirm};
 use crate::model::{new_id, Account, LOCAL};
 use crate::settings::{refresh_label, SortBy, StartWith, REFRESH_CHOICES, TEXT_SIZES};
 use crate::sync::bitwarden::{self, Method, SignInRequest, SignInStep, TwoFactorCode, TwoFactorKind};
-use crate::sync::{cloudkit, sqlite, BackendConfig};
+use crate::sync::{cloudkit, sqlite, standardnotes, BackendConfig};
 use crate::theme::{self, Palette};
 
 const LABEL_W: f32 = 190.0;
@@ -93,6 +93,38 @@ impl BwForm {
     }
 }
 
+#[derive(Default)]
+struct SnForm {
+    /// Signing in again to this account.
+    again: Option<String>,
+    name: String,
+    self_hosted: bool,
+    server: String,
+    email: String,
+    password: String,
+    /// Shown once the server asks for a two-factor code.
+    needs_code: bool,
+    code: String,
+}
+
+impl SnForm {
+    fn config(&self) -> standardnotes::Config {
+        let server = if self.self_hosted { self.server.trim().trim_end_matches('/').to_owned() } else { standardnotes::DEFAULT_SERVER.to_owned() };
+        standardnotes::Config { server, email: self.email.trim().to_owned() }
+    }
+
+    fn request(&self) -> standardnotes::SignInRequest {
+        standardnotes::SignInRequest { password: self.password.clone(), mfa_code: self.needs_code.then(|| self.code.trim().to_owned()) }
+    }
+
+    fn ready(&self) -> bool {
+        !self.email.trim().is_empty()
+            && !self.password.is_empty()
+            && (!self.self_hosted || self.server.trim().starts_with("http"))
+            && (!self.needs_code || !self.code.trim().is_empty())
+    }
+}
+
 struct SqliteForm {
     name: String,
     path: String,
@@ -112,12 +144,14 @@ enum Sheet {
     Bitwarden(Box<BwForm>),
     Sqlite(SqliteForm),
     CloudKit(CkForm),
+    StandardNotes(Box<SnForm>),
 }
 
 /// A sign-in running in the background.
 enum Pending {
     Bitwarden(Receiver<Result<SignInStep, String>>),
     CloudKit(Receiver<Result<String, String>>),
+    StandardNotes(Receiver<Result<standardnotes::SignInStep, String>>),
 }
 
 #[derive(Default)]
@@ -336,6 +370,14 @@ impl App {
                     ui.label(&c.environment);
                     ui.end_row();
                 }
+                BackendConfig::StandardNotes(c) => {
+                    ui.label("Server:");
+                    ui.label(&c.server);
+                    ui.end_row();
+                    ui.label("Email:");
+                    ui.label(&c.email);
+                    ui.end_row();
+                }
                 BackendConfig::Local => {}
             }
             ui.label("Status:");
@@ -388,6 +430,19 @@ impl App {
                             api_token: c.api_token.clone(),
                             port: c.callback_port.to_string(),
                         }));
+                        self.settings_ui.error = None;
+                    }
+                }
+                BackendConfig::StandardNotes(c) => {
+                    if ui.button("Sign In Again…").clicked() {
+                        self.settings_ui.sheet = Some(Sheet::StandardNotes(Box::new(SnForm {
+                            again: Some(id.to_owned()),
+                            name: a.name.clone(),
+                            self_hosted: c.server != standardnotes::DEFAULT_SERVER,
+                            server: c.server.clone(),
+                            email: c.email.clone(),
+                            ..SnForm::default()
+                        })));
                         self.settings_ui.error = None;
                     }
                 }
@@ -446,6 +501,29 @@ impl App {
                     Err(e) => self.settings_ui.error = Some(e),
                 }
             }
+            Pending::StandardNotes(rx) => {
+                let Ok(r) = rx.try_recv() else { return };
+                self.settings_ui.pending = None;
+                let Some(Sheet::StandardNotes(form)) = &mut self.settings_ui.sheet else { return };
+                match r {
+                    Ok(standardnotes::SignInStep::Done { secret }) => {
+                        let config = form.config();
+                        let (id, name) = match &form.again {
+                            Some(id) => (id.clone(), form.name.clone()),
+                            None => (new_id(), if form.name.trim().is_empty() { "Standard Notes".to_owned() } else { form.name.trim().to_owned() }),
+                        };
+                        let account = self.account_for(&id, name, BackendConfig::StandardNotes(config));
+                        self.settings_ui.sheet = None;
+                        self.settings_ui.selected = Some(id);
+                        self.add_account(account, Some(secret));
+                    }
+                    Ok(standardnotes::SignInStep::NeedsMfaCode) => {
+                        form.needs_code = true;
+                        self.settings_ui.error = None;
+                    }
+                    Err(e) => self.settings_ui.error = Some(e),
+                }
+            }
             Pending::CloudKit(rx) => {
                 let Ok(r) = rx.try_recv() else { return };
                 self.settings_ui.pending = None;
@@ -487,6 +565,7 @@ impl App {
         let mut next: Option<Sheet> = None;
         let mut start_bw: Option<(bitwarden::Config, SignInRequest)> = None;
         let mut start_ck: Option<cloudkit::Config> = None;
+        let mut start_sn: Option<(standardnotes::Config, standardnotes::SignInRequest)> = None;
         let mut add_sqlite: Option<(String, String)> = None;
         let sheet = self.settings_ui.sheet.as_mut().unwrap();
         modal(ctx, "add-account", p, |ui| {
@@ -504,6 +583,10 @@ impl App {
                     };
                     if choice(ui, "Bitwarden", "Encrypted, as secure notes in your vault") {
                         next = Some(Sheet::Bitwarden(Box::new(BwForm { folder: bitwarden::DEFAULT_FOLDER.into(), ..BwForm::default() })));
+                    }
+                    ui.add_space(6.0);
+                    if choice(ui, "Standard Notes", "End-to-end encrypted notes in your Standard Notes account") {
+                        next = Some(Sheet::StandardNotes(Box::default()));
                     }
                     ui.add_space(6.0);
                     if choice(ui, "iCloud (CloudKit)", "Records in your CloudKit container's private database") {
@@ -635,6 +718,49 @@ impl App {
                         start_ck = Some(ck_config(f));
                     }
                 }
+                Sheet::StandardNotes(f) => {
+                    ui.label(RichText::new(if f.again.is_some() { "Sign in to Standard Notes again" } else { "Add a Standard Notes account" }).font(theme::bold_font(14.0)));
+                    ui.add_space(8.0);
+                    let fixed = f.again.is_some();
+                    egui::Grid::new("sn").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        if !fixed {
+                            ui.label("Description:");
+                            ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Standard Notes").desired_width(240.0));
+                            ui.end_row();
+                            ui.label("Server:");
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(&mut f.self_hosted, false, "standardnotes.com");
+                                ui.selectable_value(&mut f.self_hosted, true, "Self-hosted");
+                            });
+                            ui.end_row();
+                            if f.self_hosted {
+                                ui.label("Server URL:");
+                                ui.add(egui::TextEdit::singleline(&mut f.server).hint_text("https://notes-api.example.com").desired_width(240.0));
+                                ui.end_row();
+                            }
+                        }
+                        ui.label("Email:");
+                        ui.add_enabled(!fixed, egui::TextEdit::singleline(&mut f.email).desired_width(240.0));
+                        ui.end_row();
+                        ui.label("Password:");
+                        ui.add(egui::TextEdit::singleline(&mut f.password).password(true).desired_width(240.0));
+                        ui.end_row();
+                        if f.needs_code {
+                            ui.label("Two-factor code:");
+                            ui.add(egui::TextEdit::singleline(&mut f.code).hint_text("from your authenticator app").desired_width(160.0));
+                            ui.end_row();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    wrapped(
+                        ui,
+                        "Notes are encrypted on this computer before they're synced. Tags become folders. Super and other rich notes show read-only; editing one saves a new plain note and keeps the original. The password isn't saved; only the session and keys, in the system's credential store.",
+                        p.secondary,
+                    );
+                    if sheet_buttons(ui, p, busy, &error, f.ready(), "Sign In", &mut close) {
+                        start_sn = Some((f.config(), f.request()));
+                    }
+                }
                 Sheet::Sqlite(f) => {
                     ui.label(RichText::new("Add a SQLite database").font(theme::bold_font(14.0)));
                     ui.add_space(8.0);
@@ -670,6 +796,16 @@ impl App {
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::Bitwarden(rx));
+            self.settings_ui.error = None;
+        }
+        if let Some((config, req)) = start_sn {
+            let (tx, rx) = mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(standardnotes::sign_in(&config, &req).map_err(|e| format!("{e:#}")));
+                ctx.request_repaint();
+            });
+            self.settings_ui.pending = Some(Pending::StandardNotes(rx));
             self.settings_ui.error = None;
         }
         if let Some(config) = start_ck {

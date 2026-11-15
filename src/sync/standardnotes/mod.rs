@@ -26,10 +26,6 @@
 //!   only the session tokens and the master key (which unlocks the
 //!   account's items keys) are kept in the OS credential store.
 
-// Until the settings window offers it (the `standardnotes` feature), only
-// the tests use this module.
-#![cfg_attr(not(feature = "standardnotes"), allow(dead_code))]
-
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
