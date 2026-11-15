@@ -150,6 +150,7 @@ fn read(resp: reqwest::blocking::Response) -> Result<(Value, Option<String>)> {
 }
 
 /// Signs in with an Apple ID in the browser (blocking). Returns the secret.
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn sign_in(config: &Config) -> Result<String> {
     sign_in_with(config, |u| open::that(u).map_err(|e| anyhow!("couldn't open the browser: {e}")))
 }

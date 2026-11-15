@@ -29,7 +29,7 @@ impl App {
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
         let y = bar.center().y;
-        let read_only = self.selected.as_ref().and_then(|s| self.store.note(s)).is_some_and(|n| n.deleted.is_some());
+        let read_only = self.selected.as_ref().and_then(|s| self.lib.store.note(s)).is_some_and(|n| n.deleted.is_some());
         let has_note = self.editor.is_some();
         let mut x = bar.left() + 14.0;
         if self.gallery_open {
@@ -83,7 +83,7 @@ impl App {
             child.painter().text(area.center(), Align2::CENTER_CENTER, msg, theme::font(15.0), p.secondary);
             return;
         };
-        let Some(note) = self.store.note(&id).cloned() else { return };
+        let Some(note) = self.lib.store.note(&id).cloned() else { return };
         if self.is_closed(&id) {
             self.lock_screen(&mut child, p, area, &id);
             return;
@@ -96,7 +96,7 @@ impl App {
 
         let header = note_header_time(note.modified);
         let highlight = self.search.clone();
-        let opts = Options { text_size: self.settings.text_size, sort_checked: self.settings.sort_checked, read_only, highlight: &highlight };
+        let opts = Options { text_size: self.lib.settings.text_size, sort_checked: self.lib.settings.sort_checked, read_only, highlight: &highlight };
         let Some(editor) = &mut self.editor else { return };
         let mut out = None;
         egui::ScrollArea::vertical()
@@ -130,7 +130,7 @@ impl App {
             let r = Rect::from_center_size(c + Vec2::new(off, -off), Vec2::new(120.0, 150.0));
             painter.rect(r, 10.0, p.card, egui::Stroke::new(1.0_f32, p.separator));
             if i == 0 {
-                let title = self.store.note(&self.multi[0]).map(|n| n.title()).unwrap_or_default();
+                let title = self.lib.store.note(&self.multi[0]).map(|n| n.title()).unwrap_or_default();
                 let t = super::sidebar::truncate(&title, 100.0, ui);
                 painter.text(r.left_top() + Vec2::new(10.0, 14.0), Align2::LEFT_CENTER, t, theme::bold_font(10.5), p.text);
                 for k in 0..5 {
@@ -149,7 +149,7 @@ impl App {
         if resp.clicked() && self.selected.is_some() {
             ui.memory_mut(|m| m.toggle_popup(id));
         }
-        let Some(note) = self.selected.clone().and_then(|s| self.store.note(&s).cloned()) else { return };
+        let Some(note) = self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned()) else { return };
         let ids = vec![note.id.clone()];
         egui::popup_below_widget(ui, id, resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
             popover_frame(ui, p).show(ui, |ui| {

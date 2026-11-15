@@ -1,41 +1,24 @@
-//! The note editor: a rich-text editor over a [`Doc`], with Apple Notes'
-//! paragraph styles, checklists, keyboard shortcuts, undo, find, links and
-//! a clipboard that keeps formatting within the app.
+//! The note editor on the desktop: lays out, draws and takes keyboard and
+//! pointer input for the shared editing engine ([`Editing`]), which holds the
+//! note as a [`Doc`] and does what typing, Return, the formatting commands,
+//! undo and find do to it. Here are the egui parts: layout, the caret,
+//! selection painting, arrows by line, clicks, the context menu, the system
+//! clipboard and the link sheet.
 //!
 //! The note's Markdown is only produced when the app asks for it
-//! ([`Editor::markdown`]); while open, the note is a `Doc`.
+//! ([`Editing::take_markdown`]); while open, the note is a `Doc`.
 
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 
 use eframe::egui::{self, text::CCursor, Event, Key, Modifiers, Pos2, Rect, Sense, Vec2};
 
-use crate::doc::{Attr, Block, Doc, Kind, Pos, Selection, Style};
-use crate::markdown;
+use crate::doc::{Attr, Kind, Pos, Selection};
 use crate::theme::Palette;
+pub use cleannotes_core::editing::{Command, Editing};
 
 pub mod layout;
 use layout::{Laid, Marks};
-
-/// Things the editor can be asked to do (from the Format menu, toolbar,
-/// shortcuts or the right-click menu).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Command {
-    SetKind(Kind),
-    ToggleAttr(Attr),
-    /// "Mark as Checked".
-    ToggleChecked,
-    Indent,
-    Outdent,
-    MoveUp,
-    MoveDown,
-    /// Open the link sheet for the selection.
-    EditLink,
-    SetLink(Option<String>),
-    Undo,
-    Redo,
-    SelectAll,
-    CopyMarkdown,
-}
 
 /// Settings the editor needs from the app.
 pub struct Options<'a> {
@@ -57,28 +40,6 @@ pub struct Output {
     pub open_url: Option<String>,
 }
 
-#[derive(Clone)]
-struct State {
-    doc: Doc,
-    sel: Selection,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Group {
-    Typing,
-    Deleting,
-}
-
-/// Find in note (Ctrl+F).
-#[derive(Default)]
-pub struct Find {
-    pub open: bool,
-    pub query: String,
-    pub focus: bool,
-    /// The current match's index in [`Editor::matches`].
-    pub current: usize,
-}
-
 /// The "Add Link" sheet.
 pub struct LinkSheet {
     pub url: String,
@@ -86,477 +47,66 @@ pub struct LinkSheet {
 }
 
 pub struct Editor {
-    pub note_id: String,
-    pub doc: Doc,
-    pub sel: Selection,
-    /// The style to type in after Bold etc. was pressed with nothing selected.
-    typing_style: Option<Style>,
-    undo: Vec<State>,
-    redo: Vec<State>,
-    group: Option<(Group, f64)>,
+    /// The note being edited (shared with the iPhone app).
+    pub ed: Editing,
     /// The x position vertical moves aim for.
     goal_x: Option<f32>,
     laid: Vec<Laid>,
-    /// Changed since the app last took the Markdown.
-    changed: bool,
-    /// The Markdown the editor was loaded with or last produced.
-    pub markdown_seen: String,
-    pub find: Find,
     pub link_sheet: Option<LinkSheet>,
-    scroll_to_caret: bool,
     /// Last time the caret moved or text changed (the caret shows steadily
     /// right after).
     last_activity: f64,
     dragging: bool,
-    /// Formatted copy of what was last copied, matched up with the clipboard
-    /// text when pasting.
-    clipboard: Option<(String, Vec<Block>)>,
     pub focus_requested: bool,
 }
 
-const COALESCE_SECS: f64 = 1.5;
+impl Deref for Editor {
+    type Target = Editing;
+    fn deref(&self) -> &Editing {
+        &self.ed
+    }
+}
+
+impl DerefMut for Editor {
+    fn deref_mut(&mut self) -> &mut Editing {
+        &mut self.ed
+    }
+}
 
 impl Editor {
     pub fn new(note_id: &str, md: &str) -> Editor {
-        let doc = markdown::from_markdown(md);
-        Editor {
-            note_id: note_id.to_owned(),
-            doc,
-            sel: Selection::default(),
-            typing_style: None,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            group: None,
-            goal_x: None,
-            laid: Vec::new(),
-            changed: false,
-            markdown_seen: md.to_owned(),
-            find: Find::default(),
-            link_sheet: None,
-            scroll_to_caret: false,
-            last_activity: 0.0,
-            dragging: false,
-            clipboard: None,
-            focus_requested: false,
-        }
+        Editor::wrap(Editing::new(note_id, md))
     }
 
-    /// A new note: one empty paragraph in the "New notes start with" style.
-    pub fn new_note(note_id: &str, start: Kind) -> Editor {
-        let mut e = Editor::new(note_id, "");
-        e.doc.blocks[0].kind = start;
-        e.markdown_seen = String::new();
-        e
+    /// A new note: its Markdown from the library (empty, or a tag), the
+    /// first paragraph in the "New notes start with" style.
+    pub fn new_note(note_id: &str, md: &str, start: Kind) -> Editor {
+        Editor::wrap(Editing::new_note(note_id, md, start))
+    }
+
+    fn wrap(ed: Editing) -> Editor {
+        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false }
     }
 
     pub fn id(&self) -> egui::Id {
         egui::Id::new(("note-editor", &self.note_id))
     }
 
-    /// The note's Markdown, if it changed since last asked.
-    pub fn take_markdown(&mut self) -> Option<String> {
-        if !self.changed {
-            return None;
-        }
-        self.changed = false;
-        let md = markdown::to_markdown(&self.doc);
-        if md == self.markdown_seen {
-            return None;
-        }
-        self.markdown_seen = md.clone();
-        Some(md)
-    }
-
-    /// The note changed elsewhere (a sync): load it, keeping the caret near
-    /// where it was.
-    pub fn reload(&mut self, md: &str) {
-        if md == self.markdown_seen {
-            return;
-        }
-        // Not an edit here: the note isn't marked changed (which would write
-        // the other device's text back in this app's own Markdown style),
-        // and undo history from before can't be stepped back into, as that
-        // would quietly revert the other device's edit.
-        self.undo.clear();
-        self.redo.clear();
-        self.group = None;
-        self.typing_style = None;
-        self.doc = markdown::from_markdown(md);
-        self.markdown_seen = md.to_owned();
-        self.sel = Selection { anchor: self.doc.clamp(self.sel.anchor), caret: self.doc.clamp(self.sel.caret) };
-    }
-
-    /// The paragraph style at the caret (for the Format menu's checkmark).
-    pub fn current_kind(&self) -> Kind {
-        self.doc.blocks[self.sel.caret.block.min(self.doc.blocks.len() - 1)].kind
-    }
-
-    /// Whether the selection (or typing style) has a character attribute.
-    pub fn has_attr(&self, a: Attr) -> bool {
-        if self.sel.is_empty() {
-            self.typing_style.clone().unwrap_or_else(|| self.doc.style_at(self.sel.caret)).get(a)
-        } else {
-            self.doc.has_attr(self.sel.start(), self.sel.end(), a)
-        }
-    }
-
-    // ---- Undo ---------------------------------------------------------
-
-    /// Saves the state for undo before a change. Typing (or deleting) in a
-    /// row is undone as one step.
-    fn checkpoint(&mut self, group: Option<Group>) {
-        let now = self.last_activity;
-        let joins = match (group, self.group) {
-            (Some(g), Some((last, t))) => g == last && now - t < COALESCE_SECS,
-            _ => false,
-        };
-        if !joins {
-            self.undo.push(State { doc: self.doc.clone(), sel: self.sel });
-            if self.undo.len() > 500 {
-                self.undo.remove(0);
-            }
-        }
-        self.group = group.map(|g| (g, now));
-        self.redo.clear();
-        self.changed = true;
-        self.scroll_to_caret = true;
-    }
-
-    fn undo(&mut self) {
-        if let Some(s) = self.undo.pop() {
-            self.redo.push(State { doc: std::mem::replace(&mut self.doc, s.doc), sel: self.sel });
-            self.sel = s.sel;
-            self.after_history();
-        }
-    }
-
-    fn redo(&mut self) {
-        if let Some(s) = self.redo.pop() {
-            self.undo.push(State { doc: std::mem::replace(&mut self.doc, s.doc), sel: self.sel });
-            self.sel = s.sel;
-            self.after_history();
-        }
-    }
-
-    fn after_history(&mut self) {
-        self.group = None;
-        self.changed = true;
-        self.typing_style = None;
-        self.scroll_to_caret = true;
-    }
-
-    // ---- Editing --------------------------------------------------------
-
-    fn set_caret(&mut self, p: Pos, extend: bool) {
-        self.sel.caret = p;
-        if !extend {
-            self.sel.anchor = p;
-        }
-        self.typing_style = None;
-        self.group = None;
-        self.scroll_to_caret = true;
-    }
-
-    /// Deletes the selection, if any. Returns where the caret ends up.
-    fn delete_selection(&mut self) -> Pos {
-        let start = self.doc.delete(self.sel.start(), self.sel.end());
-        self.sel = Selection::caret(start);
-        start
-    }
-
-    pub fn insert_text(&mut self, text: &str) {
-        let text: String = text.chars().filter(|&c| c == '\n' || c == '\t' || !c.is_control()).collect();
-        if text.is_empty() {
-            return;
-        }
-        self.checkpoint(Some(Group::Typing));
-        let style = self.typing_style.clone().unwrap_or_else(|| self.doc.style_at(self.sel.start()));
-        let at = self.delete_selection();
-        let end = self.doc.insert(at, &text, &style);
-        self.sel = Selection::caret(end);
-        if text == " " {
-            self.auto_list(end);
-        }
-    }
-
-    /// Typing "- ", "* " or "1. " at the start of body text starts a list,
-    /// as in Apple Notes.
-    fn auto_list(&mut self, caret: Pos) {
-        let b = &self.doc.blocks[caret.block];
-        if b.kind != Kind::Body {
-            return;
-        }
-        let before: String = b.text.chars().take(caret.offset).collect();
-        let kind = match before.as_str() {
-            "- " => Kind::Dashed,
-            "* " | "• " => Kind::Bulleted,
-            "1. " | "1) " => Kind::Numbered,
-            "[] " | "[ ] " => Kind::Checklist(false),
-            _ => return,
-        };
-        self.checkpoint(None);
-        let n = before.chars().count();
-        self.doc.delete(Pos::new(caret.block, 0), Pos::new(caret.block, n));
-        self.doc.blocks[caret.block].kind = kind;
-        self.sel = Selection::caret(Pos::new(caret.block, 0));
-    }
-
-    fn enter(&mut self) {
-        self.checkpoint(None);
-        let at = self.delete_selection();
-        let p = self.doc.enter(at);
-        self.sel = Selection::caret(p);
-    }
-
-    fn backspace(&mut self, word: bool) {
-        if !self.sel.is_empty() {
-            self.checkpoint(Some(Group::Deleting));
-            self.delete_selection();
-            return;
-        }
-        let c = self.sel.caret;
-        if c.offset == 0 {
-            // Nothing to undo: no indent or list/quote style to take off,
-            // and nothing above to join (a title stays a title).
-            let first = &self.doc.blocks[0];
-            if c.block == 0 && first.indent == 0 && !first.kind.is_list() && first.kind != Kind::Quote {
-                return;
-            }
-            self.checkpoint(None);
-            let p = self.doc.backspace_at_start(c.block);
-            self.sel = Selection::caret(p);
-            return;
-        }
-        self.checkpoint(Some(Group::Deleting));
-        let from = if word { self.doc.word_step(c, -1) } else { self.doc.char_step(c, -1) };
-        let p = self.doc.delete(from, c);
-        self.sel = Selection::caret(p);
-    }
-
-    fn delete_forward(&mut self, word: bool) {
-        if !self.sel.is_empty() {
-            self.checkpoint(Some(Group::Deleting));
-            self.delete_selection();
-            return;
-        }
-        let c = self.sel.caret;
-        let to = if word { self.doc.word_step(c, 1) } else { self.doc.char_step(c, 1) };
-        if to == c {
-            return;
-        }
-        self.checkpoint(Some(Group::Deleting));
-        self.doc.delete(c, to);
-    }
-
     pub fn command(&mut self, cmd: Command) {
-        let blocks = self.sel.blocks();
         match cmd {
-            Command::SetKind(k) => {
-                self.checkpoint(None);
-                self.doc.set_kind(blocks, k);
-            }
-            Command::ToggleAttr(a) => {
-                if self.sel.is_empty() {
-                    let mut s = self.typing_style.clone().unwrap_or_else(|| self.doc.style_at(self.sel.caret));
-                    s.set(a, !s.get(a));
-                    self.typing_style = Some(s);
-                } else {
-                    self.checkpoint(None);
-                    self.doc.toggle_attr(self.sel.start(), self.sel.end(), a);
-                }
-            }
-            Command::ToggleChecked => {
-                self.checkpoint(None);
-                if !self.doc.blocks[blocks.clone()].iter().any(|b| matches!(b.kind, Kind::Checklist(_))) {
-                    self.doc.set_kind(blocks, Kind::Checklist(false));
-                } else {
-                    self.doc.toggle_checked(blocks);
-                }
-            }
-            Command::Indent => {
-                self.checkpoint(None);
-                self.doc.indent(blocks, 1);
-            }
-            Command::Outdent => {
-                self.checkpoint(None);
-                self.doc.indent(blocks, -1);
-            }
-            Command::MoveUp | Command::MoveDown => {
-                let d = if cmd == Command::MoveUp { -1 } else { 1 };
-                let before = self.doc.clone();
-                if self.doc.move_blocks(blocks, d) {
-                    self.undo.push(State { doc: before, sel: self.sel });
-                    self.redo.clear();
-                    // Typing after this is a step of its own.
-                    self.group = None;
-                    self.changed = true;
-                    let shift = |p: Pos| Pos::new((p.block as i32 + d) as usize, p.offset);
-                    self.sel = Selection { anchor: shift(self.sel.anchor), caret: shift(self.sel.caret) };
-                    self.scroll_to_caret = true;
-                }
-            }
-            Command::EditLink => {
-                let start = self.sel.start();
-                let url = self.doc.blocks[start.block]
-                    .styles
-                    .get(start.offset)
-                    .and_then(|s| s.link.as_deref().map(str::to_owned))
-                    .unwrap_or_default();
-                self.link_sheet = Some(LinkSheet { url, focus: true });
-            }
-            Command::SetLink(url) => {
-                self.checkpoint(None);
-                let url: Option<std::sync::Arc<str>> = url.filter(|u| !u.trim().is_empty()).map(|u| normalize_url(&u).into());
-                if self.sel.is_empty() {
-                    if let Some(u) = &url {
-                        // Nothing selected: the address itself becomes the link.
-                        let style = Style { link: Some(u.clone()), ..self.doc.style_at(self.sel.caret) };
-                        let end = self.doc.insert(self.sel.caret, u, &style);
-                        self.sel = Selection::caret(end);
-                    }
-                } else {
-                    self.doc.restyle(self.sel.start(), self.sel.end(), |s| s.link = url.clone());
-                }
-            }
-            Command::Undo => self.undo(),
-            Command::Redo => self.redo(),
-            Command::SelectAll => {
-                self.sel = Selection { anchor: Pos::default(), caret: self.doc.end() };
-            }
-            Command::CopyMarkdown => {}
+            Command::EditLink => self.link_sheet = Some(LinkSheet { url: self.ed.link_at_selection(), focus: true }),
+            c => self.ed.command(c),
         }
-    }
-
-    /// Clicking a checkbox.
-    fn toggle_check_at(&mut self, block: usize, sort: bool) {
-        self.checkpoint(None);
-        if let Kind::Checklist(c) = self.doc.blocks[block].kind {
-            self.doc.blocks[block].kind = Kind::Checklist(!c);
-            if sort && !c {
-                self.sort_checklist(block);
-            }
-        }
-    }
-
-    /// Moves checked items below the unchecked ones in the checklist around
-    /// `block` (Settings → Sort checked items: Automatically).
-    fn sort_checklist(&mut self, block: usize) {
-        let is_item = |b: &Block| matches!(b.kind, Kind::Checklist(_));
-        let mut start = block;
-        while start > 0 && is_item(&self.doc.blocks[start - 1]) {
-            start -= 1;
-        }
-        let mut end = block + 1;
-        while end < self.doc.blocks.len() && is_item(&self.doc.blocks[end]) {
-            end += 1;
-        }
-        let items: Vec<Block> = self.doc.blocks.drain(start..end).collect();
-        let (unchecked, checked): (Vec<Block>, Vec<Block>) =
-            items.into_iter().partition(|b| b.kind == Kind::Checklist(false));
-        let sorted: Vec<Block> = unchecked.into_iter().chain(checked).collect();
-        self.doc.blocks.splice(start..start, sorted);
-        self.sel = Selection::caret(self.doc.clamp(self.sel.caret));
-    }
-
-    fn selected_blocks(&self) -> Vec<Block> {
-        self.doc.fragment(self.sel.start(), self.sel.end())
     }
 
     fn copy(&mut self, ctx: &egui::Context) {
-        if self.sel.is_empty() {
-            return;
+        if let Some(text) = self.ed.copy() {
+            ctx.copy_text(text);
         }
-        let text = self.doc.text_between(self.sel.start(), self.sel.end());
-        self.clipboard = Some((text.clone(), self.selected_blocks()));
-        ctx.copy_text(text);
     }
 
     fn copy_markdown(&mut self, ctx: &egui::Context) {
-        let blocks = if self.sel.is_empty() { self.doc.blocks.clone() } else { self.selected_blocks() };
-        ctx.copy_text(markdown::to_markdown(&Doc::new(blocks)));
-    }
-
-    fn paste(&mut self, text: &str) {
-        let text = text.replace("\r\n", "\n");
-        // Copied from this app: paste with its formatting.
-        if let Some((plain, blocks)) = &self.clipboard {
-            if *plain == text {
-                let blocks = blocks.clone();
-                self.checkpoint(None);
-                let at = self.delete_selection();
-                let end = self.doc.insert_blocks(at, blocks);
-                self.sel = Selection::caret(end);
-                return;
-            }
-        }
-        self.checkpoint(None);
-        let style = self.doc.style_at(self.sel.start());
-        let at = self.delete_selection();
-        let end = self.doc.insert(at, &text, &Style { link: None, ..style });
-        self.sel = Selection::caret(end);
-    }
-
-    // ---- Find ------------------------------------------------------------
-
-    /// Matches of `query` (case-insensitive) as (block, char range).
-    pub fn matches(&self, query: &str) -> Vec<(usize, std::ops::Range<usize>)> {
-        // Query and text are folded the same way, character by character
-        // (whole-string lowercasing would turn a final Σ into ς, say).
-        let fold = |s: &str| -> Vec<char> {
-            s.chars()
-                .flat_map(|c| {
-                    let l: Vec<char> = c.to_lowercase().collect();
-                    // Keep char positions aligned (a few characters lowercase to two).
-                    if l.len() == 1 { l } else { vec![c] }
-                })
-                .collect()
-        };
-        let q = fold(query);
-        if q.is_empty() {
-            return vec![];
-        }
-        let mut out = Vec::new();
-        for (bi, b) in self.doc.blocks.iter().enumerate() {
-            let t = fold(&b.text);
-            let mut i = 0;
-            while i + q.len() <= t.len() {
-                if t[i..i + q.len()] == q[..] {
-                    out.push((bi, i..i + q.len()));
-                    i += q.len();
-                } else {
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
-
-    /// Selects the next (`1`) or previous (`-1`) match of the find query.
-    pub fn find_step(&mut self, dir: i32) {
-        let m = self.matches(&self.find.query);
-        if m.is_empty() {
-            return;
-        }
-        let n = m.len() as i32;
-        self.find.current = ((self.find.current as i32 + dir).rem_euclid(n)) as usize;
-        self.select_match(&m);
-    }
-
-    /// Selects the first match at or after the caret.
-    pub fn find_from_caret(&mut self) {
-        let m = self.matches(&self.find.query);
-        if m.is_empty() {
-            return;
-        }
-        let caret = self.sel.start();
-        self.find.current = m.iter().position(|(b, r)| Pos::new(*b, r.start) >= caret).unwrap_or(0);
-        self.select_match(&m);
-    }
-
-    fn select_match(&mut self, m: &[(usize, std::ops::Range<usize>)]) {
-        let (b, r) = &m[self.find.current.min(m.len() - 1)];
-        self.sel = Selection { anchor: Pos::new(*b, r.start), caret: Pos::new(*b, r.end) };
-        self.scroll_to_caret = true;
+        ctx.copy_text(self.ed.selection_markdown());
     }
 
     // ---- Geometry -----------------------------------------------------------
@@ -791,6 +341,8 @@ impl Editor {
         if self.last_activity == 0.0 {
             self.last_activity = now;
         }
+        // Typing within a moment of the last is one undo step.
+        self.ed.clock = now;
         if self.focus_requested {
             ui.memory_mut(|m| m.request_focus(id));
             self.focus_requested = false;
@@ -807,7 +359,7 @@ impl Editor {
 
         // ---- Input (applies to last frame's layout) ----
         let sel_before = self.sel;
-        let doc_before_len = (self.doc.blocks.len(), self.undo.len());
+        let doc_before_len = (self.doc.blocks.len(), self.undo_depth());
         if focused {
             let events = ui.input(|i| i.events.clone());
             let shift_down = ui.input(|i| i.modifiers.shift);
@@ -831,9 +383,8 @@ impl Editor {
                     }
                     Event::Cut => {
                         self.copy(&ctx);
-                        if !opts.read_only && !self.sel.is_empty() {
-                            self.checkpoint(None);
-                            self.delete_selection();
+                        if !opts.read_only {
+                            self.delete_selected();
                         }
                     }
                     Event::Paste(t) if !opts.read_only => {
@@ -971,7 +522,7 @@ impl Editor {
             if self.dragging && ui.input(|i| i.pointer.primary_down()) && resp.dragged() {
                 let p = self.pos_at(pt);
                 self.sel.caret = p;
-                self.scroll_to_caret = true;
+                self.reveal = true;
             }
         }
         if !ui.input(|i| i.pointer.primary_down()) {
@@ -995,7 +546,7 @@ impl Editor {
         self.context_menu(&resp, opts, &ctx);
 
         // ---- Caret ----
-        if self.sel != sel_before || (self.doc.blocks.len(), self.undo.len()) != doc_before_len {
+        if self.sel != sel_before || (self.doc.blocks.len(), self.undo_depth()) != doc_before_len {
             self.last_activity = now;
         }
         if let Some(r) = self.caret_rect(self.sel.caret) {
@@ -1009,9 +560,9 @@ impl Editor {
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                 ctx.output_mut(|o| o.ime = Some(egui::output::IMEOutput { rect: resp.rect, cursor_rect: r }));
             }
-            if self.scroll_to_caret {
+            if self.reveal {
                 ui.scroll_to_rect(r.expand(24.0), None);
-                self.scroll_to_caret = false;
+                self.reveal = false;
             }
         }
         out
@@ -1045,8 +596,7 @@ impl Editor {
             };
             if item(ui, "Cut", cmd_key!("X"), has_sel && editable) {
                 self.copy(ctx);
-                self.checkpoint(None);
-                self.delete_selection();
+                self.delete_selected();
                 ui.close_menu();
             }
             if item(ui, "Copy", cmd_key!("C"), has_sel) {
@@ -1116,47 +666,10 @@ fn paint_range(painter: &egui::Painter, l: &Laid, from: usize, to: usize, past_e
     }
 }
 
-/// A typed link address made into a URL ("example.com" → "https://example.com").
-pub fn normalize_url(u: &str) -> String {
-    let u = u.trim();
-    if u.contains("://") || u.starts_with("mailto:") {
-        u.to_owned()
-    } else if u.contains('@') && !u.contains('/') {
-        format!("mailto:{u}")
-    } else {
-        format!("https://{u}")
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn typing_list_markers_starts_lists() {
-        let mut e = Editor::new("n", "");
-        e.insert_text("-");
-        e.insert_text(" ");
-        assert_eq!(e.doc.blocks[0].kind, Kind::Dashed);
-        assert_eq!(e.doc.blocks[0].text, "");
-        e.insert_text("eggs");
-        assert_eq!(e.take_markdown().as_deref(), Some("- eggs\n"));
-    }
-
-    #[test]
-    fn backspace_at_the_start_of_a_title_changes_nothing() {
-        let mut e = Editor::new("n", "# Title\nbody\n");
-        e.sel = Selection::caret(Pos::new(0, 0));
-        e.backspace(false);
-        e.backspace(false);
-        assert!(e.undo.is_empty(), "no do-nothing undo steps");
-        assert_eq!(e.take_markdown(), None, "the note isn't changed");
-        // A list item at the top still turns into body text.
-        let mut e = Editor::new("n", "- item\n");
-        e.sel = Selection::caret(Pos::new(0, 0));
-        e.backspace(false);
-        assert_eq!(e.doc.blocks[0].kind, Kind::Body);
-    }
 
     #[test]
     fn the_link_sheet_shows_the_link_where_the_selection_starts() {
@@ -1165,15 +678,6 @@ mod tests {
         e.sel = Selection { anchor: Pos::new(0, 1), caret: Pos::new(1, 3) };
         e.command(Command::EditLink);
         assert_eq!(e.link_sheet.as_ref().map(|s| s.url.as_str()), Some("https://example.com"));
-    }
-
-    #[test]
-    fn find_folds_case_the_same_way_for_query_and_text() {
-        let e = Editor::new("n", "ΟΔΟΣ and Straße\n");
-        assert_eq!(e.matches("ΟΔΟΣ").len(), 1);
-        assert_eq!(e.matches("οδοσ").len(), 1);
-        assert_eq!(e.matches("STRASSE").len(), 0);
-        assert_eq!(e.matches("straße").len(), 1);
     }
 
     #[test]
@@ -1187,121 +691,11 @@ mod tests {
     }
 
     #[test]
-    fn typing_after_moving_a_paragraph_is_its_own_undo_step() {
-        let mut e = Editor::new("n", "one\ntwo\n");
-        e.sel = Selection::caret(Pos::new(0, 3));
-        e.insert_text("!");
-        e.command(Command::MoveDown);
-        e.insert_text("?");
-        assert_eq!(e.doc.plain_text(), "two\none!?");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "two\none!", "only the typing is undone");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "one!\ntwo");
-    }
-
-    #[test]
-    fn backspace_and_delete_take_whole_emoji() {
-        let mut e = Editor::new("n", "ok 👍🏽🇩🇪\n");
-        e.sel = Selection::caret(Pos::new(0, 7));
-        e.backspace(false);
-        assert_eq!(e.doc.blocks[0].text, "ok 👍🏽");
-        e.backspace(false);
-        assert_eq!(e.doc.blocks[0].text, "ok ");
-        let mut e = Editor::new("n", "👍🏽x\n");
-        e.sel = Selection::caret(Pos::new(0, 0));
-        e.delete_forward(false);
-        assert_eq!(e.doc.blocks[0].text, "x");
-    }
-
-    #[test]
-    fn a_reload_from_a_sync_is_not_an_edit() {
-        let mut e = Editor::new("n", "# Note\nmine\n");
-        e.sel = Selection::caret(Pos::new(1, 4));
-        e.insert_text("!");
-        assert_eq!(e.take_markdown().as_deref(), Some("# Note\nmine!\n"));
-        // Markdown from another device, not in this app's own style.
-        e.reload("# Note\nmine!\n+ theirs\n");
-        assert_eq!(e.take_markdown(), None, "not written back reformatted");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "Note\nmine!\ntheirs", "undo can't revert the other device's edit");
-        assert_eq!((e.doc.clamp(e.sel.anchor), e.doc.clamp(e.sel.caret)), (e.sel.anchor, e.sel.caret));
-    }
-
-    #[test]
-    fn typing_is_undone_as_one_step() {
-        let mut e = Editor::new("n", "start");
-        e.sel = Selection::caret(Pos::new(0, 5));
-        for c in " more text".chars() {
-            e.insert_text(&c.to_string());
-        }
-        e.enter();
-        e.insert_text("x");
-        assert_eq!(e.doc.plain_text(), "start more text\nx");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "start more text\n");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "start more text");
-        e.command(Command::Undo);
-        assert_eq!(e.doc.plain_text(), "start");
-        e.command(Command::Redo);
-        assert_eq!(e.doc.plain_text(), "start more text");
-    }
-
-    #[test]
-    fn bold_with_nothing_selected_applies_to_typing() {
-        let mut e = Editor::new("n", "a");
-        e.sel = Selection::caret(Pos::new(0, 1));
-        e.command(Command::ToggleAttr(Attr::Bold));
-        e.insert_text("b");
-        e.command(Command::ToggleAttr(Attr::Bold));
-        e.insert_text("c");
-        assert_eq!(e.take_markdown().as_deref(), Some("a**b**c\n"));
-    }
-
-    #[test]
-    fn copy_and_paste_keep_formatting_inside_the_app() {
-        let mut e = Editor::new("n", "**bold** plain\n- [ ] task\n");
-        e.sel = Selection { anchor: Pos::new(0, 0), caret: Pos::new(1, 4) };
+    fn copy_puts_the_text_on_the_system_clipboard() {
+        let mut e = Editor::new("n", "**bold** plain\n");
+        e.sel = Selection { anchor: Pos::new(0, 0), caret: Pos::new(0, 4) };
         let ctx = egui::Context::default();
-        e.copy(&ctx);
-        let (plain, _) = e.clipboard.clone().unwrap();
-        assert_eq!(plain, "bold plain\ntask");
-        e.sel = Selection::caret(e.doc.end());
-        e.enter();
-        e.paste(&plain);
-        // Pasted into an empty line, paragraphs keep their own style.
-        assert_eq!(e.take_markdown().unwrap(), "**bold** plain\n- [ ] task\n**bold** plain\n- [ ] task\n");
-        // Text from elsewhere comes in as plain text.
-        e.paste("*x*");
-        assert!(e.take_markdown().unwrap().ends_with("task\\*x\\*\n"));
-    }
-
-    #[test]
-    fn checked_items_sort_to_the_bottom() {
-        let mut e = Editor::new("n", "- [ ] a\n- [ ] b\n- [ ] c\nafter\n");
-        e.toggle_check_at(0, true);
-        assert_eq!(e.take_markdown().unwrap(), "- [ ] b\n- [ ] c\n- [x] a\nafter\n");
-    }
-
-    #[test]
-    fn find_matches_case_insensitively() {
-        let mut e = Editor::new("n", "Apple pie\nan apple a day");
-        assert_eq!(e.matches("APPLE"), vec![(0, 0..5), (1, 3..8)]);
-        e.find.query = "apple".into();
-        e.sel = Selection::caret(Pos::new(0, 2));
-        e.find_from_caret();
-        assert_eq!(e.sel.start(), Pos::new(1, 3));
-        e.find_step(1);
-        assert_eq!(e.sel.start(), Pos::new(0, 0));
-    }
-
-    #[test]
-    fn links() {
-        let mut e = Editor::new("n", "see docs");
-        e.sel = Selection { anchor: Pos::new(0, 4), caret: Pos::new(0, 8) };
-        e.command(Command::SetLink(Some("example.com".into())));
-        assert_eq!(e.take_markdown().unwrap(), "see [docs](https://example.com)\n");
-        assert_eq!(normalize_url("me@x.org"), "mailto:me@x.org");
+        let out = ctx.run(egui::RawInput::default(), |ctx| e.copy(ctx));
+        assert!(out.platform_output.copied_text == "bold");
     }
 }

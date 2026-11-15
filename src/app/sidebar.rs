@@ -28,7 +28,7 @@ impl App {
             self.settings_ui.open = true;
         }
         if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.right() - 24.0, y), Vec2::splat(30.0)), Icon::Sidebar, "Hide Folders (Ctrl+Alt+S)") {
-            self.settings.sidebar_visible = false;
+            self.lib.settings.sidebar_visible = false;
         }
         if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.right() - 62.0, y), Vec2::splat(30.0)), Icon::FolderPlus, "New Folder (Ctrl+Shift+N)") {
             self.new_folder(None, None);
@@ -40,7 +40,7 @@ impl App {
             ui.spacing_mut().item_spacing.y = 1.0;
             // "All Notes": every note, whatever its folder or account.
             if self.show_all_notes() {
-                let count = self.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)).count();
+                let count = self.lib.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)).count();
                 let selected = self.location == Location::All && self.search.is_empty();
                 ui.add_space(4.0);
                 let resp = self.row(ui, p, 0, Icon::Notes, "All Notes", Some(count), selected, None);
@@ -54,7 +54,7 @@ impl App {
                 self.go_to(Location::Folder(f));
             }
             let accounts: Vec<(String, String)> =
-                self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+                self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
             for (id, name) in accounts {
                 self.account_section(ui, p, &id, &name);
                 ui.add_space(10.0);
@@ -64,7 +64,7 @@ impl App {
     }
 
     fn account_section(&mut self, ui: &mut Ui, p: &Palette, account: &str, name: &str) {
-        let collapsed = self.settings.collapsed.iter().any(|c| c == account);
+        let collapsed = self.lib.settings.collapsed.iter().any(|c| c == account);
         // Header: the account's name, with a chevron and sync state.
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
         let painter = ui.painter();
@@ -80,13 +80,13 @@ impl App {
             let a = t * 6.0;
             painter.line_segment([r.center(), r.center() + Vec2::new(a.cos(), a.sin()) * 5.0], egui::Stroke::new(1.5_f32, p.secondary));
             ui.ctx().request_repaint();
-        } else if self.needs_sign_in.contains(account) || self.sync_errors.contains_key(account) {
+        } else if self.lib.needs_sign_in.contains(account) || self.lib.sync_errors.contains_key(account) {
             icons::paint(painter, Icon::Warning, Rect::from_center_size(right, Vec2::splat(13.0)), theme::RED);
         }
-        let tip = if self.needs_sign_in.contains(account) {
+        let tip = if self.lib.needs_sign_in.contains(account) {
             Some("Sign in again in Settings → Accounts".to_owned())
         } else {
-            self.sync_errors.get(account).map(|e| format!("Couldn't sync: {e}"))
+            self.lib.sync_errors.get(account).map(|e| format!("Couldn't sync: {e}"))
         };
         let resp = match tip {
             Some(t) => resp.on_hover_text(t),
@@ -94,12 +94,12 @@ impl App {
         };
         if resp.clicked() {
             if collapsed {
-                self.settings.collapsed.retain(|c| c != account);
+                self.lib.settings.collapsed.retain(|c| c != account);
             } else {
-                self.settings.collapsed.push(account.to_owned());
+                self.lib.settings.collapsed.push(account.to_owned());
             }
         }
-        let synced = self.store.account(account).is_some_and(|a| a.synced());
+        let synced = self.lib.store.account(account).is_some_and(|a| a.synced());
         resp.context_menu(|ui| {
             if ui.button("New Folder").clicked() {
                 self.new_folder(Some(account.to_owned()), None);
@@ -119,11 +119,11 @@ impl App {
         }
 
         let tree: Vec<(String, usize, String, bool, bool)> = self
-            .store
+            .lib.store
             .folder_tree(account)
             .into_iter()
             .map(|(f, depth)| {
-                let has_kids = self.store.folders.iter().any(|c| c.parent.as_deref() == Some(&f.id));
+                let has_kids = self.lib.store.folders.iter().any(|c| c.parent.as_deref() == Some(&f.id));
                 (f.id.clone(), depth, f.name.clone(), f.default, has_kids)
             })
             .collect();
@@ -136,14 +136,14 @@ impl App {
                 }
                 hidden_below = None;
             }
-            let folded = self.settings.collapsed.contains(&id);
+            let folded = self.lib.settings.collapsed.contains(&id);
             if folded && has_kids {
                 hidden_below = Some(depth);
             }
-            let count = self.store.notes.iter().filter(|n| n.folder == id && n.deleted.is_none()).count();
+            let count = self.lib.store.notes.iter().filter(|n| n.folder == id && n.deleted.is_none()).count();
             self.folder_row(ui, p, &id, depth, &name, default, has_kids.then_some(folded), count);
         }
-        let deleted = self.store.notes.iter().filter(|n| n.account == account && n.deleted.is_some()).count();
+        let deleted = self.lib.store.notes.iter().filter(|n| n.account == account && n.deleted.is_some()).count();
         if deleted > 0 {
             let loc = Location::Deleted(account.to_owned());
             let selected = self.location == loc && self.search.is_empty();
@@ -175,9 +175,9 @@ impl App {
             let t = ui.interact(tri, ui.id().with(("fold", id)), Sense::click());
             if t.clicked() {
                 if folded == Some(true) {
-                    self.settings.collapsed.retain(|c| c != id);
+                    self.lib.settings.collapsed.retain(|c| c != id);
                 } else {
-                    self.settings.collapsed.push(id.to_owned());
+                    self.lib.settings.collapsed.push(id.to_owned());
                 }
             }
         }
@@ -215,7 +215,7 @@ impl App {
         if let Some(drag) = resp.dnd_release_payload::<NoteDrag>() {
             self.move_notes(&drag.0, id);
         }
-        let account = self.store.folder(id).map(|f| f.account.clone());
+        let account = self.lib.store.folder(id).map(|f| f.account.clone());
         resp.context_menu(|ui| {
             if ui.button("New Folder").clicked() {
                 self.new_folder(account.clone(), Some(id.to_owned()));
@@ -264,7 +264,7 @@ impl App {
             galley
         };
         painter.galley(Pos2::new(x0 + 40.0, rect.center().y - galley.size().y / 2.0), galley, text_color);
-        if let (Some(n), true) = (count, self.settings.show_note_count) {
+        if let (Some(n), true) = (count, self.lib.settings.show_note_count) {
             let c = if selected { egui::Color32::WHITE } else { p.secondary };
             painter.text(Pos2::new(inner.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, n.to_string(), theme::font(13.0), c);
         }
@@ -273,7 +273,7 @@ impl App {
 
     fn tags_section(&mut self, ui: &mut Ui, p: &Palette) {
         let mut tags: Vec<String> = Vec::new();
-        for n in self.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)) {
+        for n in self.lib.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)) {
             for t in n.tags() {
                 if !tags.contains(&t) {
                     tags.push(t);

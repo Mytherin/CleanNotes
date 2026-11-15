@@ -1,0 +1,40 @@
+[package]
+name = "cleannotes-core"
+version = "0.1.0"
+edition = "2021"
+description = "CleanNotes' shared core: notes, folders, accounts, the rich-text document and its Markdown, editing, locked notes, storage and sync. Used by the desktop app and (through cleannotes-ffi) the iPhone app."
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+rusqlite = { version = "0.42.0", features = ["bundled", "chrono"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# The caret steps over whole characters as seen (emoji, flags, accents).
+unicode-segmentation = "1.13"
+# Three-way merges of note text when two devices edit the same note.
+diffy = "0.4"
+# Bitwarden's vault encryption.
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+sha2 = "0.10"
+pbkdf2 = "0.12"
+hkdf = "0.12"
+argon2 = "0.5"
+rand = "0.8"
+base64 = "0.22"
+# Standard Notes' protocol 004 encryption.
+chacha20poly1305 = "0.10"
+
+# Desktop only: the default data folder, and opening the browser for
+# CloudKit's sign-in. (On iOS the app passes its own folder in.)
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+directories = "5"
+open = "5"
+
+[dev-dependencies]
+tempfile = "3"

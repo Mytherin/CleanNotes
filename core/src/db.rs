@@ -21,6 +21,8 @@ use crate::settings::Settings;
 
 const KEYRING_SERVICE: &str = "CleanNotes";
 
+/// The desktop app's data folder. (The iPhone app passes its own.)
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub fn data_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("CLEANNOTES_DATA") {
         return PathBuf::from(d);

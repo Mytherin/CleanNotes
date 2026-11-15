@@ -744,6 +744,21 @@ dependencies = [
 name = "clean-notes"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "cleannotes-core",
+ "directories",
+ "eframe",
+ "open",
+ "png 0.17.16",
+ "tempfile",
+ "ttf-parser",
+]
+
+[[package]]
+name = "cleannotes-core"
+version = "0.1.0"
+dependencies = [
  "aes",
  "anyhow",
  "argon2",
@@ -753,13 +768,11 @@ dependencies = [
  "chrono",
  "diffy",
  "directories",
- "eframe",
  "hkdf",
  "hmac",
  "keyring",
  "open",
  "pbkdf2",
- "png 0.17.16",
  "rand",
  "reqwest",
  "rusqlite",
@@ -767,7 +780,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
- "ttf-parser",
  "unicode-segmentation",
  "uuid",
 ]

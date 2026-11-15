@@ -1,41 +1,24 @@
-//! Locked notes in the app: the password (set, entered, changed), locking
-//! and unlocking notes, the lock screen, and re-encrypting a locked note as
-//! it's edited. The encryption itself is in [`crate::lock`].
-//!
-//! As in Apple Notes, one password unlocks every note locked with it, and
-//! they stay unlocked until "Lock Now", a while without use, or quitting.
-//! Passwords are only ever kept in memory.
-
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+//! Locked notes on the desktop: the lock screen and the password sheets.
+//! Locking, unlocking, the password and re-encrypting a locked note as it's
+//! edited are the shared library's ([`cleannotes_core::library`]); the
+//! encryption itself is in [`crate::lock`].
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, RichText, Ui, Vec2};
 
 use super::{modal, App};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
-use crate::lock::{self, Keys};
 use crate::theme::{self, Palette};
+use cleannotes_core::library::LockNote;
 
-/// What the password check in Settings decrypts to.
-const CHECK: &str = "CleanNotes locked notes";
-/// Unlocked notes lock again after this long without input.
-pub const AUTO_LOCK: Duration = Duration::from_secs(15 * 60);
-
+/// The lock screen's field and the password sheets.
 #[derive(Default)]
-pub struct LockState {
-    /// The current password, once entered (and checked) this session.
-    current: Option<String>,
-    /// Keys made this session, by salt (base64).
-    keys: HashMap<String, Keys>,
-    /// The text of each unlocked note.
-    unlocked: HashMap<String, String>,
+pub struct LockUi {
     /// The password typed on the lock screen.
     pub typed: String,
     pub error: Option<String>,
     pub focus: bool,
     pub sheet: Option<Sheet>,
-    pub last_input: Option<Instant>,
 }
 
 pub enum Sheet {
@@ -49,102 +32,36 @@ pub enum Sheet {
 
 impl App {
     pub fn is_locked(&self, id: &str) -> bool {
-        self.store.note(id).is_some_and(|n| lock::is_locked(&n.body))
+        self.lib.is_locked(id)
     }
 
     /// A locked note that hasn't been unlocked.
     pub fn is_closed(&self, id: &str) -> bool {
-        self.is_locked(id) && !self.lock.unlocked.contains_key(id)
+        self.lib.is_closed(id)
     }
 
     /// A note's Markdown: its text, or a locked note's once unlocked.
-    pub fn plain_body(&self, id: &str) -> Option<String> {
-        let n = self.store.note(id)?;
-        if lock::is_locked(&n.body) {
-            self.lock.unlocked.get(id).cloned()
-        } else {
-            Some(n.body.clone())
-        }
+    pub fn plain_body(&mut self, id: &str) -> Option<String> {
+        self.lib.plain_body(id)
     }
 
     /// The editor for a note, unless it's locked.
     pub fn editor_for(&mut self, id: &str) -> Option<Editor> {
-        if self.is_locked(id) && !self.lock.unlocked.contains_key(id) {
-            self.try_open(id);
-        }
-        self.plain_body(id).map(|md| Editor::new(id, &md))
-    }
-
-    fn keys(&mut self, password: &str, env: &lock::Envelope) -> anyhow::Result<Keys> {
-        if let Some(k) = self.lock.keys.get(&env.salt) {
-            return Ok(k.clone());
-        }
-        let k = lock::derive_for(password, env)?;
-        Ok(k)
-    }
-
-    /// Opens a locked note with keys already made this session.
-    fn try_open(&mut self, id: &str) -> bool {
-        let Some(env) = self.store.note(id).and_then(|n| lock::parse(&n.body)) else { return false };
-        let Some(k) = self.lock.keys.get(&env.salt).cloned() else { return false };
-        match lock::open(&k, &env) {
-            Ok(text) => {
-                self.lock.unlocked.insert(id.to_owned(), text);
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Opens every locked note the keys made this session open.
-    fn open_all(&mut self) {
-        let ids: Vec<String> = self.store.notes.iter().filter(|n| lock::is_locked(&n.body)).map(|n| n.id.clone()).collect();
-        for id in ids {
-            if !self.lock.unlocked.contains_key(&id) {
-                self.try_open(&id);
-            }
-        }
+        self.lib.plain_body(id).map(|md| Editor::new(id, &md))
     }
 
     /// The lock screen's "View Note".
     pub fn unlock(&mut self, id: &str) {
         let password = std::mem::take(&mut self.lock.typed);
-        let Some(env) = self.store.note(id).and_then(|n| lock::parse(&n.body)) else { return };
-        let opened = lock::derive_for(&password, &env).and_then(|k| lock::open(&k, &env).map(|t| (k, t)));
-        match opened {
-            Ok((k, text)) => {
-                self.lock.keys.insert(env.salt.clone(), k.clone());
-                self.lock.unlocked.insert(id.to_owned(), text);
+        match self.lib.unlock(id, &password) {
+            Ok(()) => {
                 self.lock.error = None;
-                // The settings' check: this device learns the password's
-                // salt from the note if it hasn't got one, and the password
-                // is the current one if it opens the check.
-                match self.settings.lock_check.as_deref().and_then(|c| lock::decode(c).ok()) {
-                    None => {
-                        let check = lock::seal(&k, &env.salt(), CHECK);
-                        self.settings.lock_check = Some(lock::encode(&check));
-                        self.lock.current = Some(password);
-                    }
-                    Some(check) => {
-                        let k2 = if check.salt == env.salt { Ok(k) } else { lock::derive_for(&password, &check) };
-                        if let Ok(k2) = k2 {
-                            if lock::open(&k2, &check).is_ok() {
-                                self.lock.keys.insert(check.salt.clone(), k2);
-                                self.lock.current = Some(password);
-                            }
-                        }
-                    }
-                }
-                // Other notes locked with it open now too.
-                self.open_all();
                 if self.selected.as_deref() == Some(id) {
                     self.editor = self.editor_for(id);
                 }
             }
-            Err(e) => {
-                let hint = (!self.settings.lock_hint.is_empty()).then(|| format!(" Hint: {}", self.settings.lock_hint)).unwrap_or_default();
-                let msg = if e.to_string() == "wrong password" { "Wrong password.".to_owned() } else { e.to_string() };
-                self.lock.error = Some(format!("{msg}{hint}"));
+            Err(msg) => {
+                self.lock.error = Some(msg);
                 self.lock.focus = true;
             }
         }
@@ -152,61 +69,39 @@ impl App {
 
     /// "Lock Note": asks for (or to choose) the password first if needed.
     pub fn lock_note(&mut self, id: &str) {
-        if self.is_locked(id) {
-            return;
-        }
-        if self.settings.lock_check.is_none() {
-            self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Some(id.to_owned()), error: None });
-            return;
-        }
-        let Some((k, salt)) = self.current_keys() else {
-            self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: Some(id.to_owned()), error: None });
-            return;
-        };
         self.flush_editor();
-        let Some(text) = self.plain_body(id) else { return };
-        let env = lock::seal(&k, &salt, &text);
-        if let Some(n) = self.store.note_mut(id) {
-            n.body = lock::locked_body(&text, &env);
-            n.touch();
+        match self.lib.lock_note(id) {
+            LockNote::Locked => {}
+            LockNote::ChoosePassword => {
+                self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Some(id.to_owned()), error: None })
+            }
+            LockNote::EnterPassword => {
+                self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: Some(id.to_owned()), error: None })
+            }
         }
-        self.lock.unlocked.insert(id.to_owned(), text);
-        self.unsaved.insert(id.to_owned());
-        self.push_notice("Note locked. Choose Lock Now to close locked notes.".into());
-    }
-
-    /// The current password's keys and salt (those of the settings' check).
-    fn current_keys(&mut self) -> Option<(Keys, Vec<u8>)> {
-        let password = self.lock.current.clone()?;
-        let check = lock::decode(self.settings.lock_check.as_deref()?).ok()?;
-        let k = self.keys(&password, &check).ok()?;
-        self.lock.keys.insert(check.salt.clone(), k.clone());
-        Some((k, check.salt()))
     }
 
     /// "Remove Lock": the note is stored as plain text again.
     pub fn remove_lock(&mut self, id: &str) {
         self.flush_editor();
-        let Some(text) = self.lock.unlocked.remove(id) else { return };
-        if let Some(n) = self.store.note_mut(id) {
-            n.body = text;
-            n.touch();
-        }
-        self.unsaved.insert(id.to_owned());
+        self.lib.remove_lock(id);
     }
 
     /// Closes every unlocked note and forgets the password.
     pub fn lock_now(&mut self) {
         self.flush_editor();
-        let any = !self.lock.unlocked.is_empty();
-        self.lock.unlocked.clear();
-        self.lock.keys.clear();
-        self.lock.current = None;
+        self.lib.lock_now();
+        self.after_lock_now();
+    }
+
+    /// After locked notes closed (Lock Now, or a while without use).
+    pub(super) fn after_lock_now(&mut self) {
+        let any = self.editor.as_ref().is_some_and(|e| self.lib.is_locked(&e.note_id));
         self.lock.typed.clear();
         self.lock.error = None;
         // A password sheet left open mustn't stay filled in.
         self.lock.sheet = None;
-        if self.selected.as_ref().is_some_and(|s| self.is_locked(s)) {
+        if self.selected.as_ref().is_some_and(|s| self.lib.is_locked(s)) {
             self.editor = None;
         }
         if any {
@@ -215,69 +110,7 @@ impl App {
     }
 
     pub fn has_unlocked(&self) -> bool {
-        !self.lock.unlocked.is_empty()
-    }
-
-    /// Re-encrypts an unlocked note's edited text; false if `id` isn't one.
-    pub(super) fn store_locked(&mut self, id: &str, md: &str) -> bool {
-        let Some(env) = self.store.note(id).and_then(|n| lock::parse(&n.body)) else { return false };
-        if !self.lock.unlocked.contains_key(id) {
-            // Never write a locked note's text out in the clear.
-            return true;
-        }
-        if self.lock.unlocked.get(id).is_some_and(|t| t == md) {
-            return true;
-        }
-        let Some(k) = self.lock.keys.get(&env.salt).cloned() else {
-            // Locked again elsewhere with another password: the edit can't
-            // be sealed, so say so and close the note rather than drop it
-            // silently (never write it out in the clear).
-            self.lock.unlocked.remove(id);
-            if self.editor.as_ref().is_some_and(|e| e.note_id == id) {
-                self.editor = None;
-            }
-            self.push_notice("A change to a locked note couldn't be saved: it was locked with another password on another device.".into());
-            return true;
-        };
-        let sealed = lock::seal(&k, &env.salt(), md);
-        if let Some(n) = self.store.note_mut(id) {
-            n.body = lock::locked_body(md, &sealed);
-            n.touch();
-        }
-        self.lock.unlocked.insert(id.to_owned(), md.to_owned());
-        self.unsaved.insert(id.to_owned());
-        self.last_edit = Some(Instant::now());
-        true
-    }
-
-    /// After a sync changed a locked note: its new text, if it opens.
-    pub(super) fn reopen_after_sync(&mut self, id: &str) -> Option<String> {
-        self.lock.unlocked.remove(id);
-        self.try_open(id);
-        self.lock.unlocked.get(id).cloned()
-    }
-
-    /// After a sync: every unlocked note's text is read again from its
-    /// (possibly new) sealed text, so a stale copy is never shown or sealed
-    /// over another device's edit. Notes gone, no longer locked, or locked
-    /// with keys not at hand are closed.
-    pub(super) fn refresh_unlocked(&mut self) {
-        let ids: Vec<String> = self.lock.unlocked.keys().cloned().collect();
-        for id in ids {
-            self.reopen_after_sync(&id);
-        }
-    }
-
-    /// Locks everything after a while without input.
-    pub(super) fn auto_lock(&mut self, ctx: &egui::Context) {
-        // Checked before this frame's input counts: coming back to a window
-        // left minimized for an hour brings input events with it.
-        if self.has_unlocked() && self.lock.last_input.is_some_and(|t| t.elapsed() > AUTO_LOCK) {
-            self.lock_now();
-        }
-        if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.lock.last_input = Some(Instant::now());
-        }
+        self.lib.has_unlocked()
     }
 
     // ---- The lock screen ----------------------------------------------------
@@ -408,80 +241,32 @@ impl App {
         }
     }
 
+
     fn sheet_action(&mut self, a: SheetAction) -> Result<(), String> {
         match a {
             SheetAction::Set(password, hint, then_lock) => {
-                let salt = lock::new_salt();
-                let k = lock::derive(&password, &salt).map_err(|e| e.to_string())?;
-                let check = lock::seal(&k, &salt, CHECK);
-                self.lock.keys.insert(check.salt.clone(), k);
-                self.settings.lock_check = Some(lock::encode(&check));
-                self.settings.lock_hint = hint;
-                self.lock.current = Some(password);
+                self.lib.set_password(&password, &hint)?;
                 if let Some(id) = then_lock {
                     self.lock_note(&id);
                 }
-                Ok(())
             }
             SheetAction::Enter(password, then_lock) => {
-                self.check_password(&password)?;
-                self.lock.current = Some(password);
+                self.lib.enter_password(&password)?;
                 if let Some(id) = then_lock {
                     self.lock_note(&id);
                 }
-                Ok(())
             }
             SheetAction::Change(old, password, hint) => {
-                let old_keys = self.check_password(&old)?;
-                let _ = old_keys;
-                // Every locked note the old password opens gets the new one.
-                let salt = lock::new_salt();
-                let k = lock::derive(&password, &salt).map_err(|e| e.to_string())?;
-                let mut by_salt: HashMap<String, Option<Keys>> = HashMap::new();
-                let mut changed = 0;
-                let ids: Vec<String> = self.store.notes.iter().filter(|n| lock::is_locked(&n.body)).map(|n| n.id.clone()).collect();
                 self.flush_editor();
-                for id in ids {
-                    let Some(env) = self.store.note(&id).and_then(|n| lock::parse(&n.body)) else { continue };
-                    let ok = by_salt.entry(env.salt.clone()).or_insert_with(|| lock::derive_for(&old, &env).ok()).clone();
-                    let Some(ok) = ok else { continue };
-                    let Ok(text) = lock::open(&ok, &env) else { continue };
-                    let sealed = lock::seal(&k, &salt, &text);
-                    if let Some(n) = self.store.note_mut(&id) {
-                        n.body = lock::locked_body(&text, &sealed);
-                        n.touch();
-                    }
-                    self.unsaved.insert(id);
-                    changed += 1;
-                }
-                let check = lock::seal(&k, &salt, CHECK);
-                self.lock.keys.insert(check.salt.clone(), k);
-                self.settings.lock_check = Some(lock::encode(&check));
-                self.settings.lock_hint = hint;
-                self.lock.current = Some(password);
-                self.lock.unlocked.clear();
-                self.open_all();
-                self.push_notice(format!("Password changed for {changed} locked note{}.", if changed == 1 { "" } else { "s" }));
-                Ok(())
+                self.lib.change_password(&old, &password, &hint)?;
             }
         }
-    }
-
-    /// Checks a password against the settings' check.
-    fn check_password(&mut self, password: &str) -> Result<Keys, String> {
-        let check = self.settings.lock_check.as_deref().and_then(|c| lock::decode(c).ok()).ok_or("No password is set.")?;
-        let k = lock::derive_for(password, &check).map_err(|e| e.to_string())?;
-        lock::open(&k, &check).map_err(|_| {
-            let hint = if self.settings.lock_hint.is_empty() { String::new() } else { format!(" Hint: {}", self.settings.lock_hint) };
-            format!("Wrong password.{hint}")
-        })?;
-        self.lock.keys.insert(check.salt.clone(), k.clone());
-        Ok(k)
+        Ok(())
     }
 
     pub fn open_change_password(&mut self) {
-        self.lock.sheet = Some(if self.settings.lock_check.is_some() {
-            Sheet::Change { old: String::new(), password: String::new(), verify: String::new(), hint: self.settings.lock_hint.clone(), error: None }
+        self.lock.sheet = Some(if self.lib.has_lock_password() {
+            Sheet::Change { old: String::new(), password: String::new(), verify: String::new(), hint: self.lib.settings.lock_hint.clone(), error: None }
         } else {
             Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: None, error: None }
         });
@@ -515,14 +300,15 @@ fn buttons(ui: &mut Ui, label: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock;
     use crate::model::Note;
 
     fn app_with_note(dir: &std::path::Path, body: &str) -> (App, String) {
         let mut app = App::for_test(dir);
-        let folder = app.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+        let folder = app.lib.default_folder_id(crate::model::LOCAL);
         let n = Note::new(crate::model::LOCAL, &folder, body);
         let id = n.id.clone();
-        app.store.notes.push(n);
+        app.lib.store.notes.push(n);
         app.select(Some(id.clone()));
         (app, id)
     }
@@ -539,17 +325,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, id) = app_with_note(dir.path(), "# Bank\nPIN 1234\n");
         set_password(&mut app, &id, "hunter2");
-        let body = app.store.note(&id).unwrap().body.clone();
+        let body = app.lib.store.note(&id).unwrap().body.clone();
         assert!(lock::is_locked(&body) && !body.contains("1234"), "stored encrypted: {body}");
-        assert_eq!(app.store.note(&id).unwrap().title(), "Bank");
+        assert_eq!(app.lib.store.note(&id).unwrap().title(), "Bank");
         // Still open after locking, as in Apple Notes; edits are encrypted.
         assert!(!app.is_closed(&id));
-        assert!(app.store_locked(&id, "# Bank\nPIN 9876\n"));
-        let body = app.store.note(&id).unwrap().body.clone();
+        app.lib.set_body(&id, "# Bank\nPIN 9876\n");
+        let body = app.lib.store.note(&id).unwrap().body.clone();
         assert!(lock::is_locked(&body) && !body.contains("9876"));
         // Lock Now: closed, no editor, nothing in memory.
         app.lock_now();
         assert!(app.is_closed(&id));
+        assert!(app.editor.is_none());
         assert!(app.editor_for(&id).is_none());
         assert_eq!(app.plain_body(&id), None);
         // A wrong password says so (with the hint); the right one opens it.
@@ -560,9 +347,10 @@ mod tests {
         app.lock.typed = "hunter2".into();
         app.unlock(&id);
         assert_eq!(app.plain_body(&id).as_deref(), Some("# Bank\nPIN 9876\n"));
+        assert!(app.editor.is_some(), "the open note shows");
         // Remove Lock stores the text in the clear again.
         app.remove_lock(&id);
-        assert_eq!(app.store.note(&id).unwrap().body, "# Bank\nPIN 9876\n");
+        assert_eq!(app.lib.store.note(&id).unwrap().body, "# Bank\nPIN 9876\n");
     }
 
     #[test]
@@ -570,10 +358,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, a) = app_with_note(dir.path(), "# A\nsecret a\n");
         set_password(&mut app, &a, "one");
-        let folder = app.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+        let folder = app.lib.default_folder_id(crate::model::LOCAL);
         let n = Note::new(crate::model::LOCAL, &folder, "# B\nsecret b\n");
         let b = n.id.clone();
-        app.store.notes.push(n);
+        app.lib.store.notes.push(n);
         // The password is known this session: locking B asks nothing.
         app.lock_note(&b);
         assert!(app.lock.sheet.is_none() && app.is_locked(&b));
@@ -597,41 +385,20 @@ mod tests {
     }
 
     #[test]
-    fn a_sync_never_leaves_stale_text_in_an_unlocked_note() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut app, id) = app_with_note(dir.path(), "# A\nv1\n");
-        set_password(&mut app, &id, "pw");
-        app.select(None);
-        // Another device edits it; the sync brings its new sealed text.
-        let env = lock::parse(&app.store.note(&id).unwrap().body).unwrap();
-        let k = app.lock.keys[&env.salt].clone();
-        let theirs = "# A\nv2 from the other device\n";
-        app.store.note_mut(&id).unwrap().body = lock::locked_body(theirs, &lock::seal(&k, &env.salt(), theirs));
-        app.refresh_unlocked();
-        assert_eq!(app.plain_body(&id).as_deref(), Some(theirs));
-        // Locked again elsewhere with another password: closed, not shown
-        // stale or edited blind.
-        let salt = lock::new_salt();
-        let other = lock::derive("another", &salt).unwrap();
-        app.store.note_mut(&id).unwrap().body = lock::locked_body(theirs, &lock::seal(&other, &salt, theirs));
-        app.refresh_unlocked();
-        assert!(app.is_closed(&id));
-    }
-
-    #[test]
     fn auto_lock_fires_when_coming_back_after_a_long_time() {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, id) = app_with_note(dir.path(), "# A\nsecret\n");
         set_password(&mut app, &id, "pw");
         assert!(app.has_unlocked());
         app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: None, error: None });
-        app.lock.last_input = Instant::now().checked_sub(AUTO_LOCK + std::time::Duration::from_secs(60));
+        app.lib.test_last_lock_use(cleannotes_core::library::AUTO_LOCK + std::time::Duration::from_secs(60));
         // The first frame back carries input (focus, the mouse moving).
         let ctx = egui::Context::default();
         let mut raw = egui::RawInput::default();
         raw.events.push(egui::Event::PointerMoved(Pos2::new(1.0, 1.0)));
-        let _ = ctx.run(raw, |ctx| app.auto_lock(ctx));
+        let _ = ctx.run(raw, |ctx| app.background(ctx));
         assert!(!app.has_unlocked() && app.is_closed(&id));
+        assert!(app.editor.is_none());
         assert!(app.lock.sheet.is_none(), "no password left in an open sheet");
     }
 

@@ -228,8 +228,8 @@ impl App {
     }
 
     fn general_tab(&mut self, ui: &mut Ui, p: &Palette) {
-        let accounts: Vec<(String, String)> = self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
-        let s = &mut self.settings;
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let s = &mut self.lib.settings;
         ui.spacing_mut().item_spacing.y = 8.0;
         form_row(ui, p, "Sort notes by:", |ui| {
             let opts: Vec<(SortBy, String)> = SortBy::ALL.iter().map(|o| (*o, o.label().to_owned())).collect();
@@ -265,7 +265,7 @@ impl App {
         });
         explain(ui, p, "How often synced accounts look for changes made on other devices.");
         ui.separator();
-        let has_password = self.settings.lock_check.is_some();
+        let has_password = self.lib.settings.lock_check.is_some();
         let mut change = false;
         let mut lock_now = false;
         let unlocked = self.has_unlocked();
@@ -287,7 +287,7 @@ impl App {
     }
 
     fn accounts_tab(&mut self, ui: &mut Ui, p: &Palette) {
-        if self.settings_ui.selected.as_ref().map_or(true, |s| self.store.account(s).is_none()) {
+        if self.settings_ui.selected.as_ref().map_or(true, |s| self.lib.store.account(s).is_none()) {
             self.settings_ui.selected = Some(LOCAL.to_owned());
         }
         let selected = self.settings_ui.selected.clone().unwrap();
@@ -299,7 +299,7 @@ impl App {
                     ui.set_min_size(Vec2::new(170.0, 280.0));
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let accounts: Vec<(String, String, String)> =
-                        self.store.accounts.iter().map(|a| (a.id.clone(), a.name.clone(), a.backend.kind_name().to_owned())).collect();
+                        self.lib.store.accounts.iter().map(|a| (a.id.clone(), a.name.clone(), a.backend.kind_name().to_owned())).collect();
                     for (id, name, kind) in accounts {
                         let (r, resp) = ui.allocate_exact_size(Vec2::new(170.0, 40.0), Sense::click());
                         if id == selected {
@@ -330,7 +330,7 @@ impl App {
     }
 
     fn account_details(&mut self, ui: &mut Ui, p: &Palette, id: &str) {
-        let Some(a) = self.store.account(id).cloned() else { return };
+        let Some(a) = self.lib.store.account(id).cloned() else { return };
         if id == LOCAL {
             ui.label(RichText::new(&a.name).font(theme::bold_font(16.0)));
             ui.add_space(6.0);
@@ -341,7 +341,7 @@ impl App {
         }
         let mut name = a.name.clone();
         let mut enabled = a.enabled;
-        if self.db.secret_in_memory_only(id) {
+        if self.lib.db.secret_in_memory_only(id) {
             wrapped(
                 ui,
                 "The system's credential store isn't available: this sign-in is kept only until CleanNotes quits, so you'll sign in again next time.",
@@ -394,9 +394,9 @@ impl App {
             ui.label("Status:");
             let status = if self.syncing(id) {
                 "Syncing…".to_owned()
-            } else if self.needs_sign_in.contains(id) {
+            } else if self.lib.needs_sign_in.contains(id) {
                 "Needs you to sign in again".to_owned()
-            } else if let Some(e) = self.sync_errors.get(id) {
+            } else if let Some(e) = self.lib.sync_errors.get(id) {
                 format!("Couldn't sync: {e}")
             } else if let Some(t) = a.last_sync {
                 format!("Synced {}", super::list_time(t))
@@ -462,14 +462,14 @@ impl App {
         });
         if name != a.name || enabled != a.enabled {
             let disabled = a.enabled && !enabled;
-            let acc = self.store.account_mut(id).unwrap();
+            let acc = self.lib.store.account_mut(id).unwrap();
             acc.name = name;
             acc.enabled = enabled;
             if disabled {
                 // Its notes vanish from view: don't stay in one of its
                 // folders, or keep one of its notes open.
                 let inside = match &self.location {
-                    Location::Folder(f) => self.store.folder(f).is_some_and(|f| f.account == id),
+                    Location::Folder(f) => self.lib.store.folder(f).is_some_and(|f| f.account == id),
                     Location::Deleted(acc) => acc == id,
                     _ => false,
                 };
@@ -572,7 +572,7 @@ impl App {
     /// The account to save after signing in: the existing one (signing in
     /// again keeps its sync state) or a new one.
     fn account_for(&self, id: &str, name: String, backend: BackendConfig) -> Account {
-        match self.store.account(id) {
+        match self.lib.store.account(id) {
             Some(a) => Account { name, backend, enabled: true, ..a.clone() },
             None => Account { id: id.to_owned(), name, backend, enabled: true, cursor: None, last_sync: None },
         }
