@@ -20,6 +20,7 @@ mod doc;
 mod editor;
 mod fonts;
 mod icons;
+mod lock;
 mod markdown;
 mod model;
 mod settings;

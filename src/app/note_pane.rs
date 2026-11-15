@@ -46,7 +46,7 @@ impl App {
 
         // Search and "…" on the right.
         let search_left = self.search_control(ui, p, bar.right() - 14.0, y);
-        let more = glass_button(ui, p, Pos2::new(search_left - 28.0, y), Icon::More, "More", has_note);
+        let more = glass_button(ui, p, Pos2::new(search_left - 28.0, y), Icon::More, "More", self.selected.is_some() && self.multi.len() < 2);
         self.note_more_menu(ui, p, &more);
 
         // The formatting buttons, in a glass capsule in the middle.
@@ -84,6 +84,10 @@ impl App {
             return;
         };
         let Some(note) = self.store.note(&id).cloned() else { return };
+        if self.is_closed(&id) {
+            self.lock_screen(&mut child, p, area, &id);
+            return;
+        }
 
         if read_only {
             self.deleted_banner(&mut child, p, &id);
@@ -142,7 +146,7 @@ impl App {
     /// The note's "…" menu: pin, find, move, duplicate, delete.
     fn note_more_menu(&mut self, ui: &mut Ui, p: &Palette, resp: &egui::Response) {
         let id = ui.id().with("note-more");
-        if resp.clicked() && self.editor.is_some() {
+        if resp.clicked() && self.selected.is_some() {
             ui.memory_mut(|m| m.toggle_popup(id));
         }
         let Some(note) = self.selected.clone().and_then(|s| self.store.note(&s).cloned()) else { return };
@@ -166,6 +170,21 @@ impl App {
                         self.toggle_pin(&note.id);
                         close = true;
                     }
+                    if !self.is_locked(&note.id) {
+                        if ui.button("Lock Note").clicked() {
+                            self.lock_note(&note.id);
+                            close = true;
+                        }
+                    } else if !self.is_closed(&note.id) {
+                        if ui.button("Lock Now").clicked() {
+                            self.lock_now();
+                            close = true;
+                        }
+                        if ui.button("Remove Lock").clicked() {
+                            self.remove_lock(&note.id);
+                            close = true;
+                        }
+                    }
                     ui.separator();
                     if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
                         if let Some(e) = &mut self.editor {
@@ -179,8 +198,9 @@ impl App {
                         self.duplicate_note(&note.id);
                         close = true;
                     }
-                    if ui.button("Copy as Markdown").clicked() {
-                        ui.ctx().copy_text(note.body.clone());
+                    let plain = self.plain_body(&note.id);
+                    if ui.add_enabled(plain.is_some(), egui::Button::new("Copy as Markdown")).clicked() {
+                        ui.ctx().copy_text(plain.unwrap_or_default());
                         close = true;
                     }
                     ui.separator();

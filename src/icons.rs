@@ -27,6 +27,7 @@ pub enum Icon {
     FolderPlus,
     /// "…": more actions.
     More,
+    Lock,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -156,6 +157,20 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             let cut = Stroke::new(s.width, if color.r() > 128 { Color32::BLACK } else { Color32::WHITE });
             line(p, &[at(3.0, -3.5), at(7.0, -3.5)], cut);
             line(p, &[at(5.0, -5.5), at(5.0, -1.5)], cut);
+        }
+        Icon::Lock => {
+            let body = Rect::from_min_max(at(-5.5, -1.0), at(5.5, 7.0));
+            p.rect_filled(body, 1.8 * u, color);
+            let arc: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 16.0);
+                    at(3.6 * a.cos(), -3.5 + 3.6 * a.sin())
+                })
+                .collect();
+            let mut pts = vec![at(-3.6, -1.0)];
+            pts.extend(arc);
+            pts.push(at(3.6, -1.0));
+            line(p, &pts, Stroke::new(s.width * 1.3, color));
         }
         Icon::More => {
             for x in [-5.0, 0.0, 5.0] {

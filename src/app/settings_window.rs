@@ -153,7 +153,7 @@ impl App {
         .collapsible(false)
         .resizable(false)
         .default_pos(ctx.screen_rect().center() - Vec2::new(280.0, 220.0))
-        .fixed_size(Vec2::new(600.0, 470.0))
+        .fixed_size(Vec2::new(600.0, 560.0))
         .frame(egui::Frame::window(&ctx.style()).fill(p.popover).inner_margin(egui::Margin::same(16.0)))
         .show(ctx, |ui| {
             self.tab_bar(ui, p);
@@ -227,6 +227,26 @@ impl App {
             combo(ui, "refresh", &mut s.refresh_minutes, &opts);
         });
         explain(ui, p, "How often synced accounts look for changes made on other devices.");
+        ui.separator();
+        let has_password = self.settings.lock_check.is_some();
+        let mut change = false;
+        let mut lock_now = false;
+        let unlocked = self.has_unlocked();
+        form_row(ui, p, "Locked notes:", |ui| {
+            if ui.button(if has_password { "Change Password…" } else { "Set Password…" }).clicked() {
+                change = true;
+            }
+            if ui.add_enabled(unlocked, egui::Button::new("Lock Now")).clicked() {
+                lock_now = true;
+            }
+        });
+        explain(ui, p, "Locked notes are encrypted with this password, also when synced. Unlocked notes lock again after 15 minutes without use and when you quit.");
+        if change {
+            self.open_change_password();
+        }
+        if lock_now {
+            self.lock_now();
+        }
     }
 
     fn accounts_tab(&mut self, ui: &mut Ui, p: &Palette) {

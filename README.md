@@ -11,6 +11,7 @@ Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCa
 - **The Aa menu** (B I U S on top, paragraph styles shown in their own style below), checklist and link buttons in the toolbar, the note's "…" menu (pin, find, move, duplicate, copy as Markdown, delete), and a right-click menu in the editor.
 - **Find in note** (Ctrl+F, with match count and next/previous) and **search all notes** from the toolbar (every word must match; matches are highlighted in the note).
 - **Folders:** new (Ctrl+Shift+N or the New Folder button at the top of the sidebar), rename (double-click), delete (notes go to Recently Deleted), subfolders, drag notes onto a folder, or "Move to" from a note's menu, also into another account.
+- **Locked notes:** "Lock Note" in a note's "…" menu encrypts it with a password you choose (set the first time, with a hint; change it in Settings → General). As in Apple Notes, a locked note's title stays visible in the list; its text is encrypted with AES-256 and an HMAC check, under a key made from the password with Argon2id, and it is stored and synced only in that form, so sync services never see it. One password opens every locked note until Lock Now, 15 minutes without use, or quitting; passwords are never saved. A locked note edited on two devices at once is kept as two notes. If the password is forgotten, locked notes can't be recovered.
 - **Recently Deleted** per account: notes stay 30 days, can be recovered, and can't be edited until they are (as in Apple Notes).
 - **Tags:** `#words` in notes become tags in the sidebar; a new note made in a tag carries it.
 - **Pinning, duplicating** (Ctrl+D), **copy as Markdown**, and a clipboard that keeps formatting within the app.
@@ -159,6 +160,7 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 | `src/app.rs` | App state, note and folder actions, shortcuts, saving, sync scheduling, dialogs |
 | `src/app/sidebar.rs` | Accounts, folders, Recently Deleted, tags, New Folder |
 | `src/app/list.rs` | The notes list and the gallery |
+| `src/lock.rs`, `src/app/locked.rs` | Locked notes: encryption, and the password, lock screen and unlocking |
 | `src/app/note_pane.rs` | The note's toolbar, Aa and "…" menus, search, find bar, link sheet |
 | `src/app/settings_window.rs` | Settings: General and Accounts, with the sign-in sheets |
 | `src/editor/mod.rs` | The rich-text editor: input, commands, undo, find, clipboard |

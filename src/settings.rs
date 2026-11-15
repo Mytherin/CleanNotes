@@ -91,6 +91,9 @@ pub struct Settings {
     /// Note counts next to folders in the sidebar.
     pub show_note_count: bool,
     pub refresh_minutes: u32,
+    /// The locked-notes password's check (see `app::locked`) and hint.
+    pub lock_check: Option<String>,
+    pub lock_hint: String,
     // ---- Window state ------------------------------------------------
     pub view: ListView,
     pub sidebar_visible: bool,
@@ -110,6 +113,8 @@ impl Default for Settings {
             group_by_date: true,
             show_note_count: true,
             refresh_minutes: 5,
+            lock_check: None,
+            lock_hint: String::new(),
             view: ListView::default(),
             sidebar_visible: true,
             collapsed: Vec::new(),

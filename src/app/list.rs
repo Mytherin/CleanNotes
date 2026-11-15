@@ -130,7 +130,8 @@ impl App {
         let Some(n) = self.store.note(id) else { return };
         let title = n.title();
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
-        let snippet = markdown::snippet_of(&n.body, 120);
+        let locked = crate::lock::is_locked(&n.body);
+        let snippet = if locked { "Locked".to_owned() } else { markdown::snippet_of(&n.body, 120) };
         let snippet = if snippet.is_empty() { "No additional text".to_owned() } else { snippet };
         let when = if n.deleted.is_some() && matches!(self.location, Location::Deleted(_)) { n.deleted.unwrap() } else if self.settings.sort_by == crate::settings::SortBy::Created { n.created } else { n.modified };
         let time = list_time(when);
@@ -162,8 +163,13 @@ impl App {
         let tg = painter.layout_no_wrap(time.clone(), theme::bold_font(12.5), text);
         let tw = tg.size().x;
         painter.galley(Pos2::new(x, rect.top() + 38.0 - tg.size().y / 2.0), tg, text);
-        let snip = truncate(&snippet, w - tw - 8.0, ui);
-        painter.text(Pos2::new(x + tw + 7.0, rect.top() + 38.0), Align2::LEFT_CENTER, snip, theme::font(12.5), sub);
+        let mut sx = x + tw + 7.0;
+        if locked {
+            crate::icons::paint(painter, Icon::Lock, Rect::from_center_size(Pos2::new(sx + 5.0, rect.top() + 38.0), Vec2::splat(11.0)), sub);
+            sx += 14.0;
+        }
+        let snip = truncate(&snippet, w - tw - 8.0 - (sx - x - tw - 7.0), ui);
+        painter.text(Pos2::new(sx, rect.top() + 38.0), Align2::LEFT_CENTER, snip, theme::font(12.5), sub);
         if let Some(f) = folder {
             crate::icons::paint(painter, Icon::Folder, Rect::from_center_size(Pos2::new(x + 6.0, rect.top() + 58.0), Vec2::splat(12.0)), sub);
             painter.text(Pos2::new(x + 16.0, rect.top() + 58.0), Align2::LEFT_CENTER, f, theme::font(11.5), sub);
@@ -230,7 +236,7 @@ impl App {
                 ui.close_menu();
             }
             if ui.button("Copy as Markdown").clicked() {
-                let text: Vec<String> = ids.iter().filter_map(|i| self.store.note(i).map(|n| n.body.clone())).collect();
+                let text: Vec<String> = ids.iter().filter_map(|i| self.plain_body(i)).collect();
                 ui.ctx().copy_text(text.join("
 
 ---
@@ -319,10 +325,14 @@ impl App {
         let selected = self.is_selected(id);
         let painter = ui.painter();
         painter.rect(r, 10.0, p.card, egui::Stroke::new(if selected { 3.0_f32 } else { 1.0 }, if selected { p.accent } else { p.separator }));
+        if crate::lock::is_locked(&n.body) {
+            crate::icons::paint(painter, Icon::Lock, Rect::from_center_size(r.center(), Vec2::splat(30.0)), p.secondary);
+        }
         // A miniature of the note.
         let clip = painter.with_clip_rect(r.shrink(8.0));
+        let body = if crate::lock::is_locked(&n.body) { n.title() } else { n.body.clone() };
         let mut y = r.top() + 10.0;
-        for (i, line) in n.body.lines().filter(|l| !l.trim().is_empty()).take(9).enumerate() {
+        for (i, line) in body.lines().filter(|l| !l.trim().is_empty()).take(9).enumerate() {
             let b = markdown::from_markdown(line);
             let text = b.blocks.first().map(|b| b.text.clone()).unwrap_or_default();
             let (font, color) = if i == 0 { (theme::bold_font(10.5), p.text) } else { (theme::font(9.0), p.secondary) };

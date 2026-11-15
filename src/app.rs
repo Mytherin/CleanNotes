@@ -17,6 +17,7 @@ use crate::sync::worker::{Synced, Worker};
 use crate::theme::{self, Palette};
 
 mod list;
+pub mod locked;
 mod note_pane;
 pub mod settings_window;
 mod sidebar;
@@ -107,6 +108,8 @@ pub struct App {
     /// (for ⇧⌘Z).
     undo_deletes: Vec<Deletion>,
     redo_deletes: Vec<Deletion>,
+    /// Locked notes: the password this session, unlocked notes' text.
+    pub lock: locked::LockState,
 }
 
 /// Notes moved to Recently Deleted together, and how things were before.
@@ -130,7 +133,17 @@ impl App {
         let (db, store, settings) = Db::open(&dir, Secrets::Keyring).expect("opening the notes database");
         let ctx = cc.egui_ctx.clone();
         let worker = Worker::spawn(move || ctx.request_repaint());
-        let mut app = App {
+        let mut app = App::with(db, store, settings, worker);
+        app.restore_location();
+        app.purge_expired();
+        if std::env::var_os("CLEANNOTES_SEED").is_some() && app.store.notes.is_empty() {
+            app.seed();
+        }
+        app
+    }
+
+    fn with(db: Db, store: Store, settings: Settings, worker: Worker) -> Self {
+        App {
             location: Location::Folder(String::new()),
             store,
             settings,
@@ -162,12 +175,16 @@ impl App {
             gallery_open: false,
             undo_deletes: Vec::new(),
             redo_deletes: Vec::new(),
-        };
-        app.restore_location();
-        app.purge_expired();
-        if std::env::var_os("CLEANNOTES_SEED").is_some() && app.store.notes.is_empty() {
-            app.seed();
+            lock: Default::default(),
         }
+    }
+
+    /// An app on a database in `dir`, without a window (for tests).
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &std::path::Path) -> Self {
+        let (db, store, settings) = Db::open(dir, Secrets::Database).expect("test database");
+        let mut app = App::with(db, store, settings, Worker::spawn(|| {}));
+        app.restore_location();
         app
     }
 
@@ -236,7 +253,8 @@ impl App {
             .filter(|n| self.account_enabled(&n.account))
             .filter(|n| {
                 if searching {
-                    let body = n.body.to_lowercase();
+                    // A locked note is found by its title only.
+                    let body = if crate::lock::is_locked(&n.body) { n.title().to_lowercase() } else { n.body.to_lowercase() };
                     n.deleted.is_none() && words.iter().all(|w| body.contains(w.as_str()))
                 } else {
                     match &self.location {
@@ -291,7 +309,7 @@ impl App {
         if self.selected == id {
             if !self.multi.is_empty() {
                 self.multi.clear();
-                self.editor = id.and_then(|id| self.store.note(&id).map(|n| Editor::new(&id, &n.body)));
+                self.editor = id.and_then(|id| self.editor_for(&id));
             }
             return;
         }
@@ -307,7 +325,10 @@ impl App {
         }
         self.selected = id.clone();
         self.settings.last_note = id.clone();
-        self.editor = id.and_then(|id| self.store.note(&id).map(|n| Editor::new(&id, &n.body)));
+        self.editor = id.and_then(|id| self.editor_for(&id));
+        self.lock.typed.clear();
+        self.lock.error = None;
+        self.lock.focus = true;
         self.format_open = false;
         self.scroll_list = true;
     }
@@ -695,6 +716,9 @@ impl App {
         let Some(e) = &mut self.editor else { return };
         let Some(md) = e.take_markdown() else { return };
         let id = e.note_id.clone();
+        if self.store_locked(&id, &md) {
+            return;
+        }
         if let Some(n) = self.store.note_mut(&id) {
             if n.body != md {
                 n.body = md;
@@ -814,9 +838,13 @@ impl App {
             eprintln!("saving after sync: {e:#}");
         }
         // Follow the sync in the open note and the selection.
-        if let Some(e) = &mut self.editor {
-            match self.store.note(&e.note_id) {
-                Some(n) => e.reload(&n.body.clone()),
+        if let Some(id) = self.editor.as_ref().map(|e| e.note_id.clone()) {
+            match self.store.note(&id).map(|n| n.body.clone()) {
+                Some(body) if crate::lock::is_locked(&body) => match self.reopen_after_sync(&id) {
+                    Some(text) => self.editor.as_mut().unwrap().reload(&text),
+                    None => self.editor = None,
+                },
+                Some(body) => self.editor.as_mut().unwrap().reload(&body),
                 None => {
                     self.editor = None;
                     self.selected = None;
@@ -1157,6 +1185,7 @@ impl eframe::App for App {
         }
         self.schedule_syncs();
         self.shortcuts(ctx);
+        self.auto_lock(ctx);
 
         if self.settings.sidebar_visible {
             egui::SidePanel::left("sidebar")
@@ -1187,6 +1216,7 @@ impl eframe::App for App {
 
         self.flush_editor();
         self.confirm_dialog(ctx, &p);
+        self.lock_sheets(ctx, &p);
         self.settings_window(ctx, &p);
         self.notices_bar(ctx, &p);
         if self.last_purge.elapsed() > StdDuration::from_secs(3600) {
