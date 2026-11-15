@@ -23,6 +23,10 @@ pub enum Icon {
     Gear,
     ChevronRight,
     ChevronDown,
+    /// A folder with a plus: New Folder.
+    FolderPlus,
+    /// "…": more actions.
+    More,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -143,5 +147,20 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
         }
         Icon::ChevronRight => line(p, &[at(-1.5, -4.0), at(2.5, 0.0), at(-1.5, 4.0)], s),
         Icon::ChevronDown => line(p, &[at(-4.0, -1.5), at(0.0, 2.5), at(4.0, -1.5)], s),
+        Icon::FolderPlus => {
+            let pts = vec![at(-7.0, -4.5), at(-2.5, -4.5), at(-1.0, -3.0), at(2.0, -3.0)];
+            line(p, &pts, s);
+            line(p, &[at(7.0, 1.5), at(7.0, 5.5), at(-7.0, 5.5), at(-7.0, -4.5)], s);
+            line(p, &[at(-7.0, -1.0), at(1.5, -1.0)], s);
+            p.circle_filled(at(5.0, -3.5), 3.8 * u, color);
+            let cut = Stroke::new(s.width, if color.r() > 128 { Color32::BLACK } else { Color32::WHITE });
+            line(p, &[at(3.0, -3.5), at(7.0, -3.5)], cut);
+            line(p, &[at(5.0, -5.5), at(5.0, -1.5)], cut);
+        }
+        Icon::More => {
+            for x in [-5.0, 0.0, 5.0] {
+                p.circle_filled(at(x, 0.0), 1.3 * u, color);
+            }
+        }
     }
 }

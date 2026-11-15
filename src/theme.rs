@@ -14,9 +14,18 @@ pub const RED: Color32 = Color32::from_rgb(0xFF, 0x3B, 0x30);
 #[derive(Clone, Copy)]
 pub struct Palette {
     pub dark: bool,
-    /// The note itself and the notes list.
+    /// The note itself.
     pub bg: Color32,
+    /// The notes list, and the window behind the floating sidebar.
+    pub list_bg: Color32,
+    /// The floating sidebar panel, and its edge.
     pub sidebar: Color32,
+    pub sidebar_edge: Color32,
+    /// The selected folder: a yellow pill with white text.
+    pub folder_selection: Color32,
+    /// Round toolbar buttons and button groups ("glass"), and their edge.
+    pub glass: Color32,
+    pub glass_edge: Color32,
     pub text: Color32,
     /// Dates, snippets, counts.
     pub secondary: Color32,
@@ -50,20 +59,25 @@ impl Palette {
             Palette {
                 dark: true,
                 bg: Color32::from_rgb(0x1E, 0x1E, 0x1E),
-                sidebar: Color32::from_rgb(0x2B, 0x2A, 0x2A),
+                list_bg: Color32::from_rgb(0x26, 0x28, 0x2A),
+                sidebar: Color32::from_rgb(0x1F, 0x21, 0x23),
+                sidebar_edge: Color32::from_rgb(0x38, 0x3B, 0x3E),
+                folder_selection: Color32::from_rgb(0xFF, 0xC9, 0x38),
+                glass: Color32::from_rgb(0x26, 0x26, 0x27),
+                glass_edge: Color32::from_rgb(0x3A, 0x3A, 0x3C),
                 text: Color32::from_rgb(0xE4, 0xE4, 0xE4),
                 secondary: Color32::from_rgb(0x98, 0x98, 0x9D),
                 tertiary: Color32::from_rgb(0x5E, 0x5E, 0x62),
-                separator: Color32::from_rgb(0x38, 0x38, 0x3A),
-                selection: Color32::from_rgb(0x7A, 0x5F, 0x0E),
+                separator: Color32::from_rgb(0x3A, 0x3D, 0x40),
+                selection: Color32::from_rgb(0x82, 0x6A, 0x24),
                 selection_text: Color32::WHITE,
-                selection_inactive: Color32::from_rgb(0x3A, 0x3A, 0x3C),
+                selection_inactive: Color32::from_rgb(0x46, 0x46, 0x46),
                 text_selection: Color32::from_rgb(0x5E, 0x4B, 0x14),
                 accent: ACCENT_DARK,
                 hover: Color32::from_rgb(0x3A, 0x3A, 0x3C),
                 field: Color32::from_rgb(0x32, 0x32, 0x34),
                 card: Color32::from_rgb(0x2A, 0x2A, 0x2C),
-                popover: Color32::from_rgb(0x2C, 0x2C, 0x2E),
+                popover: Color32::from_rgb(0x26, 0x26, 0x28),
                 highlight: Color32::from_rgb(0x8A, 0x6D, 0x00),
                 code_bg: Color32::from_rgb(0x30, 0x30, 0x32),
             }
@@ -71,14 +85,19 @@ impl Palette {
             Palette {
                 dark: false,
                 bg: Color32::WHITE,
-                sidebar: Color32::from_rgb(0xEE, 0xED, 0xEC),
+                list_bg: Color32::from_rgb(0xF6, 0xF6, 0xF6),
+                sidebar: Color32::from_rgb(0xEC, 0xEC, 0xEC),
+                sidebar_edge: Color32::from_rgb(0xD9, 0xD9, 0xD9),
+                folder_selection: Color32::from_rgb(0xF7, 0xC1, 0x2E),
+                glass: Color32::WHITE,
+                glass_edge: Color32::from_rgb(0xDD, 0xDD, 0xDF),
                 text: Color32::from_rgb(0x1D, 0x1D, 0x1F),
                 secondary: Color32::from_rgb(0x86, 0x86, 0x8B),
                 tertiary: Color32::from_rgb(0xBF, 0xBF, 0xC4),
                 separator: Color32::from_rgb(0xE3, 0xE3, 0xE5),
                 selection: Color32::from_rgb(0xFE, 0xDE, 0x6E),
                 selection_text: Color32::from_rgb(0x1D, 0x1D, 0x1F),
-                selection_inactive: Color32::from_rgb(0xDE, 0xDD, 0xDC),
+                selection_inactive: Color32::from_rgb(0xE0, 0xE0, 0xE0),
                 text_selection: Color32::from_rgb(0xFC, 0xE8, 0x9E),
                 accent: ACCENT_LIGHT,
                 hover: Color32::from_rgb(0xE6, 0xE5, 0xE4),

@@ -30,9 +30,9 @@ pub struct Laid {
 /// Font size of a paragraph style, for a body size.
 pub fn size(kind: Kind, body: f32) -> f32 {
     match kind {
-        Kind::Title => (body * 1.87).round(),
-        Kind::Heading => (body * 1.47).round(),
-        Kind::Subheading => (body * 1.2).round(),
+        Kind::Title => (body * 1.6).round(),
+        Kind::Heading => (body * 1.33).round(),
+        Kind::Subheading => (body * 1.13).round(),
         Kind::Monospaced => body * 0.93,
         _ => body,
     }

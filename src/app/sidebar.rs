@@ -11,23 +11,30 @@ use crate::theme::{self, Palette};
 #[derive(Clone, Debug)]
 pub struct NoteDrag(pub Vec<String>);
 
-const ROW_H: f32 = 28.0;
+const ROW_H: f32 = 32.0;
+/// The gap around the floating sidebar panel.
+const INSET: f32 = 8.0;
 
 impl App {
     pub(super) fn sidebar(&mut self, ui: &mut Ui, p: &Palette) {
-        let full = ui.max_rect();
-        // Toolbar: settings, and the sidebar toggle.
-        let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
+        // A rounded panel floating over the window.
+        let full = ui.max_rect().shrink(INSET);
+        ui.painter().rect(full, 18.0, p.sidebar, egui::Stroke::new(1.0_f32, p.sidebar_edge));
+        // Toolbar: settings; New Folder and the sidebar toggle on the right.
+        let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H - INSET));
         ui.allocate_rect(bar, Sense::hover());
-        if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.left() + 26.0, bar.center().y), Vec2::splat(28.0)), Icon::Gear, "Settings (Ctrl+,)") {
+        let y = bar.center().y;
+        if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.left() + 24.0, y), Vec2::splat(30.0)), Icon::Gear, "Settings (Ctrl+,)") {
             self.settings_ui.open = true;
         }
-        if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.right() - 24.0, bar.center().y), Vec2::splat(28.0)), Icon::Sidebar, "Hide Folders (Ctrl+Alt+S)") {
+        if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.right() - 24.0, y), Vec2::splat(30.0)), Icon::Sidebar, "Hide Folders (Ctrl+Alt+S)") {
             self.settings.sidebar_visible = false;
         }
+        if tool_button(ui, p, Rect::from_center_size(Pos2::new(bar.right() - 62.0, y), Vec2::splat(30.0)), Icon::FolderPlus, "New Folder (Ctrl+Shift+N)") {
+            self.new_folder(None, None);
+        }
 
-        let bottom_h = 40.0;
-        let list_rect = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), Pos2::new(full.right(), full.bottom() - bottom_h));
+        let list_rect = Rect::from_min_max(Pos2::new(full.left() + 4.0, bar.bottom() + 6.0), Pos2::new(full.right() - 4.0, full.bottom() - 10.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
@@ -39,24 +46,14 @@ impl App {
             }
             self.tags_section(ui, p);
         });
-
-        // "New Folder"
-        let nf = Rect::from_min_size(Pos2::new(full.left() + 10.0, full.bottom() - bottom_h + 6.0), Vec2::new(120.0, 28.0));
-        let resp = ui.interact(nf, ui.id().with("new-folder"), Sense::click());
-        let color = if resp.hovered() { p.text } else { p.secondary };
-        icons::paint(ui.painter(), Icon::PlusCircle, Rect::from_center_size(Pos2::new(nf.left() + 11.0, nf.center().y), Vec2::splat(16.0)), color);
-        ui.painter().text(Pos2::new(nf.left() + 26.0, nf.center().y), Align2::LEFT_CENTER, "New Folder", theme::font(13.0), color);
-        if resp.clicked() {
-            self.new_folder(None, None);
-        }
     }
 
     fn account_section(&mut self, ui: &mut Ui, p: &Palette, account: &str, name: &str) {
         let collapsed = self.settings.collapsed.iter().any(|c| c == account);
         // Header: the account's name, with a chevron and sync state.
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::click());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
         let painter = ui.painter();
-        painter.text(Pos2::new(rect.left() + 14.0, rect.center().y + 2.0), Align2::LEFT_CENTER, name, theme::bold_font(11.5), p.secondary);
+        painter.text(Pos2::new(rect.left() + 16.0, rect.center().y + 2.0), Align2::LEFT_CENTER, name, theme::bold_font(12.0), p.secondary);
         let right = Pos2::new(rect.right() - 16.0, rect.center().y + 2.0);
         if resp.hovered() {
             let icon = if collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
@@ -224,33 +221,37 @@ impl App {
     #[allow(clippy::too_many_arguments)]
     fn row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
-        let inner = rect.shrink2(Vec2::new(8.0, 1.0));
+        let inner = rect.shrink2(Vec2::new(6.0, 1.0));
         let painter = ui.painter();
         let drop_hover = resp.dnd_hover_payload::<NoteDrag>().is_some();
+        // The selected folder is a yellow pill, whichever pane has the keyboard.
         if selected {
-            let active = self.focus == Pane::Sidebar;
-            painter.rect_filled(inner, 6.0, if active { p.selection } else { p.selection_inactive });
+            painter.rect_filled(inner, 10.0, p.folder_selection);
         } else if drop_hover {
-            painter.rect_stroke(inner, 6.0, egui::Stroke::new(2.0_f32, p.accent));
+            painter.rect_stroke(inner, 10.0, egui::Stroke::new(2.0_f32, p.folder_selection));
+        } else if resp.hovered() {
+            painter.rect_filled(inner, 10.0, p.hover);
         }
         let x0 = inner.left() + depth as f32 * 16.0;
         if let Some(f) = folded {
             let ic = if f { Icon::ChevronRight } else { Icon::ChevronDown };
             icons::paint(painter, ic, Rect::from_center_size(Pos2::new(x0 + 4.0, rect.center().y), Vec2::splat(10.0)), p.secondary);
         }
-        let text_color = if selected && self.focus == Pane::Sidebar { p.selection_text } else { p.text };
-        let icon_color = if selected && self.focus == Pane::Sidebar && !p.dark { p.selection_text } else { p.accent };
-        icons::paint(painter, icon, Rect::from_center_size(Pos2::new(x0 + 22.0, rect.center().y), Vec2::splat(16.0)), icon_color);
-        let max_w = inner.right() - (x0 + 36.0) - 30.0;
-        let galley = painter.layout(label.to_owned(), theme::font(13.5), text_color, max_w.max(10.0));
+        let text_color = if selected { egui::Color32::WHITE } else { p.text };
+        let icon_color = if selected { egui::Color32::WHITE } else { p.text };
+        icons::paint(painter, icon, Rect::from_center_size(Pos2::new(x0 + 24.0, rect.center().y), Vec2::splat(18.0)), icon_color);
+        let max_w = inner.right() - (x0 + 40.0) - 34.0;
+        let font = theme::font(14.0);
+        let galley = painter.layout(label.to_owned(), font.clone(), text_color, max_w.max(10.0));
         let galley = if galley.rows.len() > 1 {
-            painter.layout_no_wrap(truncate(label, max_w, ui), theme::font(13.5), text_color)
+            painter.layout_no_wrap(truncate(label, max_w, ui), font, text_color)
         } else {
             galley
         };
-        painter.galley(Pos2::new(x0 + 36.0, rect.center().y - galley.size().y / 2.0), galley, text_color);
+        painter.galley(Pos2::new(x0 + 40.0, rect.center().y - galley.size().y / 2.0), galley, text_color);
         if let (Some(n), true) = (count, self.settings.show_note_count) {
-            painter.text(Pos2::new(inner.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, n.to_string(), theme::font(12.5), p.secondary);
+            let c = if selected { egui::Color32::WHITE } else { p.secondary };
+            painter.text(Pos2::new(inner.right() - 10.0, rect.center().y), Align2::RIGHT_CENTER, n.to_string(), theme::font(13.0), c);
         }
         resp
     }
@@ -268,8 +269,8 @@ impl App {
             return;
         }
         tags.sort();
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
-        ui.painter().text(Pos2::new(rect.left() + 14.0, rect.center().y + 2.0), Align2::LEFT_CENTER, "Tags", theme::bold_font(11.5), p.secondary);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+        ui.painter().text(Pos2::new(rect.left() + 16.0, rect.center().y + 2.0), Align2::LEFT_CENTER, "Tags", theme::bold_font(12.0), p.secondary);
         ui.add_space(4.0);
         egui::Frame::none().inner_margin(egui::Margin { left: 12.0, right: 8.0, top: 0.0, bottom: 0.0 }).show(ui, |ui| ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
@@ -277,10 +278,10 @@ impl App {
                 let loc = Location::Tag(t.clone());
                 let selected = self.location == loc && self.search.is_empty();
                 let text = format!("#{t}");
-                let galley = ui.painter().layout_no_wrap(text, theme::font(12.5), if selected { p.selection_text } else { p.text });
+                let galley = ui.painter().layout_no_wrap(text, theme::font(12.5), if selected { egui::Color32::WHITE } else { p.text });
                 let size = galley.size() + Vec2::new(18.0, 8.0);
                 let (r, resp) = ui.allocate_exact_size(size, Sense::click());
-                let fill = if selected { p.selection } else if resp.hovered() { p.hover } else { p.field };
+                let fill = if selected { p.folder_selection } else if resp.hovered() { p.hover } else { p.field };
                 ui.painter().rect_filled(r, r.height() / 2.0, fill);
                 ui.painter().galley(r.center() - galley.size() / 2.0, galley, p.text);
                 if resp.clicked() {
@@ -322,10 +323,60 @@ pub fn tool_button(ui: &mut Ui, p: &Palette, rect: Rect, icon: Icon, tip: &str) 
 pub fn tool_button_state(ui: &mut Ui, p: &Palette, rect: Rect, icon: Icon, tip: &str, enabled: bool, on: bool) -> bool {
     let resp = ui.interact(rect, ui.id().with(("tool", tip)), if enabled { Sense::click() } else { Sense::hover() });
     if enabled && (resp.hovered() || on) {
-        ui.painter().rect_filled(rect, 6.0, p.hover);
+        ui.painter().rect_filled(rect, rect.height() / 2.0, p.hover);
     }
-    let color = if !enabled { p.tertiary } else { p.secondary };
+    let color = if !enabled { p.tertiary } else { p.text };
     icons::paint(ui.painter(), icon, rect.shrink(rect.height() * 0.2), color);
     let resp = resp.on_hover_text(tip);
     enabled && resp.clicked()
+}
+
+/// Paints a "glass" shape: a raised, softly outlined round rect.
+pub fn glass(ui: &Ui, p: &Palette, rect: Rect) {
+    let r = rect.height() / 2.0;
+    let painter = ui.painter();
+    painter.rect_filled(rect.translate(Vec2::new(0.0, 1.5)), r, egui::Color32::from_black_alpha(if p.dark { 70 } else { 18 }));
+    painter.rect(rect, r, p.glass, egui::Stroke::new(1.0_f32, p.glass_edge));
+}
+
+/// A round glass toolbar button (Apple's New Note, Search, "…").
+pub fn glass_button(ui: &mut Ui, p: &Palette, center: Pos2, icon: Icon, tip: &str, enabled: bool) -> egui::Response {
+    let rect = Rect::from_center_size(center, Vec2::splat(36.0));
+    glass(ui, p, rect);
+    capsule_item(ui, p, rect, icon, tip, enabled, false)
+}
+
+/// A button inside a glass capsule (or a glass button's face).
+pub fn capsule_item(ui: &mut Ui, p: &Palette, rect: Rect, icon: Icon, tip: &str, enabled: bool, on: bool) -> egui::Response {
+    let resp = ui.interact(rect, ui.id().with(("glass", tip)), if enabled { Sense::click() } else { Sense::hover() });
+    if enabled && (resp.hovered() || on) {
+        ui.painter().rect_filled(rect.shrink(3.0), (rect.height() - 6.0) / 2.0, p.hover);
+    }
+    let color = if enabled { p.text } else { p.tertiary };
+    icons::paint(ui.painter(), icon, Rect::from_center_size(rect.center(), Vec2::splat(rect.height() * 0.56)), color);
+    resp.on_hover_text(tip)
+}
+
+/// The frame of Apple-style menus and popovers.
+pub fn popover_frame(ui: &Ui, p: &Palette) -> egui::Frame {
+    egui::Frame::popup(ui.style())
+        .fill(p.popover)
+        .rounding(14.0)
+        .stroke(egui::Stroke::new(1.0_f32, p.glass_edge))
+        .inner_margin(egui::Margin::same(6.0))
+}
+
+/// Menu items without a frame, highlighted when hovered (as in Apple's
+/// menus).
+pub fn menu_look(ui: &mut Ui, p: &Palette) {
+    let v = ui.visuals_mut();
+    v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    v.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    for w in [&mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.weak_bg_fill = p.hover;
+        w.bg_stroke = egui::Stroke::NONE;
+        w.rounding = egui::Rounding::same(7.0);
+    }
+    ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+    ui.style_mut().text_styles.insert(egui::TextStyle::Button, theme::font(14.0));
 }

@@ -153,7 +153,7 @@ impl App {
         .collapsible(false)
         .resizable(false)
         .default_pos(ctx.screen_rect().center() - Vec2::new(280.0, 220.0))
-        .fixed_size(Vec2::new(560.0, 400.0))
+        .fixed_size(Vec2::new(600.0, 470.0))
         .frame(egui::Frame::window(&ctx.style()).fill(p.popover).inner_margin(egui::Margin::same(16.0)))
         .show(ctx, |ui| {
             self.tab_bar(ui, p);
@@ -193,9 +193,7 @@ impl App {
     fn general_tab(&mut self, ui: &mut Ui, p: &Palette) {
         let accounts: Vec<(String, String)> = self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
         let s = &mut self.settings;
-        form_row(ui, p, "Default account:", |ui| {
-            combo(ui, "default-account", &mut s.default_account, &accounts);
-        });
+        ui.spacing_mut().item_spacing.y = 8.0;
         form_row(ui, p, "Sort notes by:", |ui| {
             let opts: Vec<(SortBy, String)> = SortBy::ALL.iter().map(|o| (*o, o.label().to_owned())).collect();
             combo(ui, "sort-by", &mut s.sort_by, &opts);
@@ -204,29 +202,31 @@ impl App {
             let opts: Vec<(StartWith, String)> = StartWith::ALL.iter().map(|o| (*o, o.label().to_owned())).collect();
             combo(ui, "start-with", &mut s.start_with, &opts);
         });
-        form_row(ui, p, "Sort checked items:", |ui| {
-            combo(ui, "sort-checked", &mut s.sort_checked, &[(false, "Manually".into()), (true, "Automatically".into())]);
+        form_row(ui, p, "Default account:", |ui| {
+            combo(ui, "default-account", &mut s.default_account, &accounts);
         });
+        explain(ui, p, "New notes go to this account when no folder of another account is selected.");
+        ui.add_space(4.0);
+        check_row(ui, p, &mut s.group_by_date, "Group notes by date", "When sorted by Date Edited or Date Created, group notes by date.");
+        check_row(ui, p, &mut s.sort_checked, "Automatically sort checked items", "Automatically move checklist items to the bottom of the list as they are checked.");
+        check_row(ui, p, &mut s.show_note_count, "Show note count", "Show how many notes each folder has in the sidebar.");
+        ui.separator();
         form_row(ui, p, "Default text size:", |ui| {
             let mut i = TEXT_SIZES.iter().position(|&t| t >= s.text_size).unwrap_or(3);
             ui.label(RichText::new("A").size(11.0));
-            if ui.add(egui::Slider::new(&mut i, 0..=TEXT_SIZES.len() - 1).show_value(false)).changed() {
+            ui.spacing_mut().slider_width = 270.0;
+            ui.visuals_mut().selection.bg_fill = p.folder_selection;
+            if ui.add(egui::Slider::new(&mut i, 0..=TEXT_SIZES.len() - 1).show_value(false).trailing_fill(true)).changed() {
                 s.text_size = TEXT_SIZES[i];
             }
-            ui.label(RichText::new("A").size(17.0));
+            ui.label(RichText::new("A").size(19.0));
         });
-        ui.add_space(6.0);
-        form_row(ui, p, "", |ui| {
-            ui.checkbox(&mut s.group_by_date, "Group notes by date");
-        });
-        form_row(ui, p, "", |ui| {
-            ui.checkbox(&mut s.show_note_count, "Show note count");
-        });
-        ui.add_space(6.0);
+        ui.separator();
         form_row(ui, p, "Check for changes:", |ui| {
             let opts: Vec<(u32, String)> = REFRESH_CHOICES.iter().map(|&m| (m, refresh_label(m))).collect();
             combo(ui, "refresh", &mut s.refresh_minutes, &opts);
         });
+        explain(ui, p, "How often synced accounts look for changes made on other devices.");
     }
 
     fn accounts_tab(&mut self, ui: &mut Ui, p: &Palette) {
@@ -721,15 +721,56 @@ fn wrapped(ui: &mut Ui, text: &str, color: egui::Color32) {
 
 fn form_row(ui: &mut Ui, p: &Palette, label: &str, add: impl FnOnce(&mut Ui)) {
     ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(Vec2::new(LABEL_W, 24.0), Sense::hover());
-        ui.painter().text(Pos2::new(r.right(), r.center().y), Align2::RIGHT_CENTER, label, theme::font(13.0), p.text);
+        let (r, _) = ui.allocate_exact_size(Vec2::new(LABEL_W, 28.0), Sense::hover());
+        ui.painter().text(Pos2::new(r.right(), r.center().y), Align2::RIGHT_CENTER, label, theme::font(14.0), p.text);
+        ui.add_space(4.0);
         add(ui);
     });
 }
 
+/// A grey note under a setting, lined up with the controls.
+fn explain(ui: &mut Ui, p: &Palette, text: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 16.0);
+        ui.add(egui::Label::new(RichText::new(text).color(p.secondary).size(12.5)).wrap());
+    });
+}
+
+/// Apple's settings checkbox: a yellow box, a label, and a grey
+/// explanation under it.
+fn check_row(ui: &mut Ui, p: &Palette, value: &mut bool, label: &str, detail: &str) {
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 14.0);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            let g = ui.painter().layout_no_wrap(label.to_owned(), theme::font(14.0), p.text);
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(26.0 + g.size().x, 24.0), Sense::click());
+            let bx = Rect::from_min_size(Pos2::new(r.left(), r.center().y - 9.0), Vec2::splat(18.0));
+            if *value {
+                ui.painter().rect_filled(bx, 5.0, p.folder_selection);
+                let s = egui::Stroke::new(2.0_f32, if p.dark { egui::Color32::from_rgb(0x1E, 0x1E, 0x1E) } else { egui::Color32::WHITE });
+                let c = bx.center();
+                ui.painter().add(egui::Shape::line(vec![c + Vec2::new(-4.5, 0.0), c + Vec2::new(-1.2, 3.5), c + Vec2::new(4.8, -3.8)], s));
+            } else {
+                ui.painter().rect(bx, 5.0, p.field, egui::Stroke::new(1.0_f32, p.glass_edge));
+            }
+            ui.painter().galley(Pos2::new(r.left() + 26.0, r.center().y - g.size().y / 2.0), g, p.text);
+            if resp.clicked() {
+                *value = !*value;
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(26.0);
+                ui.add(egui::Label::new(RichText::new(detail).color(p.secondary).size(12.5)).wrap());
+            });
+        });
+    });
+    ui.add_space(2.0);
+}
+
 fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)]) {
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
-    egui::ComboBox::from_id_salt(id).selected_text(current).width(200.0).show_ui(ui, |ui| {
+    ui.spacing_mut().interact_size.y = 28.0;
+    egui::ComboBox::from_id_salt(id).selected_text(current).width(320.0).height(300.0).show_ui(ui, |ui| {
         for (v, l) in options {
             ui.selectable_value(value, v.clone(), l);
         }

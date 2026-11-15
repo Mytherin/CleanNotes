@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Align2, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{tool_button, tool_button_state, truncate, NoteDrag};
+use super::sidebar::{glass_button, menu_look, popover_frame, tool_button, truncate, NoteDrag};
 use super::{list_time, App, Confirm, Location, Pane, TOOLBAR_H};
 use crate::icons::Icon;
 use crate::markdown;
@@ -13,49 +13,89 @@ use crate::theme::{self, Palette};
 const ROW_H: f32 = 64.0;
 
 impl App {
-    /// The list/gallery switch and the delete button, from `x`.
-    fn view_controls(&mut self, ui: &mut Ui, p: &Palette, bar: Rect, mut x: f32) -> f32 {
+    /// What's shown in the list, for its header.
+    fn location_title(&self) -> String {
+        if !self.search.trim().is_empty() {
+            return "Search".into();
+        }
+        match &self.location {
+            Location::Folder(f) => self.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
+            Location::Deleted(_) => "Recently Deleted".into(),
+            Location::Tag(t) => format!("#{t}"),
+        }
+    }
+
+    /// The list's header: the folder's name and note count, and the "…"
+    /// view menu at `more_x`. Returns where the header text ends.
+    fn list_header(&mut self, ui: &mut Ui, p: &Palette, bar: Rect, more_x: f32) -> f32 {
         let y = bar.center().y;
+        let mut x = bar.left() + 18.0;
         if !self.settings.sidebar_visible {
-            if tool_button(ui, p, Rect::from_center_size(Pos2::new(x + 14.0, y), Vec2::splat(28.0)), Icon::Sidebar, "Show Folders (Ctrl+Alt+S)") {
+            if tool_button(ui, p, Rect::from_center_size(Pos2::new(x + 12.0, y), Vec2::splat(30.0)), Icon::Sidebar, "Show Folders (Ctrl+Alt+S)") {
                 self.settings.sidebar_visible = true;
             }
-            x += 36.0;
+            x += 40.0;
         }
-        // Segmented control.
-        let track = Rect::from_min_size(Pos2::new(x, y - 13.0), Vec2::new(64.0, 26.0));
-        ui.painter().rect_filled(track, 7.0, p.field);
-        for (i, (view, icon, tip)) in [(ListView::List, Icon::List, "View as List (Ctrl+1)"), (ListView::Gallery, Icon::Gallery, "View as Gallery (Ctrl+2)")]
-            .into_iter()
-            .enumerate()
-        {
-            let r = Rect::from_min_size(Pos2::new(track.left() + 2.0 + i as f32 * 30.0, track.top() + 2.0), Vec2::new(30.0, 22.0));
-            if self.settings.view == view {
-                ui.painter().rect_filled(r, 5.5, if p.dark { p.hover } else { p.bg });
-            }
-            let resp = ui.interact(r, ui.id().with(tip), Sense::click()).on_hover_text(tip);
-            crate::icons::paint(ui.painter(), icon, r.shrink(4.0), p.secondary);
-            if resp.clicked() {
-                self.settings.view = view;
-            }
+        let n = self.shown.len();
+        let max_w = (more_x - 24.0 - x).max(40.0);
+        let title = truncate(&self.location_title(), max_w, ui);
+        ui.painter().text(Pos2::new(x, y - 8.0), Align2::LEFT_CENTER, title, theme::bold_font(15.0), p.text);
+        let count = if n == 1 { "1 note".to_owned() } else { format!("{n} notes") };
+        ui.painter().text(Pos2::new(x, y + 11.0), Align2::LEFT_CENTER, count, theme::font(12.5), p.secondary);
+
+        let resp = glass_button(ui, p, Pos2::new(more_x, y), Icon::More, "View Options", true);
+        let id = ui.id().with("view-menu");
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
         }
-        x = track.right() + 10.0;
-        let can_delete = self.selected.is_some();
-        if tool_button_state(ui, p, Rect::from_center_size(Pos2::new(x + 14.0, y), Vec2::splat(28.0)), Icon::Trash, "Delete", can_delete, false) {
-            self.delete_notes(self.selected_ids());
-        }
-        x + 36.0
+        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            popover_frame(ui, p).show(ui, |ui| {
+                menu_look(ui, p);
+                ui.set_min_width(210.0);
+                let mut close = false;
+                let gallery = self.settings.view == ListView::Gallery;
+                let (label, view) = if gallery { ("View as List", ListView::List) } else { ("View as Gallery", ListView::Gallery) };
+                if ui.add(egui::Button::new(label).shortcut_text(if gallery { cmd_key!("1") } else { cmd_key!("2") })).clicked() {
+                    self.settings.view = view;
+                    close = true;
+                }
+                ui.separator();
+                ui.menu_button("Sort By", |ui| {
+                    for o in crate::settings::SortBy::ALL {
+                        if ui.radio(self.settings.sort_by == o, o.label()).clicked() {
+                            self.settings.sort_by = o;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("Group By Date", |ui| {
+                    for (on, l) in [(true, "On"), (false, "Off")] {
+                        if ui.radio(self.settings.group_by_date == on, l).clicked() {
+                            self.settings.group_by_date = on;
+                            ui.close_menu();
+                        }
+                    }
+                });
+                if ui.checkbox(&mut self.settings.show_note_count, "Show Note Count").clicked() {
+                    close = true;
+                }
+                if close {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
+        x
     }
 
     pub(super) fn notes_list(&mut self, ui: &mut Ui, p: &Palette) {
         let full = ui.max_rect();
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
-        self.view_controls(ui, p, bar, bar.left() + 12.0);
-
         let sections = self.list_sections();
         self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
-        let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
+        self.list_header(ui, p, bar, bar.right() - 30.0);
+
+        let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom() + 4.0), full.max);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::LEFT)));
         if self.shown.is_empty() {
             let msg = if !self.search.trim().is_empty() { "No Results" } else { "No Notes" };
@@ -67,14 +107,20 @@ impl App {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (name, ids) in &sections {
                 if !name.is_empty() {
-                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
-                    ui.painter().text(Pos2::new(r.left() + 18.0, r.bottom() - 9.0), Align2::LEFT_CENTER, name, theme::bold_font(13.0), p.text);
+                    // Apple's big section titles, with a line under them.
+                    let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::hover());
+                    ui.painter().text(Pos2::new(r.left() + 18.0, r.bottom() - 18.0), Align2::LEFT_CENTER, name, theme::bold_font(16.0), p.text);
+                    ui.painter().line_segment(
+                        [Pos2::new(r.left() + 16.0, r.bottom() - 0.5), Pos2::new(r.right() - 16.0, r.bottom() - 0.5)],
+                        egui::Stroke::new(1.0_f32, p.separator),
+                    );
+                    ui.add_space(6.0);
                 }
                 for (i, id) in ids.iter().enumerate() {
                     let next_selected = ids.get(i + 1).is_some_and(|n| self.is_selected(n));
                     self.note_row(ui, p, id, show_folder, i + 1 < ids.len() && !next_selected);
                 }
-                ui.add_space(6.0);
+                ui.add_space(14.0);
             }
         });
         self.scroll_list = false;
@@ -97,10 +143,10 @@ impl App {
         if selected && self.scroll_list {
             ui.scroll_to_rect(rect, None);
         }
-        let inner = rect.shrink2(Vec2::new(8.0, 0.0));
+        let inner = rect.shrink2(Vec2::new(10.0, 0.0));
         let painter = ui.painter();
         if selected {
-            painter.rect_filled(inner, 7.0, if active { p.selection } else { p.selection_inactive });
+            painter.rect_filled(inner, 10.0, if active { p.selection } else { p.selection_inactive });
         } else if separator {
             painter.line_segment(
                 [Pos2::new(inner.left() + 12.0, rect.bottom() - 0.5), Pos2::new(inner.right() - 4.0, rect.bottom() - 0.5)],
@@ -109,8 +155,8 @@ impl App {
         }
         let text = p.on_selection(active);
         let sub = if active { theme::blend(p.selection, p.selection_text, 0.6) } else { p.secondary };
-        let x = inner.left() + 12.0;
-        let w = inner.width() - 24.0;
+        let x = inner.left() + 16.0;
+        let w = inner.width() - 32.0;
         let title_line = truncate(&title, w, ui);
         painter.text(Pos2::new(x, rect.top() + 18.0), Align2::LEFT_CENTER, title_line, theme::bold_font(13.5), text);
         let tg = painter.layout_no_wrap(time.clone(), theme::bold_font(12.5), text);
@@ -178,30 +224,7 @@ impl App {
                 }
                 ui.close_menu();
             }
-            ui.menu_button("Move to", |ui| {
-                let accounts: Vec<(String, String)> =
-                    self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
-                let several = accounts.len() > 1;
-                for (aid, aname) in accounts {
-                    if several {
-                        ui.label(egui::RichText::new(aname).small().strong());
-                    }
-                    let folders: Vec<(String, String, usize)> = self
-                        .store
-                        .folder_tree(&aid)
-                        .into_iter()
-                        .map(|(f, d)| (f.id.clone(), f.name.clone(), d))
-                        .collect();
-                    for (fid, fname, depth) in folders {
-                        let label = format!("{}{}", "    ".repeat(depth), fname);
-                        let all_there = ids.iter().all(|i| self.store.note(i).is_some_and(|n| n.folder == fid));
-                        if ui.add_enabled(!all_there, egui::Button::new(label)).clicked() {
-                            self.move_notes(&ids, &fid);
-                            ui.close_menu();
-                        }
-                    }
-                }
-            });
+            ui.menu_button("Move to", |ui| self.move_to_menu(ui, &ids));
             if !several && ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
                 self.duplicate_note(id);
                 ui.close_menu();
@@ -224,6 +247,28 @@ impl App {
         });
     }
 
+    /// The folders of every account, to move `ids` into one.
+    pub(super) fn move_to_menu(&mut self, ui: &mut Ui, ids: &[String]) {
+        let accounts: Vec<(String, String)> = self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let several = accounts.len() > 1;
+        for (aid, aname) in accounts {
+            if several {
+                ui.label(egui::RichText::new(aname).small().strong());
+            }
+            let folders: Vec<(String, String, usize)> =
+                self.store.folder_tree(&aid).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
+            for (fid, fname, depth) in folders {
+                let label = format!("{}{}", "    ".repeat(depth), fname);
+                let all_there = ids.iter().all(|i| self.store.note(i).is_some_and(|n| n.folder == fid));
+                if ui.add_enabled(!all_there, egui::Button::new(label)).clicked() {
+                    self.move_notes(ids, &fid);
+                    ui.close_menu();
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            }
+        }
+    }
+
     /// The gallery: thumbnails in a grid; double-click opens a note.
     pub(super) fn gallery(&mut self, ui: &mut Ui, p: &Palette) {
         if self.gallery_open && self.editor.is_some() {
@@ -234,16 +279,14 @@ impl App {
         let full = ui.max_rect();
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
-        let x = self.view_controls(ui, p, bar, bar.left() + 12.0);
-        if tool_button(ui, p, Rect::from_center_size(Pos2::new(x + 14.0, bar.center().y), Vec2::splat(28.0)), Icon::Compose, "New Note (Ctrl+N)") {
+        let sections = self.list_sections();
+        self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
+        let left = self.search_control(ui, p, bar.right() - 14.0, bar.center().y);
+        if glass_button(ui, p, Pos2::new(left - 28.0, bar.center().y), Icon::Compose, "New Note (Ctrl+N)", true).clicked() {
             self.new_note();
             self.gallery_open = true;
         }
-        self.search_field(ui, p, bar);
-        ui.painter().line_segment([Pos2::new(full.left(), bar.bottom()), Pos2::new(full.right(), bar.bottom())], egui::Stroke::new(1.0_f32, p.separator));
-
-        let sections = self.list_sections();
-        self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
+        self.list_header(ui, p, bar, left - 74.0);
         let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom() + 1.0), full.max);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::LEFT)));
         if self.shown.is_empty() {

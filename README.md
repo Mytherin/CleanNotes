@@ -6,10 +6,11 @@ Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCa
 ## Features
 
 - **Three panes like Apple Notes:** folders (per account, nested, with note counts), the notes list (title, time and first line, in sections: Pinned, Today, Yesterday, Previous 7 Days, Previous 30 Days, months, years), and the note. A **gallery view** shows notes as thumbnails (double-click opens one).
+- **The macOS 26 look:** the sidebar floats as a rounded panel with the selected folder as a yellow pill; the list has a header with the folder's name and note count and a round "…" menu (list or gallery, sort, group by date, note counts), with large date sections; the toolbar has round glass buttons (New Note, "…" note menu, Search, which opens into a field) and a capsule with Aa, checklist and link.
 - **Rich text editor** with Apple Notes' paragraph styles: Title, Heading, Subheading, Body, Monospaced, bulleted (•), dashed (–) and numbered lists, checklists, and block quotes; bold, italic, underline, strikethrough and links. Lists indent and outdent (Tab / Shift+Tab), list items move up and down, and checked items can sort to the bottom. Typing `- `, `* `, `1. ` or `[] ` at the start of a line starts a list. Plain URLs and `#tags` are highlighted; links open on click.
-- **The Aa menu** (character styles on top, paragraph styles shown in their own style), checklist and link buttons in the toolbar, and a right-click menu in the editor.
+- **The Aa menu** (B I U S on top, paragraph styles shown in their own style below), checklist and link buttons in the toolbar, the note's "…" menu (pin, find, move, duplicate, copy as Markdown, delete), and a right-click menu in the editor.
 - **Find in note** (Ctrl+F, with match count and next/previous) and **search all notes** from the toolbar (every word must match; matches are highlighted in the note).
-- **Folders:** new (Ctrl+Shift+N or "New Folder"), rename (double-click), delete (notes go to Recently Deleted), subfolders, drag notes onto a folder, or "Move to" from a note's menu, also into another account.
+- **Folders:** new (Ctrl+Shift+N or the New Folder button at the top of the sidebar), rename (double-click), delete (notes go to Recently Deleted), subfolders, drag notes onto a folder, or "Move to" from a note's menu, also into another account.
 - **Recently Deleted** per account: notes stay 30 days, can be recovered, and can't be edited until they are (as in Apple Notes).
 - **Tags:** `#words` in notes become tags in the sidebar; a new note made in a tag carries it.
 - **Pinning, duplicating** (Ctrl+D), **copy as Markdown**, and a clipboard that keeps formatting within the app.
@@ -158,7 +159,7 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 | `src/app.rs` | App state, note and folder actions, shortcuts, saving, sync scheduling, dialogs |
 | `src/app/sidebar.rs` | Accounts, folders, Recently Deleted, tags, New Folder |
 | `src/app/list.rs` | The notes list and the gallery |
-| `src/app/note_pane.rs` | The note's toolbar, Aa menu, search field, find bar, link sheet |
+| `src/app/note_pane.rs` | The note's toolbar, Aa and "…" menus, search, find bar, link sheet |
 | `src/app/settings_window.rs` | Settings: General and Accounts, with the sign-in sheets |
 | `src/editor/mod.rs` | The rich-text editor: input, commands, undo, find, clipboard |
 | `src/editor/layout.rs` | Laying out and painting paragraphs, list markers, checkboxes |

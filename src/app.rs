@@ -77,6 +77,8 @@ pub struct App {
     /// The toolbar search (searches all notes).
     pub search: String,
     pub search_focus: bool,
+    /// The round search button has opened into a field.
+    pub search_open: bool,
     /// Notes changed since the last save.
     unsaved: HashSet<String>,
     last_save: Instant,
@@ -141,6 +143,7 @@ impl App {
             focus: Pane::List,
             search: String::new(),
             search_focus: false,
+            search_open: false,
             unsaved: HashSet::new(),
             last_save: Instant::now(),
             last_purge: Instant::now(),
@@ -1158,9 +1161,10 @@ impl eframe::App for App {
         if self.settings.sidebar_visible {
             egui::SidePanel::left("sidebar")
                 .resizable(true)
-                .default_width(220.0)
-                .width_range(170.0..=360.0)
-                .frame(egui::Frame::none().fill(p.sidebar))
+                .default_width(240.0)
+                .width_range(190.0..=380.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::none().fill(p.list_bg))
                 .show(ctx, |ui| self.sidebar(ui, &p));
         }
         let list_w = if self.settings.view == ListView::Gallery { 0.0 } else { 300.0 };
@@ -1169,7 +1173,8 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_width(list_w)
                 .width_range(220.0..=480.0)
-                .frame(egui::Frame::none().fill(p.bg).stroke(egui::Stroke::new(1.0_f32, p.separator)))
+                .show_separator_line(false)
+                .frame(egui::Frame::none().fill(p.list_bg))
                 .show(ctx, |ui| self.notes_list(ui, &p));
         }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(p.bg)).show(ctx, |ui| {

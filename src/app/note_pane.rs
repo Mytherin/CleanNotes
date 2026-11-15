@@ -3,8 +3,8 @@
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{tool_button, tool_button_state};
-use super::{modal, note_header_time, App, Pane, TOOLBAR_H};
+use super::sidebar::{capsule_item, glass, glass_button, menu_look, popover_frame, tool_button};
+use super::{modal, note_header_time, App, Confirm, Pane, TOOLBAR_H};
 use crate::doc::{Attr, Kind};
 use crate::editor::{Command, Options};
 use crate::icons::Icon;
@@ -16,11 +16,11 @@ const STYLES: [(&str, Kind, &str); 9] = [
     ("Heading", Kind::Heading, cmd_key!("Shift+H")),
     ("Subheading", Kind::Subheading, cmd_key!("Shift+J")),
     ("Body", Kind::Body, cmd_key!("Shift+B")),
-    ("Monospaced", Kind::Monospaced, cmd_key!("Shift+M")),
+    ("Monostyled", Kind::Monospaced, cmd_key!("Shift+M")),
     ("•  Bulleted List", Kind::Bulleted, cmd_key!("Shift+7")),
     ("–  Dashed List", Kind::Dashed, cmd_key!("Shift+8")),
     ("1.  Numbered List", Kind::Numbered, cmd_key!("Shift+9")),
-    ("|  Block Quote", Kind::Quote, cmd_key!("'")),
+    ("Block Quote", Kind::Quote, cmd_key!("'")),
 ];
 
 impl App {
@@ -32,33 +32,42 @@ impl App {
         let read_only = self.selected.as_ref().and_then(|s| self.store.note(s)).is_some_and(|n| n.deleted.is_some());
         let has_note = self.editor.is_some();
         let mut x = bar.left() + 14.0;
-        let btn = |x: f32| Rect::from_center_size(Pos2::new(x + 14.0, y), Vec2::new(30.0, 28.0));
         if self.gallery_open {
-            if tool_button(ui, p, btn(x), Icon::ChevronRight, "Back to Gallery") {
+            if tool_button(ui, p, Rect::from_center_size(Pos2::new(x + 15.0, y), Vec2::splat(30.0)), Icon::ChevronRight, "Back to Gallery") {
                 self.gallery_open = false;
             }
-            x += 38.0;
-        } else if !self.settings.sidebar_visible && self.settings.view == crate::settings::ListView::List {
-            // The list pane shows the sidebar toggle.
+            x += 40.0;
         }
-        if tool_button(ui, p, btn(x), Icon::Compose, "New Note (Ctrl+N)") {
+        // New Note, in a round glass button.
+        if glass_button(ui, p, Pos2::new(x + 18.0, y), Icon::Compose, "New Note (Ctrl+N)", true).clicked() {
             self.new_note();
         }
-        x += 52.0;
+        let compose_right = x + 36.0;
+
+        // Search and "…" on the right.
+        let search_left = self.search_control(ui, p, bar.right() - 14.0, y);
+        let more = glass_button(ui, p, Pos2::new(search_left - 28.0, y), Icon::More, "More", has_note);
+        self.note_more_menu(ui, p, &more);
+
+        // The formatting buttons, in a glass capsule in the middle.
         let editable = has_note && !read_only;
-        let aa_rect = btn(x);
-        if tool_button_state(ui, p, aa_rect, Icon::Format, "Format", editable, self.format_open) {
+        let item = 40.0;
+        let cap_w = item * 3.0 + 8.0;
+        let room = (compose_right + 12.0, search_left - 56.0 - 12.0);
+        let cx = (bar.center().x).clamp(room.0 + cap_w / 2.0, (room.1 - cap_w / 2.0).max(room.0 + cap_w / 2.0));
+        let cap = Rect::from_center_size(Pos2::new(cx, y), Vec2::new(cap_w, 36.0));
+        glass(ui, p, cap);
+        let slot = |i: usize| Rect::from_min_size(Pos2::new(cap.left() + 4.0 + i as f32 * item, cap.top()), Vec2::new(item, 36.0));
+        let aa_rect = slot(0);
+        if capsule_item(ui, p, aa_rect, Icon::Format, "Format", editable, self.format_open).clicked() && editable {
             self.format_open = !self.format_open;
         }
-        x += 36.0;
-        if tool_button_state(ui, p, btn(x), Icon::Checklist, &format!("Checklist ({})", cmd_key!("Shift+L")), editable, false) {
+        if capsule_item(ui, p, slot(1), Icon::Checklist, &format!("Checklist ({})", cmd_key!("Shift+L")), editable, false).clicked() && editable {
             self.editor_command(Command::SetKind(Kind::Checklist(false)));
         }
-        x += 36.0;
-        if tool_button_state(ui, p, btn(x), Icon::Link, &format!("Add Link ({})", cmd_key!("K")), editable, false) {
+        if capsule_item(ui, p, slot(2), Icon::Link, &format!("Add Link ({})", cmd_key!("K")), editable, false).clicked() && editable {
             self.editor_command(Command::EditLink);
         }
-        self.search_field(ui, p, bar);
         if self.format_open {
             self.format_menu(ui, p, aa_rect);
         }
@@ -130,6 +139,63 @@ impl App {
         painter.text(c + Vec2::new(0.0, 110.0), Align2::CENTER_CENTER, format!("{n} Notes Selected"), theme::font(15.0), p.secondary);
     }
 
+    /// The note's "…" menu: pin, find, move, duplicate, delete.
+    fn note_more_menu(&mut self, ui: &mut Ui, p: &Palette, resp: &egui::Response) {
+        let id = ui.id().with("note-more");
+        if resp.clicked() && self.editor.is_some() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        let Some(note) = self.selected.clone().and_then(|s| self.store.note(&s).cloned()) else { return };
+        let ids = vec![note.id.clone()];
+        egui::popup_below_widget(ui, id, resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            popover_frame(ui, p).show(ui, |ui| {
+                menu_look(ui, p);
+                ui.set_min_width(220.0);
+                let mut close = false;
+                if note.deleted.is_some() {
+                    if ui.button("Recover Note").clicked() {
+                        self.recover_note(&note.id);
+                        close = true;
+                    }
+                    if ui.button("Delete Permanently…").clicked() {
+                        self.confirm = Some(Confirm::DeleteNotesForever(ids.clone()));
+                        close = true;
+                    }
+                } else {
+                    if ui.button(if note.pinned { "Unpin Note" } else { "Pin Note" }).clicked() {
+                        self.toggle_pin(&note.id);
+                        close = true;
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
+                        if let Some(e) = &mut self.editor {
+                            e.find.open = true;
+                            e.find.focus = true;
+                        }
+                        close = true;
+                    }
+                    ui.menu_button("Move to", |ui| self.move_to_menu(ui, &ids));
+                    if ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
+                        self.duplicate_note(&note.id);
+                        close = true;
+                    }
+                    if ui.button("Copy as Markdown").clicked() {
+                        ui.ctx().copy_text(note.body.clone());
+                        close = true;
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Delete Note").shortcut_text(cmd_key!("Backspace"))).clicked() {
+                        self.delete_notes(ids.clone());
+                        close = true;
+                    }
+                }
+                if close {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
+    }
+
     fn deleted_banner(&mut self, ui: &mut Ui, p: &Palette, id: &str) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -199,17 +265,32 @@ impl App {
         }
     }
 
-    /// The search field at the right of the toolbar (searches all notes).
-    pub(super) fn search_field(&mut self, ui: &mut Ui, p: &Palette, bar: Rect) {
-        let w = (bar.width() * 0.32).clamp(120.0, 220.0);
-        let r = Rect::from_min_size(Pos2::new(bar.right() - w - 14.0, bar.center().y - 13.0), Vec2::new(w, 26.0));
-        ui.painter().rect_filled(r, 7.0, p.field);
-        crate::icons::paint(ui.painter(), Icon::Search, Rect::from_center_size(Pos2::new(r.left() + 14.0, r.center().y), Vec2::splat(14.0)), p.secondary);
-        let te_rect = Rect::from_min_max(Pos2::new(r.left() + 24.0, r.top() + 2.0), Pos2::new(r.right() - 22.0, r.bottom() - 2.0));
+    /// Search (all notes): a round button ending at `right` that opens
+    /// into a field. Returns its left edge.
+    pub(super) fn search_control(&mut self, ui: &mut Ui, p: &Palette, right: f32, y: f32) -> f32 {
+        if self.search_focus {
+            self.search_open = true;
+        }
+        if !self.search_open && self.search.is_empty() {
+            let c = Pos2::new(right - 18.0, y);
+            if glass_button(ui, p, c, Icon::Search, "Search (Ctrl+Alt+F)", true).clicked() {
+                self.search_open = true;
+                self.search_focus = true;
+            }
+            return c.x - 18.0;
+        }
+        let w = 240.0;
+        let r = Rect::from_min_size(Pos2::new(right - w, y - 18.0), Vec2::new(w, 36.0));
+        glass(ui, p, r);
+        crate::icons::paint(ui.painter(), Icon::Search, Rect::from_center_size(Pos2::new(r.left() + 20.0, r.center().y), Vec2::splat(15.0)), p.secondary);
+        let te_rect = Rect::from_min_max(Pos2::new(r.left() + 34.0, r.top() + 7.0), Pos2::new(r.right() - 28.0, r.bottom() - 7.0));
         let te = ui.put(
             te_rect,
-            egui::TextEdit::singleline(&mut self.search).hint_text("Search").frame(false).margin(egui::vec2(2.0, 3.0)),
+            egui::TextEdit::singleline(&mut self.search).hint_text("Search").frame(false).margin(egui::vec2(2.0, 2.0)),
         );
+        if te.lost_focus() && self.search.is_empty() {
+            self.search_open = false;
+        }
         if self.search_focus {
             te.request_focus();
             self.search_focus = false;
@@ -230,14 +311,16 @@ impl App {
             te.surrender_focus();
         }
         if !self.search.is_empty() {
-            let x = Rect::from_center_size(Pos2::new(r.right() - 12.0, r.center().y), Vec2::splat(14.0));
+            let x = Rect::from_center_size(Pos2::new(r.right() - 16.0, r.center().y), Vec2::splat(14.0));
             let resp = ui.interact(x, ui.id().with("clear-search"), Sense::click());
-            ui.painter().circle_filled(x.center(), 6.5, p.tertiary);
+            ui.painter().circle_filled(x.center(), 7.0, p.tertiary);
             ui.painter().text(x.center(), Align2::CENTER_CENTER, "×", theme::bold_font(11.0), p.bg);
             if resp.clicked() {
                 self.search.clear();
+                self.search_open = false;
             }
         }
+        r.left()
     }
 
     /// The Aa popover: character styles on top, paragraph styles below.
@@ -250,46 +333,84 @@ impl App {
         let mut chosen: Option<Command> = None;
         let area = egui::Area::new(egui::Id::new("format-menu"))
             .order(egui::Order::Foreground)
-            .fixed_pos(Pos2::new(anchor.left() - 10.0, anchor.bottom() + 6.0))
+            .fixed_pos(Pos2::new(anchor.left() - 14.0, anchor.bottom() + 8.0))
             .show(ui.ctx(), |ui| {
-                egui::Frame::popup(ui.style()).fill(p.popover).rounding(10.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
-                    ui.set_width(230.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let labels = [("B", Attr::Bold), ("I", Attr::Italic), ("U", Attr::Underline), ("S", Attr::Strike)];
-                        for (i, (l, a)) in labels.into_iter().enumerate() {
-                            let mut text = egui::RichText::new(l).size(15.0);
-                            text = match a {
-                                Attr::Bold => text.strong(),
-                                Attr::Italic => text.italics(),
-                                Attr::Underline => text.underline(),
-                                Attr::Strike => text.strikethrough(),
-                            };
-                            let b = egui::Button::new(text).min_size(Vec2::new(53.0, 30.0)).selected(attrs[i]);
-                            if ui.add(b).clicked() {
-                                chosen = Some(Command::ToggleAttr(a));
-                            }
+                popover_frame(ui, p).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+                    ui.set_width(216.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    // B I U S
+                    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), Sense::hover());
+                    let labels = [("B", Attr::Bold), ("I", Attr::Italic), ("U", Attr::Underline), ("S", Attr::Strike)];
+                    for (i, (l, a)) in labels.into_iter().enumerate() {
+                        let r = Rect::from_min_size(Pos2::new(row.left() + i as f32 * 42.0, row.top() + 2.0), Vec2::new(36.0, 32.0));
+                        let resp = ui.interact(r, ui.id().with(("attr", i)), Sense::click());
+                        let tip = match a {
+                            Attr::Bold => cmd_key!("B"),
+                            Attr::Italic => cmd_key!("I"),
+                            Attr::Underline => cmd_key!("U"),
+                            Attr::Strike => cmd_key!("Shift+X"),
+                        };
+                        let resp = resp.on_hover_text(tip);
+                        if attrs[i] {
+                            ui.painter().rect_filled(r, 8.0, theme::blend(p.popover, p.accent, 0.55));
+                        } else if resp.hovered() {
+                            ui.painter().rect_filled(r, 8.0, p.hover);
                         }
-                    });
+                        let font = match a {
+                            Attr::Bold => theme::bold_font(18.0),
+                            Attr::Italic => egui::FontId::new(18.0, theme::italic()),
+                            _ => theme::font(18.0),
+                        };
+                        let color = if attrs[i] { egui::Color32::WHITE } else { p.text };
+                        let g = ui.painter().layout_no_wrap(l.to_owned(), font, color);
+                        let gr = Rect::from_center_size(r.center(), g.size());
+                        ui.painter().galley(gr.min, g, color);
+                        let stroke = egui::Stroke::new(1.3_f32, color);
+                        match a {
+                            Attr::Underline => {
+                                ui.painter().line_segment([Pos2::new(gr.left(), gr.bottom() - 1.0), Pos2::new(gr.right(), gr.bottom() - 1.0)], stroke);
+                            }
+                            Attr::Strike => {
+                                ui.painter().line_segment([Pos2::new(gr.left() - 2.0, gr.center().y + 1.0), Pos2::new(gr.right() + 2.0, gr.center().y + 1.0)], stroke);
+                            }
+                            _ => {}
+                        }
+                        if resp.clicked() {
+                            chosen = Some(Command::ToggleAttr(a));
+                        }
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
                     ui.add_space(4.0);
                     for (label, kind, shortcut) in STYLES {
+                        if kind == Kind::Quote {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                        }
                         let font = match kind {
-                            Kind::Title => theme::bold_font(21.0),
-                            Kind::Heading => theme::bold_font(17.0),
-                            Kind::Subheading => theme::bold_font(14.5),
-                            Kind::Monospaced => egui::FontId::monospace(13.0),
-                            _ => theme::font(13.5),
+                            Kind::Title => theme::bold_font(24.0),
+                            Kind::Heading => theme::bold_font(19.0),
+                            Kind::Subheading => theme::bold_font(15.5),
+                            Kind::Monospaced => egui::FontId::monospace(14.0),
+                            _ => theme::font(14.5),
                         };
-                        let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), font.size + 12.0), Sense::click());
+                        let (r, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), font.size + 15.0), Sense::click());
+                        let resp = resp.on_hover_text(shortcut);
                         let on = current.same(kind);
                         if resp.hovered() {
-                            ui.painter().rect_filled(r, 6.0, p.selection);
+                            ui.painter().rect_filled(r, 7.0, p.hover);
                         }
                         if on {
-                            ui.painter().text(Pos2::new(r.left() + 10.0, r.center().y), Align2::CENTER_CENTER, "✓", theme::font(12.0), p.text);
+                            ui.painter().text(Pos2::new(r.left() + 13.0, r.center().y), Align2::CENTER_CENTER, "✓", theme::font(14.0), p.text);
                         }
-                        ui.painter().text(Pos2::new(r.left() + 24.0, r.center().y), Align2::LEFT_CENTER, label, font, p.text);
-                        ui.painter().text(Pos2::new(r.right() - 6.0, r.center().y), Align2::RIGHT_CENTER, shortcut, theme::font(11.0), p.secondary);
+                        let tx = r.left() + 30.0;
+                        if kind == Kind::Quote {
+                            ui.painter().line_segment([Pos2::new(tx, r.center().y - 8.0), Pos2::new(tx, r.center().y + 8.0)], egui::Stroke::new(2.5_f32, p.secondary));
+                            ui.painter().text(Pos2::new(tx + 9.0, r.center().y), Align2::LEFT_CENTER, label, font, p.text);
+                        } else {
+                            ui.painter().text(Pos2::new(tx, r.center().y), Align2::LEFT_CENTER, label, font, p.text);
+                        }
                         if resp.clicked() {
                             chosen = Some(Command::SetKind(kind));
                         }
