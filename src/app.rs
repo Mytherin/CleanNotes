@@ -920,6 +920,9 @@ impl App {
         if let Err(e) = self.db.save_all(&self.store, &self.settings) {
             eprintln!("saving after sync: {e:#}");
         }
+        // Unlocked notes' text follows the sync too (or they close, if the
+        // new version doesn't open with the keys at hand).
+        self.refresh_unlocked();
         // Follow the sync in the open note and the selection.
         if let Some(id) = self.editor.as_ref().map(|e| e.note_id.clone()) {
             match self.store.note(&id).map(|n| n.body.clone()) {
@@ -941,6 +944,12 @@ impl App {
             }
         }
         self.prune_missing();
+        // Selected notes the sync moved to Recently Deleted leave the list:
+        // don't keep them open (or let Delete/Move reach them).
+        let in_deleted = matches!(self.location, Location::Deleted(_));
+        if !in_deleted && self.selected_ids().iter().any(|id| self.store.note(id).is_some_and(|n| n.deleted.is_some())) {
+            self.retain_visible(None);
+        }
     }
 
     /// Drops notes that no longer exist (purged, deleted by a sync) from

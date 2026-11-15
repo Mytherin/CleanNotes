@@ -204,6 +204,8 @@ impl App {
         self.lock.current = None;
         self.lock.typed.clear();
         self.lock.error = None;
+        // A password sheet left open mustn't stay filled in.
+        self.lock.sheet = None;
         if self.selected.as_ref().is_some_and(|s| self.is_locked(s)) {
             self.editor = None;
         }
@@ -226,7 +228,17 @@ impl App {
         if self.lock.unlocked.get(id).is_some_and(|t| t == md) {
             return true;
         }
-        let Some(k) = self.lock.keys.get(&env.salt).cloned() else { return true };
+        let Some(k) = self.lock.keys.get(&env.salt).cloned() else {
+            // Locked again elsewhere with another password: the edit can't
+            // be sealed, so say so and close the note rather than drop it
+            // silently (never write it out in the clear).
+            self.lock.unlocked.remove(id);
+            if self.editor.as_ref().is_some_and(|e| e.note_id == id) {
+                self.editor = None;
+            }
+            self.push_notice("A change to a locked note couldn't be saved: it was locked with another password on another device.".into());
+            return true;
+        };
         let sealed = lock::seal(&k, &env.salt(), md);
         if let Some(n) = self.store.note_mut(id) {
             n.body = lock::locked_body(md, &sealed);
@@ -245,13 +257,26 @@ impl App {
         self.lock.unlocked.get(id).cloned()
     }
 
+    /// After a sync: every unlocked note's text is read again from its
+    /// (possibly new) sealed text, so a stale copy is never shown or sealed
+    /// over another device's edit. Notes gone, no longer locked, or locked
+    /// with keys not at hand are closed.
+    pub(super) fn refresh_unlocked(&mut self) {
+        let ids: Vec<String> = self.lock.unlocked.keys().cloned().collect();
+        for id in ids {
+            self.reopen_after_sync(&id);
+        }
+    }
+
     /// Locks everything after a while without input.
     pub(super) fn auto_lock(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
-            self.lock.last_input = Some(Instant::now());
-        }
+        // Checked before this frame's input counts: coming back to a window
+        // left minimized for an hour brings input events with it.
         if self.has_unlocked() && self.lock.last_input.is_some_and(|t| t.elapsed() > AUTO_LOCK) {
             self.lock_now();
+        }
+        if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
+            self.lock.last_input = Some(Instant::now());
         }
     }
 
@@ -569,6 +594,45 @@ mod tests {
         assert_eq!(app.plain_body(&a).as_deref(), Some("# A\nsecret a\n"));
         // A wrong old password changes nothing.
         assert!(app.sheet_action(SheetAction::Change("bad".into(), "three".into(), String::new())).is_err());
+    }
+
+    #[test]
+    fn a_sync_never_leaves_stale_text_in_an_unlocked_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = app_with_note(dir.path(), "# A\nv1\n");
+        set_password(&mut app, &id, "pw");
+        app.select(None);
+        // Another device edits it; the sync brings its new sealed text.
+        let env = lock::parse(&app.store.note(&id).unwrap().body).unwrap();
+        let k = app.lock.keys[&env.salt].clone();
+        let theirs = "# A\nv2 from the other device\n";
+        app.store.note_mut(&id).unwrap().body = lock::locked_body(theirs, &lock::seal(&k, &env.salt(), theirs));
+        app.refresh_unlocked();
+        assert_eq!(app.plain_body(&id).as_deref(), Some(theirs));
+        // Locked again elsewhere with another password: closed, not shown
+        // stale or edited blind.
+        let salt = lock::new_salt();
+        let other = lock::derive("another", &salt).unwrap();
+        app.store.note_mut(&id).unwrap().body = lock::locked_body(theirs, &lock::seal(&other, &salt, theirs));
+        app.refresh_unlocked();
+        assert!(app.is_closed(&id));
+    }
+
+    #[test]
+    fn auto_lock_fires_when_coming_back_after_a_long_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = app_with_note(dir.path(), "# A\nsecret\n");
+        set_password(&mut app, &id, "pw");
+        assert!(app.has_unlocked());
+        app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: None, error: None });
+        app.lock.last_input = Instant::now().checked_sub(AUTO_LOCK + std::time::Duration::from_secs(60));
+        // The first frame back carries input (focus, the mouse moving).
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerMoved(Pos2::new(1.0, 1.0)));
+        let _ = ctx.run(raw, |ctx| app.auto_lock(ctx));
+        assert!(!app.has_unlocked() && app.is_closed(&id));
+        assert!(app.lock.sheet.is_none(), "no password left in an open sheet");
     }
 
     #[test]

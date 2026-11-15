@@ -12,6 +12,11 @@ pub fn merge_text(base: &str, ours: &str, theirs: &str) -> Result<String, ()> {
     if ours == base {
         return Ok(theirs.to_owned());
     }
+    // A locked note's text is sealed; merging lines around the seal would
+    // leave the other side's edit outside it, in the clear. Both are kept.
+    if [base, ours, theirs].iter().any(|s| crate::lock::is_locked(s)) {
+        return Err(());
+    }
     // diffy works on lines; make sure every line ends in a newline so an edit
     // to the last line isn't seen as a change to the line ending as well.
     let norm = |s: &str| if s.is_empty() || s.ends_with('\n') { s.to_owned() } else { format!("{s}\n") };

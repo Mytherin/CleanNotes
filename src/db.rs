@@ -116,7 +116,9 @@ impl Db {
         let conn = Connection::open(path)?;
         // Wait out another process holding a lock rather than failing.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        // Freed space is overwritten, so a note's text from before it was
+        // locked (or deleted for good) doesn't linger in the file.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(conn)
     }

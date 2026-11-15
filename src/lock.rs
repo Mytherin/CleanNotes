@@ -44,6 +44,9 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct Keys {
     enc: [u8; 32],
     mac: [u8; 32],
+    /// The Argon2id costs the keys were made with, written into what they
+    /// seal, so the right password always makes them again.
+    cost: (u32, u32, u32),
 }
 
 /// The sealed text and how to open it.
@@ -83,7 +86,7 @@ fn derive_with(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Ke
     let mut master = [0u8; 32];
     argon.hash_password_into(password.as_bytes(), salt, &mut master).map_err(|e| anyhow!("argon2: {e}"))?;
     let hk = hkdf::Hkdf::<Sha256>::new(None, &master);
-    let mut keys = Keys { enc: [0; 32], mac: [0; 32] };
+    let mut keys = Keys { enc: [0; 32], mac: [0; 32], cost: (m, t, p) };
     hk.expand(b"cleannotes-lock enc", &mut keys.enc).map_err(|_| anyhow!("hkdf"))?;
     hk.expand(b"cleannotes-lock mac", &mut keys.mac).map_err(|_| anyhow!("hkdf"))?;
     Ok(keys)
@@ -95,8 +98,9 @@ pub fn derive_for(password: &str, env: &Envelope) -> Result<Keys> {
     if env.kdf != "argon2id" || env.v != 1 {
         bail!("This note was locked by a newer version of CleanNotes.");
     }
-    // Don't let a damaged or hostile note ask for gigabytes of memory.
-    if env.m > 1024 * 1024 || env.t > 20 || env.p > 16 {
+    // Don't let a damaged or hostile note (it may come from a sync server)
+    // freeze the app asking for gigabytes of memory or minutes of work.
+    if env.m > 256 * 1024 || env.t > 10 || env.p > 16 {
         bail!("This locked note's settings are out of range.");
     }
     derive_with(password, &env.salt(), env.m, env.t, env.p)
@@ -117,12 +121,13 @@ pub fn seal(keys: &Keys, salt: &[u8], text: &str) -> Envelope {
     let mut iv = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut iv);
     let ct = cbc::Encryptor::<aes::Aes256>::new(&keys.enc.into(), &iv.into()).encrypt_padded_vec_mut::<Pkcs7>(text.as_bytes());
+    let (m, t, p) = keys.cost;
     let mut env = Envelope {
         v: 1,
         kdf: "argon2id".into(),
-        m: M_COST,
-        t: T_COST,
-        p: P_COST,
+        m,
+        t,
+        p,
         salt: B64.encode(salt),
         iv: B64.encode(iv),
         ct: B64.encode(&ct),
@@ -171,11 +176,15 @@ pub fn locked_body(plain_md: &str, env: &Envelope) -> String {
     format!("{title}\n\n{FENCE}\n{}\n```\n", encode(env))
 }
 
-/// The sealed text of a locked note's body, if it's locked.
+/// The sealed text of a locked note's body, if it's locked: exactly as
+/// [`locked_body`] writes it (a title line, a blank line, the fence),
+/// so no text can sit next to the seal unencrypted.
 pub fn parse(body: &str) -> Option<Envelope> {
-    let mut lines = body.lines();
-    lines.find(|l| l.trim_end() == FENCE)?;
-    decode(lines.next()?).ok()
+    let lines: Vec<&str> = body.trim_end_matches('\n').split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    match lines.as_slice() {
+        [_title, "", fence, sealed, "```"] if fence.trim_end() == FENCE => decode(sealed).ok(),
+        _ => None,
+    }
 }
 
 pub fn is_locked(body: &str) -> bool {
@@ -215,6 +224,45 @@ mod tests {
         let mut bad = env.clone();
         bad.t = 2;
         assert!(open(&quick("right", &salt), &bad).is_err());
+    }
+
+    #[test]
+    fn resealing_keeps_the_costs_the_keys_were_made_with() {
+        // A note sealed with other costs (an older version, another client).
+        let salt = new_salt();
+        let env = seal(&quick("pw", &salt), &salt, "v1");
+        assert_eq!((env.m, env.t, env.p), (64, 1, 1));
+        // Opened and sealed again with the keys made for it…
+        let k = derive_for("pw", &env).unwrap();
+        let again = seal(&k, &env.salt(), "v2");
+        // …it still opens with the right password.
+        let k2 = derive_for("pw", &again).unwrap();
+        assert_eq!(open(&k2, &again).unwrap(), "v2");
+    }
+
+    #[test]
+    fn only_the_exact_locked_layout_counts_as_locked() {
+        let salt = new_salt();
+        let k = quick("pw", &salt);
+        let body = locked_body("# T\nsecret\n", &seal(&k, &salt, "# T\nsecret\n"));
+        assert!(is_locked(&body));
+        assert!(is_locked(&body.replace('\n', "\r\n")));
+        // Text merged in next to the seal would sit in the clear.
+        assert!(!is_locked(&body.replace("# T\n", "# T\nplain text\n")));
+        assert!(!is_locked(&format!("{body}after\n")));
+    }
+
+    #[test]
+    fn a_locked_note_is_never_merged_line_by_line() {
+        let salt = new_salt();
+        let k = quick("pw", &salt);
+        let base = "T\n\npara\n";
+        let locked = locked_body(base, &seal(&k, &salt, base));
+        // Locked here, the title edited elsewhere: both kept, not merged.
+        assert!(crate::sync::merge::merge_text(base, &locked, "T secret\n\npara\n").is_err());
+        assert!(crate::sync::merge::merge_text(base, "T secret\n\npara\n", &locked).is_err());
+        // Only one side changed: that side wins as usual.
+        assert_eq!(crate::sync::merge::merge_text(base, &locked, base), Ok(locked.clone()));
     }
 
     #[test]
