@@ -1,6 +1,6 @@
 # CleanNotes
 
-A desktop notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, or a **SQLite database** file.
+A desktop notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, or a **SQLite database** file.
 Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCalendar](../CleanCalendar).
 
 ## Features
@@ -119,6 +119,19 @@ You need a container of your own:
 
 Notes are `Note` records in a custom zone `CleanNotes` (named after the note's id, with its folder path, Markdown body, title, dates, pin and deletion), folders are `Folder` records. In the **Development** environment CloudKit creates these record types on first use; for **Production**, deploy the schema from CloudKit Console first. A record's change tag is its revision, so CloudKit refuses a save based on an outdated copy, and the sync engine merges instead.
 
+### Standard Notes
+
+Notes go into a [Standard Notes](https://standardnotes.com) account (`api.standardnotes.com` or a self-hosted server), end-to-end encrypted on your computer with Standard Notes' protocol 004, so they show up in the Standard Notes apps:
+
+- Each note is a Standard Notes note. Its text is the note's Markdown as it is (new notes use Standard Notes' plain text editor), its title the note's title; pins, dates and the trash (Recently Deleted) map onto Standard Notes' own. Updating a note keeps everything the app doesn't own (other app data, links to other notes and files, the editor, spellcheck, …).
+- A note written in Standard Notes with a title that isn't its first line shows with the title on top as a heading; saving takes it off again.
+- Folders are **tags**, nested as Standard Notes nests them. A note is in the folder of the tag holding it (the deepest, if several do); untagged notes are in *Notes*. Moving a note to another folder takes it out of its other tags.
+- Notes written with another editor (**Super**, rich text, code, spreadsheets, …) and locked notes are shown **read-only**, as plain as their text can be made, under a line saying so. Pinning, moving and deleting them works; changing their text saves the change as a *new* plain note next to the original, which is never overwritten.
+- Notes deleted for good are deleted in Standard Notes too.
+- Sign in with your email and password (and your authenticator code if you use two-factor authentication). The password is never stored: signing in derives your keys, and only the session and the key that unlocks your items keys are kept, in the OS credential store. Only accounts on protocol 004 work (the Standard Notes apps offer to upgrade older ones); items in shared vaults and hardware-key two-factor aren't supported.
+
+The app speaks Standard Notes' client protocol itself (`src/sync/standardnotes/`): Argon2id root keys, XChaCha20-Poly1305 with the client's authenticated data, items keys, PKCE sign-in, session refresh and the paged items sync. It's compiled in but behind the `standardnotes` Cargo feature until Settings has a form for it.
+
 ### SQLite database
 
 Notes go into a SQLite file of your choice, as plain tables any SQLite tool can read:
@@ -147,7 +160,7 @@ To add a backend: implement `Backend`, add a `BackendConfig` variant, and open i
 
 ## Data
 
-Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (a Bitwarden session, a CloudKit web auth token) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
+Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (a Bitwarden session, a CloudKit web auth token, a Standard Notes session and key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
 
 ## Code layout
 
@@ -173,6 +186,7 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 | `src/sync/sqlite.rs` | The SQLite backend |
 | `src/sync/bitwarden/` | The Bitwarden backend: protocol, crypto, front matter |
 | `src/sync/cloudkit/` | The CloudKit backend |
+| `src/sync/standardnotes/` | The Standard Notes backend: protocol 004 crypto, sign-in, items sync, notes and tags |
 | `src/theme.rs`, `src/fonts.rs`, `src/icons.rs`, `src/app_icon.rs` | Colors, fonts, drawn icons, the app icon |
 
 ## Tests
@@ -185,7 +199,9 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 - **CloudKit** (`src/sync/cloudkit/tests.rs`) against a fake CloudKit Web Services server: browser sign-in through the loopback callback, records and change tags, conflicts, paging, folder renames, expired sign-ins, and two devices syncing.
 - **SQLite backend, local storage, model** unit tests.
 
-The Bitwarden and CloudKit backends have only been tested against those fakes, not against the real services.
+- **Standard Notes** (`src/sync/standardnotes/tests.rs`) against a fake server that only sees protocol 004 strings, checks the PKCE verifier, enforces sync conflicts by timestamp, pages downloads and expires sessions: sign-in (two-factor, email retried in lowercase), items keys, round trips, conflicts, tags as folders, the trash, read-only Super notes, paging and incremental syncs, session refresh, and two devices syncing. The key derivation and encryption are checked against the official client's own test vectors, including an items key from a real account's backup (`kat.rs`).
+
+The Bitwarden, CloudKit and Standard Notes backends have only been tested against those fakes, not against the real services.
 
 ## Ideas for next steps
 
