@@ -35,6 +35,18 @@ pub enum Command {
     Redo,
     SelectAll,
     CopyMarkdown,
+    /// "Table" (⌥⌘T in Apple Notes): a 3×3 table at the caret.
+    InsertTable,
+    AddRowAbove,
+    AddRowBelow,
+    AddColumnBefore,
+    AddColumnAfter,
+    DeleteRow,
+    DeleteColumn,
+    DeleteTable,
+    /// Super notes' tables can have header cells.
+    ToggleHeaderRow,
+    ToggleHeaderColumn,
 }
 
 /// Settings the editor needs from the app.
@@ -424,7 +436,70 @@ impl Editor {
                 self.sel = Selection { anchor: Pos::default(), caret: self.doc.end() };
             }
             Command::CopyMarkdown => {}
+            Command::InsertTable => {
+                if self.doc.blocks[self.sel.caret.block].kind.is_cell() {
+                    return;
+                }
+                self.checkpoint(None);
+                let at = self.delete_selection();
+                let p = self.doc.insert_table(at, 3, 3);
+                self.sel = Selection::caret(p);
+            }
+            Command::AddRowAbove
+            | Command::AddRowBelow
+            | Command::AddColumnBefore
+            | Command::AddColumnAfter
+            | Command::DeleteRow
+            | Command::DeleteColumn
+            | Command::DeleteTable
+            | Command::ToggleHeaderRow
+            | Command::ToggleHeaderColumn => {
+                let block = self.sel.caret.block;
+                if !self.doc.blocks[block].kind.is_cell() {
+                    return;
+                }
+                self.checkpoint(None);
+                let p = match cmd {
+                    Command::AddRowAbove => self.doc.add_row(block, false),
+                    Command::AddRowBelow => self.doc.add_row(block, true),
+                    Command::AddColumnBefore => self.doc.add_column(block, false),
+                    Command::AddColumnAfter => self.doc.add_column(block, true),
+                    Command::DeleteRow => self.doc.delete_row(block),
+                    Command::DeleteColumn => self.doc.delete_column(block),
+                    Command::DeleteTable => self.doc.delete_table(block),
+                    Command::ToggleHeaderRow => {
+                        self.doc.toggle_header(block, false);
+                        self.sel.caret
+                    }
+                    _ => {
+                        self.doc.toggle_header(block, true);
+                        self.sel.caret
+                    }
+                };
+                self.sel = Selection::caret(self.doc.clamp(p));
+                self.scroll_to_caret = true;
+            }
         }
+    }
+
+    /// Tab (or Shift+Tab) in a table cell: the caret goes to the end of the
+    /// next (previous) cell; Tab in the last cell adds a row, as in Apple
+    /// Notes.
+    fn tab_in_table(&mut self, back: bool) {
+        let block = self.sel.caret.block;
+        let target = match self.doc.next_cell(block, if back { -1 } else { 1 }) {
+            Some(b) => b,
+            None if back => return,
+            None => {
+                self.checkpoint(None);
+                // Below the last row; its first cell.
+                let (r, cols) = self.doc.table_of(block).unwrap();
+                self.doc.add_row(r.end - cols, true).block
+            }
+        };
+        let end = self.doc.blocks[target].len();
+        self.sel = Selection::caret(Pos::new(target, end));
+        self.scroll_to_caret = true;
     }
 
     /// Clicking a checkbox.
@@ -572,10 +647,13 @@ impl Editor {
         if self.laid.is_empty() {
             return Pos::default();
         }
+        // The paragraph (or table cell) under the point, else the first
+        // whose bottom is below it.
         let i = self
             .laid
             .iter()
-            .position(|l| pt.y < l.rect.bottom())
+            .position(|l| l.rect.contains(pt))
+            .or_else(|| self.laid.iter().position(|l| pt.y < l.rect.bottom()))
             .unwrap_or(self.laid.len() - 1);
         let l = &self.laid[i];
         let c = l.galley.cursor_from_pos(pt - l.origin);
@@ -598,14 +676,30 @@ impl Editor {
         let cur = l.galley.from_ccursor(CCursor::new(p.offset));
         let row = cur.rcursor.row;
         let rows = l.galley.rows.len();
+        let last_row = |b: usize| self.laid[b].galley.rows.len().saturating_sub(1);
         let target = if dir < 0 && row > 0 {
             Some((p.block, row - 1))
         } else if dir > 0 && row + 1 < rows {
             Some((p.block, row + 1))
+        } else if let Some((r, cols)) = self.doc.table_of(p.block) {
+            // Out of a cell: the cell above or below, else past the table.
+            let b = if dir < 0 {
+                if p.block >= r.start + cols {
+                    Some(p.block - cols)
+                } else {
+                    r.start.checked_sub(1).map(|b| self.entry_cell(b, x, true))
+                }
+            } else if p.block + cols < r.end {
+                Some(p.block + cols)
+            } else {
+                (r.end < self.laid.len()).then(|| self.entry_cell(r.end, x, false))
+            };
+            b.map(|b| (b, if dir < 0 { last_row(b) } else { 0 }))
         } else if dir < 0 && p.block > 0 {
-            Some((p.block - 1, self.laid[p.block - 1].galley.rows.len().saturating_sub(1)))
+            let b = self.entry_cell(p.block - 1, x, true);
+            Some((b, last_row(b)))
         } else if dir > 0 && p.block + 1 < self.laid.len() {
-            Some((p.block + 1, 0))
+            Some((self.entry_cell(p.block + 1, x, false), 0))
         } else {
             None
         };
@@ -616,6 +710,16 @@ impl Editor {
         let y = l.galley.rows.get(r).map_or(0.0, |row| row.rect.center().y);
         let c = l.galley.cursor_from_pos(Vec2::new(x - l.origin.x, y));
         Pos::new(b, c.ccursor.index.min(self.doc.blocks[b].len()))
+    }
+
+    /// Moving up or down into `block`: if it's in a table, the cell under
+    /// `x` in the table's last row (coming from below) or first row.
+    fn entry_cell(&self, block: usize, x: f32, from_below: bool) -> usize {
+        let Some((r, cols)) = self.doc.table_of(block) else { return block };
+        let row_start = if from_below { r.start + (r.len() - 1) / cols * cols } else { r.start };
+        (row_start..(row_start + cols).min(r.end))
+            .find(|&b| self.laid.get(b).is_some_and(|l| x < l.rect.right()))
+            .unwrap_or((row_start + cols).min(r.end) - 1)
     }
 
     fn row_edge(&self, p: Pos, end: bool) -> Pos {
@@ -696,6 +800,13 @@ impl Editor {
             self.copy_markdown(ctx);
             return true;
         }
+        // Table: ⌥⌘T, as in Apple Notes.
+        if cmd && m.alt && !m.shift && key == Key::T {
+            if editable {
+                self.command(Command::InsertTable);
+            }
+            return true;
+        }
 
         let caret = self.sel.caret;
         let x = || self.goal_x.or_else(|| self.caret_rect(caret).map(|r| r.left())).unwrap_or(0.0);
@@ -755,6 +866,7 @@ impl Editor {
                 }
                 self.enter();
             }
+            Key::Tab if editable && self.doc.blocks[self.sel.caret.block].kind.is_cell() => self.tab_in_table(m.shift),
             Key::Tab if editable => {
                 let blocks = self.sel.blocks();
                 let in_list = self.doc.blocks[blocks.clone()].iter().any(|b| b.kind.indents());
@@ -883,9 +995,58 @@ impl Editor {
 
         let numbers = self.doc.list_numbers();
         let mut laid = Vec::with_capacity(self.doc.blocks.len());
+        let mut tables: Vec<layout::LaidTable> = Vec::new();
         let painter = ui.painter().clone();
         let mut prev_kind = None;
+        let mut next = 0;
         for (i, b) in self.doc.blocks.iter().enumerate() {
+            if i < next {
+                continue; // a cell, laid out with its table
+            }
+            if let (Kind::Cell { header_row, header_col, .. }, Some((r, cols))) = (b.kind, self.doc.table_of(i)) {
+                // A table: columns of equal width across the text, each row
+                // as tall as its tallest cell.
+                y += if prev_kind.is_some() { body * 0.5 } else { 0.0 };
+                let col_w = width / cols as f32;
+                let mut ys = vec![y];
+                for row_start in r.clone().step_by(cols) {
+                    let row_end = (row_start + cols).min(r.end);
+                    let mut row = Vec::new();
+                    let mut h = layout::size(Kind::Body, body) * 1.2;
+                    for (col, bi) in (row_start..row_end).enumerate() {
+                        let cell = &self.doc.blocks[bi];
+                        let row_i = (row_start - r.start) / cols;
+                        let strong = (header_row && row_i == 0) || (header_col && col == 0);
+                        let marks = Marks {
+                            highlights: find_marks.remove(&bi).unwrap_or_default(),
+                            current: current.as_ref().filter(|(cb, _)| *cb == bi).map(|(_, r)| r.clone()),
+                        };
+                        let job = layout::job(cell, body, p, col_w - 2.0 * layout::CELL_PAD.x, &marks, strong);
+                        let galley = ui.fonts(|f| f.layout_job(job));
+                        h = h.max(galley.rect.height());
+                        row.push(galley);
+                    }
+                    let row_h = h + 2.0 * layout::CELL_PAD.y;
+                    for (col, galley) in row.into_iter().enumerate() {
+                        let rect = Rect::from_min_size(Pos2::new(left + col as f32 * col_w, y), Vec2::new(col_w, row_h));
+                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None });
+                    }
+                    y += row_h;
+                    ys.push(y);
+                }
+                let xs: Vec<f32> = (0..=cols).map(|c| left + c as f32 * col_w).collect();
+                tables.push(layout::LaidTable {
+                    rect: Rect::from_min_max(Pos2::new(left, ys[0]), Pos2::new(left + width, y)),
+                    xs,
+                    ys,
+                    header_row,
+                    header_col,
+                });
+                y += body * 0.5;
+                prev_kind = Some(b.kind);
+                next = r.end;
+                continue;
+            }
             y += layout::space_before(b.kind, prev_kind, body);
             prev_kind = Some(b.kind);
             let indent = layout::text_indent(b);
@@ -893,7 +1054,7 @@ impl Editor {
                 highlights: find_marks.remove(&i).unwrap_or_default(),
                 current: current.as_ref().filter(|(cb, _)| *cb == i).map(|(_, r)| r.clone()),
             };
-            let job = layout::job(b, body, p, width - indent, &marks);
+            let job = layout::job(b, body, p, width - indent, &marks, false);
             let galley = ui.fonts(|f| f.layout_job(job));
             let mono_pad = if b.kind == Kind::Monospaced { 2.0 } else { 0.0 };
             let origin = Pos2::new(left + indent, y + mono_pad);
@@ -919,6 +1080,9 @@ impl Editor {
                 painter.rect_filled(r.expand2(Vec2::new(8.0, 4.0)), 6.0, p.code_bg);
                 run_start = None;
             }
+        }
+        for t in &tables {
+            layout::paint_table(&painter, t, p);
         }
         if !self.sel.is_empty() {
             let color = if focused { p.text_selection } else { p.selection_inactive };
@@ -948,6 +1112,16 @@ impl Editor {
         }
         if resp.clicked() || resp.drag_started() || resp.secondary_clicked() {
             ui.memory_mut(|m| m.request_focus(id));
+        }
+        // A right-click puts the caret there (unless on the selection), so
+        // its menu acts on what was clicked: the table cell, say.
+        if resp.secondary_clicked() {
+            if let Some(pt) = pointer {
+                let at = self.pos_at(pt);
+                if self.sel.is_empty() || at < self.sel.start() || at > self.sel.end() {
+                    self.sel = Selection::caret(at);
+                }
+            }
         }
         let shift = ui.input(|i| i.modifiers.shift);
         if let Some(pt) = pointer {
@@ -1085,6 +1259,40 @@ impl Editor {
                     self.command(Command::EditLink);
                     ui.close_menu();
                 }
+                let block = self.sel.caret.block;
+                if let Kind::Cell { header_row, header_col, .. } = self.doc.blocks[block].kind {
+                    ui.separator();
+                    for (label, c) in [
+                        ("Add Row Above", Command::AddRowAbove),
+                        ("Add Row Below", Command::AddRowBelow),
+                        ("Add Column Before", Command::AddColumnBefore),
+                        ("Add Column After", Command::AddColumnAfter),
+                    ] {
+                        if item(ui, label, "", true) {
+                            self.command(c);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    for (label, c) in [("Delete Row", Command::DeleteRow), ("Delete Column", Command::DeleteColumn), ("Delete Table", Command::DeleteTable)] {
+                        if item(ui, label, "", true) {
+                            self.command(c);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    if ui.add(egui::Button::new("Header Row").selected(header_row)).clicked() {
+                        self.command(Command::ToggleHeaderRow);
+                        ui.close_menu();
+                    }
+                    if ui.add(egui::Button::new("Header Column").selected(header_col)).clicked() {
+                        self.command(Command::ToggleHeaderColumn);
+                        ui.close_menu();
+                    }
+                } else if item(ui, "Table", cmd_key!("Alt+T"), true) {
+                    self.command(Command::InsertTable);
+                    ui.close_menu();
+                }
             });
         });
     }
@@ -1184,6 +1392,42 @@ mod tests {
         assert_eq!(e.line_step(Pos::new(1, 2), 1, 0.0), Pos::new(2, 0));
         assert_eq!(e.line_step(Pos::new(1, 2), -1, 0.0), Pos::new(0, 0));
         assert_eq!(e.row_edge(Pos::new(2, 1), true), Pos::new(2, 5));
+    }
+
+    #[test]
+    fn tables_as_in_apple_notes() {
+        let mut e = Editor::new("n", "Shopping\n");
+        e.sel = Selection::caret(Pos::new(0, 8));
+        e.command(Command::InsertTable);
+        // After the paragraph, 3×3, the caret in the first cell.
+        assert_eq!(e.sel.caret, Pos::new(1, 0));
+        assert_eq!(e.doc.table_of(1), Some((1..10, 3)));
+        e.insert_text("Eggs");
+        // Tab moves along the row; Return is a line break in the cell.
+        e.tab_in_table(false);
+        e.insert_text("6");
+        e.enter();
+        e.insert_text("large");
+        assert_eq!(e.doc.blocks[2].text, "6\nlarge");
+        // Shift+Tab goes back; Tab in the last cell adds a row.
+        e.tab_in_table(true);
+        assert_eq!(e.sel.caret, Pos::new(1, 4));
+        e.sel = Selection::caret(Pos::new(9, 0));
+        e.tab_in_table(false);
+        assert_eq!(e.doc.table_of(1), Some((1..13, 3)));
+        assert_eq!(e.sel.caret, Pos::new(10, 0));
+        // Row and column commands act on the caret's cell: the new row goes,
+        // the caret moves up to the first column, a column after it comes.
+        e.command(Command::DeleteRow);
+        e.command(Command::AddColumnAfter);
+        assert_eq!(e.doc.table_of(1), Some((1..13, 4)));
+        // Saved as a Markdown table; undo takes it all back.
+        let md = e.take_markdown().unwrap();
+        assert!(md.starts_with("Shopping\n| | | | |\n| --- | --- | --- | --- |\n| Eggs |  | 6<br>large |  |\n"), "{md}");
+        for _ in 0..20 {
+            e.command(Command::Undo);
+        }
+        assert_eq!(e.doc.blocks.len(), 1);
     }
 
     #[test]

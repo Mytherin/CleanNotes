@@ -30,6 +30,8 @@ pub enum Icon {
     Lock,
     /// Stacked notes: All Notes.
     Notes,
+    /// A grid: insert a table.
+    Table,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -79,6 +81,14 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             p.text(at(-2.5, 0.8), eframe::egui::Align2::CENTER_CENTER, "A", f, color);
             let f = eframe::egui::FontId::new(10.0 * u, crate::theme::bold());
             p.text(at(4.5, 2.0), eframe::egui::Align2::CENTER_CENTER, "a", f, color);
+        }
+        Icon::Table => {
+            let r = Rect::from_min_max(at(-6.5, -5.5), at(6.5, 5.5));
+            p.rect_stroke(r, 2.0 * u, s);
+            line(p, &[at(-6.5, -1.8), at(6.5, -1.8)], s);
+            line(p, &[at(-6.5, 1.9), at(6.5, 1.9)], s);
+            line(p, &[at(-2.2, -5.5), at(-2.2, 5.5)], s);
+            line(p, &[at(2.2, -5.5), at(2.2, 5.5)], s);
         }
         Icon::Checklist => {
             for y in [-3.5, 3.5] {

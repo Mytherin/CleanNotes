@@ -52,7 +52,7 @@ impl App {
         // The formatting buttons, in a glass capsule in the middle.
         let editable = has_note && !read_only;
         let item = 40.0;
-        let cap_w = item * 3.0 + 8.0;
+        let cap_w = item * 4.0 + 8.0;
         let room = (compose_right + 12.0, search_left - 56.0 - 12.0);
         let cx = (bar.center().x).clamp(room.0 + cap_w / 2.0, (room.1 - cap_w / 2.0).max(room.0 + cap_w / 2.0));
         let cap = Rect::from_center_size(Pos2::new(cx, y), Vec2::new(cap_w, 36.0));
@@ -65,7 +65,10 @@ impl App {
         if capsule_item(ui, p, slot(1), Icon::Checklist, &format!("Checklist ({})", cmd_key!("Shift+L")), editable, false).clicked() && editable {
             self.editor_command(Command::SetKind(Kind::Checklist(false)));
         }
-        if capsule_item(ui, p, slot(2), Icon::Link, &format!("Add Link ({})", cmd_key!("K")), editable, false).clicked() && editable {
+        if capsule_item(ui, p, slot(2), Icon::Table, &format!("Table ({})", cmd_key!("Alt+T")), editable, false).clicked() && editable {
+            self.editor_command(Command::InsertTable);
+        }
+        if capsule_item(ui, p, slot(3), Icon::Link, &format!("Add Link ({})", cmd_key!("K")), editable, false).clicked() && editable {
             self.editor_command(Command::EditLink);
         }
         if self.format_open {

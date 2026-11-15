@@ -764,12 +764,12 @@ fn super_notes_synced_by_an_older_version_are_read_again() {
 #[test]
 fn a_super_note_with_something_the_app_cant_show_says_what() {
     let server = server_with_key();
-    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Plan"}]},{"type":"table","children":[],"version":1}]}}"#;
+    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Plan"}]},{"type":"horizontalrule","version":1}]}}"#;
     server.state().add("Note", json!({"title": "Budget", "text": lexical, "noteType": "super", "references": []}));
     let mut laptop = Device::new(&server);
     laptop.sync();
     let body = &laptop.store.notes.iter().find(|n| n.account == "sn").unwrap().body;
-    assert!(body.contains("Shown read-only: this is a Super note with a table, which CleanNotes can't show yet"), "{body}");
+    assert!(body.contains("Shown read-only: this is a Super note with a divider, which CleanNotes can't show yet"), "{body}");
 }
 
 #[test]

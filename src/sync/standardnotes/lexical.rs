@@ -89,6 +89,7 @@ fn block(n: &Value, out: &mut Vec<Block>) -> Result<()> {
             out.push(b);
         }
         "list" => list(n, 0, out)?,
+        "table" => table(n, out)?,
         "code" => {
             if n["language"].as_str().is_some_and(|l| !l.is_empty()) {
                 return Err("a code block set to a language".into());
@@ -151,6 +152,74 @@ fn list(n: &Value, depth: u64, out: &mut Vec<Block>) -> Result<()> {
         let mut b = inline_block(item, kind(item["checked"].as_bool() == Some(true))?, "list item")?;
         b.indent = indent_of(depth)?;
         out.push(b);
+    }
+    Ok(())
+}
+
+// Lexical's table header states.
+const HEADER_ROW: u64 = 1;
+const HEADER_COLUMN: u64 = 2;
+
+/// A table: cells row by row; each cell's paragraphs as lines of it.
+/// Headers may be in the first row and/or first column (as Super makes
+/// them); merged, coloured or aligned cells, frozen or striped rows the app
+/// can't show.
+fn table(n: &Value, out: &mut Vec<Block>) -> Result<()> {
+    if n["frozenColumnCount"].as_u64().unwrap_or(0) > 0 || n["frozenRowCount"].as_u64().unwrap_or(0) > 0 {
+        return Err("a table with frozen rows or columns".into());
+    }
+    if n["rowStriping"].as_bool() == Some(true) {
+        return Err("a table with striped rows".into());
+    }
+    if out.last().is_some_and(|b| b.kind.is_cell()) {
+        return Err("two tables in a row".into());
+    }
+    let rows: Vec<&[Value]> = children(n).iter().map(|r| if ty(r) == "tablerow" { Ok(children(r)) } else { Err(describe(ty(r))) }).collect::<Result<_>>()?;
+    let cols = rows.first().map_or(0, |r| r.len());
+    if cols == 0 || rows.iter().any(|r| r.len() != cols) {
+        return Err("a table with merged cells".into());
+    }
+    let state = |r: usize, c: usize| rows[r][c]["headerState"].as_u64().unwrap_or(0);
+    let header_row = (0..cols).all(|c| state(0, c) & HEADER_ROW != 0);
+    let header_col = (0..rows.len()).all(|r| state(r, 0) & HEADER_COLUMN != 0);
+    let kind = Kind::Cell { cols: cols as u16, header_row, header_col };
+    for (r, row) in rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            if ty(cell) != "tablecell" {
+                return Err(describe(ty(cell)));
+            }
+            let expected = if r == 0 && header_row { HEADER_ROW } else { 0 } | if c == 0 && header_col { HEADER_COLUMN } else { 0 };
+            if state(r, c) != expected {
+                return Err("table headers in an unusual place".into());
+            }
+            if cell["colSpan"].as_u64().unwrap_or(1) != 1 || cell["rowSpan"].as_u64().unwrap_or(1) != 1 {
+                return Err("a table with merged cells".into());
+            }
+            if !cell["backgroundColor"].is_null() {
+                return Err("coloured table cells".into());
+            }
+            if cell.get("verticalAlign").is_some_and(|v| !v.is_null()) {
+                return Err("aligned table cells".into());
+            }
+            let mut b = Block::new(kind, "");
+            for (i, para) in children(cell).iter().enumerate() {
+                if ty(para) != "paragraph" {
+                    return Err(format!("{} in a table cell", describe(ty(para))));
+                }
+                plain_element(para, "paragraph")?;
+                if i > 0 {
+                    push(&mut b, "\n", &Style::default());
+                }
+                for k in children(para) {
+                    if ty(k) == "linebreak" {
+                        push(&mut b, "\n", &Style::default());
+                    } else {
+                        inline(k, &Style::default(), &mut b, "table cell")?;
+                    }
+                }
+            }
+            out.push(b);
+        }
     }
     Ok(())
 }
@@ -363,6 +432,47 @@ fn list_node(blocks: &[Block], depth: u8) -> (Value, usize) {
     (l, i)
 }
 
+/// A table cell's lines, each as a paragraph block of its own.
+fn cell_lines(b: &Block) -> Vec<Block> {
+    let mut lines = vec![Block::new(Kind::Body, "")];
+    for (c, s) in b.text.chars().zip(&b.styles) {
+        if c == '\n' {
+            lines.push(Block::new(Kind::Body, ""));
+        } else {
+            let l = lines.last_mut().unwrap();
+            l.text.push(c);
+            l.styles.push(s.clone());
+        }
+    }
+    lines
+}
+
+/// The table node for a run of cells.
+fn table_node(cells: &[Block], cols: usize, header_row: bool, header_col: bool) -> Value {
+    let rows: Vec<Value> = cells
+        .chunks(cols.max(1))
+        .enumerate()
+        .map(|(r, row)| {
+            let cells: Vec<Value> = row
+                .iter()
+                .enumerate()
+                .map(|(c, b)| {
+                    let paragraphs = cell_lines(b).iter().map(|l| inline_element("paragraph", l)).collect();
+                    let mut cell = element("tablecell", paragraphs);
+                    cell["backgroundColor"] = Value::Null;
+                    cell["colSpan"] = json!(1);
+                    cell["headerState"] =
+                        json!(if r == 0 && header_row { HEADER_ROW } else { 0 } | if c == 0 && header_col { HEADER_COLUMN } else { 0 });
+                    cell["rowSpan"] = json!(1);
+                    cell
+                })
+                .collect();
+            element("tablerow", cells)
+        })
+        .collect();
+    element("table", rows)
+}
+
 /// A [`Doc`] as a Super note's text.
 pub fn from_doc(doc: &Doc) -> String {
     let blocks = &doc.blocks;
@@ -371,6 +481,11 @@ pub fn from_doc(doc: &Doc) -> String {
     while i < blocks.len() {
         let b = &blocks[i];
         match b.kind {
+            Kind::Cell { cols, header_row, header_col } => {
+                let end = blocks[i..].iter().position(|x| !x.kind.is_cell()).map_or(blocks.len(), |n| i + n);
+                nodes.push(table_node(&blocks[i..end], cols as usize, header_row, header_col));
+                i = end;
+            }
             Kind::Title | Kind::Heading | Kind::Subheading => {
                 let mut h = inline_element("heading", b);
                 h["tag"] = json!(match b.kind {
@@ -508,12 +623,49 @@ mod tests {
         assert_eq!(l["children"][1]["value"], 2);
     }
 
+    /// A 2×2 table as Super makes it (a header row and column), a line
+    /// break in one cell, then a paragraph.
+    const TABLE: &str = r#"{"root":{"children":[
+        {"children":[
+            {"children":[
+                {"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"Item","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}],"direction":"ltr","format":"","indent":0,"type":"tablecell","version":1,"backgroundColor":null,"colSpan":1,"headerState":3,"rowSpan":1},
+                {"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"Price","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}],"direction":"ltr","format":"","indent":0,"type":"tablecell","version":1,"backgroundColor":null,"colSpan":1,"headerState":1,"rowSpan":1}
+            ],"direction":null,"format":"","indent":0,"type":"tablerow","version":1},
+            {"children":[
+                {"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"Tea","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}],"direction":"ltr","format":"","indent":0,"type":"tablecell","version":1,"backgroundColor":null,"colSpan":1,"headerState":2,"rowSpan":1},
+                {"children":[{"children":[{"detail":0,"format":1,"mode":"normal","style":"","text":"3","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":1,"textStyle":""},{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"each","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}],"direction":"ltr","format":"","indent":0,"type":"tablecell","version":1,"backgroundColor":null,"colSpan":1,"headerState":0,"rowSpan":1}
+            ],"direction":null,"format":"","indent":0,"type":"tablerow","version":1}
+        ],"direction":null,"format":"","indent":0,"type":"table","version":1,"colWidths":[92,92]},
+        {"children":[],"direction":null,"format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}
+    ],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}"#;
+
+    #[test]
+    fn super_tables_become_tables_and_back() {
+        let d = to_doc(TABLE).unwrap();
+        let kind = Kind::Cell { cols: 2, header_row: true, header_col: true };
+        let cells: Vec<(Kind, &str)> = d.blocks.iter().filter(|b| b.kind.is_cell()).map(|b| (b.kind, b.text.as_str())).collect();
+        assert_eq!(cells, [(kind, "Item"), (kind, "Price"), (kind, "Tea"), (kind, "3\neach")]);
+        assert!(d.blocks[3].styles[0].bold);
+        // Back to Super: the same table (header states, one paragraph per
+        // line).
+        let v: Value = serde_json::from_str(&from_doc(&d)).unwrap();
+        let t = &v["root"]["children"][0];
+        assert_eq!(t["type"], "table");
+        let states: Vec<u64> = t["children"].as_array().unwrap().iter().flat_map(|r| r["children"].as_array().unwrap().iter().map(|c| c["headerState"].as_u64().unwrap())).collect();
+        assert_eq!(states, [3, 1, 2, 0]);
+        assert_eq!(t["children"][1]["children"][1]["children"].as_array().unwrap().len(), 2);
+        assert_eq!(to_doc(&from_doc(&d)).unwrap(), d);
+        // And editable: exact through the app's Markdown too.
+        let md = crate::sync::standardnotes::items::super_markdown(TABLE).unwrap();
+        assert_eq!(md, "| Item | Price |\n| :--- | --- |\n| Tea | **3**<br>each |\n");
+    }
+
     #[test]
     fn what_the_app_cant_show_keeps_the_note_read_only() {
         let wrap = |node: &str| format!(r#"{{"root":{{"children":[{node}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}}}"#);
         let text = |extra: &str| format!(r#"{{"children":[{{"detail":0,"format":0,"mode":"normal","style":"","text":"x","type":"text","version":1{extra}}}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1}}"#);
         for (json, why) in [
-            (wrap(r#"{"type":"table","children":[],"version":1}"#), "table"),
+            (wrap(r#"{"type":"table","children":[{"type":"tablerow","children":[{"type":"tablecell","colSpan":2,"rowSpan":1,"headerState":0,"backgroundColor":null,"children":[]}]}],"version":1}"#), "merged"),
             (wrap(r#"{"type":"horizontalrule","version":1}"#), "divider"),
             (wrap(r#"{"type":"snfile","fileUuid":"x","version":1}"#), "file"),
             (wrap(&text(r#","style":"color: red""#).replace(r#""style":"","#, "")), "coloured"),

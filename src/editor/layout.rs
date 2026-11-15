@@ -15,6 +15,38 @@ pub const MARKER_W: f32 = 24.0;
 pub const INDENT_W: f32 = 26.0;
 /// Space between a quote's bar and its text.
 pub const QUOTE_W: f32 = 16.0;
+/// Space between a table cell's border and its text.
+pub const CELL_PAD: Vec2 = Vec2::new(7.0, 5.0);
+
+/// A table as laid out: for drawing its grid and header cells.
+pub struct LaidTable {
+    pub rect: Rect,
+    /// Where each column and row starts, and the right and bottom edges.
+    pub xs: Vec<f32>,
+    pub ys: Vec<f32>,
+    pub header_row: bool,
+    pub header_col: bool,
+}
+
+/// Draws a table's header cells and its grid (thin lines, as in Apple
+/// Notes).
+pub fn paint_table(painter: &egui::Painter, t: &LaidTable, p: &Palette) {
+    let fill = theme::blend(p.bg, p.tertiary, 0.12);
+    if t.header_row && t.ys.len() > 1 {
+        painter.rect_filled(Rect::from_x_y_ranges(t.rect.x_range(), t.ys[0]..=t.ys[1]), 0.0, fill);
+    }
+    if t.header_col && t.xs.len() > 1 {
+        let top = if t.header_row && t.ys.len() > 1 { t.ys[1] } else { t.ys[0] };
+        painter.rect_filled(Rect::from_x_y_ranges(t.xs[0]..=t.xs[1], top..=t.rect.bottom()), 0.0, fill);
+    }
+    let line = Stroke::new(1.0_f32, theme::blend(p.bg, p.tertiary, 0.55));
+    for &x in &t.xs {
+        painter.line_segment([Pos2::new(x, t.rect.top()), Pos2::new(x, t.rect.bottom())], line);
+    }
+    for &y in &t.ys {
+        painter.line_segment([Pos2::new(t.rect.left(), y), Pos2::new(t.rect.right(), y)], line);
+    }
+}
 
 /// A paragraph as laid out last frame.
 pub struct Laid {
@@ -126,11 +158,12 @@ fn tag_ranges(text: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// The galley text and formats for a paragraph.
-pub fn job(b: &Block, body: f32, p: &Palette, wrap: f32, marks: &Marks) -> LayoutJob {
+/// The galley text and formats for a paragraph; `strong` makes it all bold
+/// (a table's header cells).
+pub fn job(b: &Block, body: f32, p: &Palette, wrap: f32, marks: &Marks, strong: bool) -> LayoutJob {
     let size = size(b.kind, body);
     let mono_block = b.kind == Kind::Monospaced;
-    let heading = matches!(b.kind, Kind::Title | Kind::Heading | Kind::Subheading);
+    let heading = strong || matches!(b.kind, Kind::Title | Kind::Heading | Kind::Subheading);
     let tags = if mono_block { vec![] } else { tag_ranges(&b.text) };
     let autos = if mono_block { vec![] } else { auto_links(&b.text) };
     let fake_italic = !theme::has_italic();

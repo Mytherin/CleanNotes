@@ -43,7 +43,7 @@ pub mod lexical;
 
 /// How Super notes are read (see [`lexical`]): raised when that changes, so
 /// notes already here are read again.
-const SUPER_READING: u32 = 1;
+const SUPER_READING: u32 = 2;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
