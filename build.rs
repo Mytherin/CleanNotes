@@ -23,6 +23,7 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    ship_webview2_loader();
     let machine: u16 = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
         "x86_64" => 0x8664,
         "x86" => 0x014c,
@@ -49,6 +50,35 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("resources.o");
     std::fs::write(&out, coff_object(machine, &resources)).unwrap();
     println!("cargo:rustc-link-arg-bins={}", out.display());
+}
+
+/// With the GNU toolchain, the WebView2 bindings link `WebView2Loader.dll`
+/// (only MSVC builds link Microsoft's static loader), so the exe won't even
+/// start without it next to it. Microsoft lets apps ship it: it's copied from
+/// `assets/windows/<arch>/` to beside the exe (and must be shipped with it).
+fn ship_webview2_loader() {
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("gnu") {
+        return;
+    }
+    let arch = match env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str() {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        _ => return,
+    };
+    let dll = PathBuf::from(format!("assets/windows/{arch}/WebView2Loader.dll"));
+    println!("cargo:rerun-if-changed={}", dll.display());
+    // OUT_DIR is inside target/<profile>/build/ (as <package>-<hash>/out or
+    // <package>/<hash>/out, depending on the Cargo version): the exe goes in
+    // target/<profile>.
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let Some(bin_dir) = out.ancestors().find(|p| p.file_name().is_some_and(|n| n == "build")).and_then(|b| b.parent()) else {
+        println!("cargo:warning=couldn't find the output folder; ship WebView2Loader.dll with CleanNotes.exe");
+        return;
+    };
+    if let Err(e) = std::fs::copy(&dll, bin_dir.join("WebView2Loader.dll")) {
+        println!("cargo:warning=couldn't put WebView2Loader.dll next to the exe ({}: {e}); ship it with CleanNotes.exe", dll.display());
+    }
 }
 
 /// Splits an .ico file into the RT_GROUP_ICON directory (which refers to the
