@@ -387,6 +387,8 @@ impl Editor {
                 if self.doc.move_blocks(blocks, d) {
                     self.undo.push(State { doc: before, sel: self.sel });
                     self.redo.clear();
+                    // Typing after this is a step of its own.
+                    self.group = None;
                     self.changed = true;
                     let shift = |p: Pos| Pos::new((p.block as i32 + d) as usize, p.offset);
                     self.sel = Selection { anchor: shift(self.sel.anchor), caret: shift(self.sel.caret) };
@@ -1182,6 +1184,20 @@ mod tests {
         assert_eq!(e.line_step(Pos::new(1, 2), 1, 0.0), Pos::new(2, 0));
         assert_eq!(e.line_step(Pos::new(1, 2), -1, 0.0), Pos::new(0, 0));
         assert_eq!(e.row_edge(Pos::new(2, 1), true), Pos::new(2, 5));
+    }
+
+    #[test]
+    fn typing_after_moving_a_paragraph_is_its_own_undo_step() {
+        let mut e = Editor::new("n", "one\ntwo\n");
+        e.sel = Selection::caret(Pos::new(0, 3));
+        e.insert_text("!");
+        e.command(Command::MoveDown);
+        e.insert_text("?");
+        assert_eq!(e.doc.plain_text(), "two\none!?");
+        e.command(Command::Undo);
+        assert_eq!(e.doc.plain_text(), "two\none!", "only the typing is undone");
+        e.command(Command::Undo);
+        assert_eq!(e.doc.plain_text(), "one!\ntwo");
     }
 
     #[test]

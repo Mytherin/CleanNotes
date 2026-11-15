@@ -186,7 +186,8 @@ pub fn read(item: &Item) -> NoteData {
     for i in 2..=parts {
         let name = format!("{PART_FIELD}{i}");
         if let Some((_, v)) = item.fields.iter().find(|(k, _)| *k == name) {
-            body.push_str(v);
+            // Line ends as in the notes field.
+            body.push_str(&v.replace("\r\n", "\n"));
         }
     }
     n.body = body;
