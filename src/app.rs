@@ -96,6 +96,17 @@ pub struct App {
     pub format_open: bool,
     /// The gallery shows the selected note full size.
     pub gallery_open: bool,
+    /// Deletions ⌘Z can take back, newest last, and those it took back
+    /// (for ⇧⌘Z).
+    undo_deletes: Vec<Deletion>,
+    redo_deletes: Vec<Deletion>,
+}
+
+/// Notes moved to Recently Deleted together, and how things were before.
+struct Deletion {
+    /// Each note, whether it was pinned and when it was last edited.
+    notes: Vec<(String, bool, DateTime<Utc>)>,
+    location: Location,
 }
 
 impl App {
@@ -139,6 +150,8 @@ impl App {
             scroll_list: true,
             format_open: false,
             gallery_open: false,
+            undo_deletes: Vec::new(),
+            redo_deletes: Vec::new(),
         };
         app.restore_location();
         app.purge_expired();
@@ -362,19 +375,74 @@ impl App {
             return;
         }
         let next = self.neighbour_of(&ids);
+        let mut undo = Deletion { notes: Vec::new(), location: self.location.clone() };
         for id in &ids {
             if self.fresh.remove(id) && self.store.note(id).is_some_and(|n| n.body.trim().is_empty()) {
                 self.store.notes.retain(|n| &n.id != id);
             } else if let Some(n) = self.store.note_mut(id) {
+                undo.notes.push((id.clone(), n.pinned, n.modified));
                 n.deleted = Some(Utc::now());
                 n.pinned = false;
                 n.touch();
             }
             self.unsaved.insert(id.clone());
         }
+        if !undo.notes.is_empty() {
+            self.undo_deletes.push(undo);
+            self.undo_deletes.drain(..self.undo_deletes.len().saturating_sub(50));
+            self.redo_deletes.clear();
+        }
         self.selected = None;
         self.editor = None;
         self.select(next);
+    }
+
+    /// Takes back the last deletion (⌘Z outside a note's text): the notes
+    /// come out of Recently Deleted, pinned and dated as they were, shown
+    /// where they were.
+    pub fn undo_delete(&mut self) -> bool {
+        let Some(d) = self.undo_deletes.pop() else { return false };
+        // Notes deleted for good since can't come back.
+        let notes: Vec<_> = d.notes.into_iter().filter(|(id, ..)| self.store.note(id).is_some_and(|n| n.deleted.is_some())).collect();
+        if notes.is_empty() {
+            return self.undo_delete();
+        }
+        for (id, pinned, modified) in &notes {
+            self.recover_quietly(id);
+            if let Some(n) = self.store.note_mut(id) {
+                n.pinned = *pinned;
+                // Undoing isn't an edit: the note keeps its date and place.
+                n.modified = *modified;
+            }
+        }
+        let still_there = match &d.location {
+            Location::Folder(f) => self.store.folder(f).is_some(),
+            _ => true,
+        };
+        if still_there && self.location != d.location {
+            self.go_to(d.location.clone());
+        }
+        if !self.visible_notes().contains(&notes[0].0) {
+            let folder = self.store.note(&notes[0].0).map(|n| n.folder.clone()).unwrap_or_default();
+            self.go_to(Location::Folder(folder));
+        }
+        self.select(Some(notes[0].0.clone()));
+        self.focus = Pane::List;
+        self.redo_deletes.push(Deletion { notes, location: d.location });
+        true
+    }
+
+    /// Deletes again what ⌘Z brought back (⇧⌘Z).
+    pub fn redo_delete(&mut self) -> bool {
+        let Some(d) = self.redo_deletes.pop() else { return false };
+        let ids: Vec<_> = d.notes.iter().map(|(id, ..)| id.clone()).filter(|id| self.store.note(id).is_some_and(|n| n.deleted.is_none())).collect();
+        if ids.is_empty() {
+            return self.redo_delete();
+        }
+        let redo = std::mem::take(&mut self.redo_deletes);
+        self.delete_notes(ids);
+        self.redo_deletes = redo;
+        true
     }
 
     fn neighbour_of(&self, ids: &[String]) -> Option<String> {
@@ -397,6 +465,13 @@ impl App {
     }
 
     pub fn recover_note(&mut self, id: &str) {
+        self.recover_quietly(id);
+        self.push_notice("Note recovered.".into());
+    }
+
+    /// Takes a note out of Recently Deleted, back into its folder (or the
+    /// account's default folder if that's gone).
+    fn recover_quietly(&mut self, id: &str) {
         let Some(n) = self.store.note(id) else { return };
         let folder_ok = self.store.folder(&n.folder).is_some();
         let default = self.store.default_folder(&n.account).map(|f| f.id.clone()).unwrap_or_default();
@@ -407,7 +482,6 @@ impl App {
         }
         n.touch();
         self.unsaved.insert(id.to_owned());
-        self.push_notice("Note recovered.".into());
     }
 
     pub fn toggle_pin(&mut self, id: &str) {
@@ -734,6 +808,15 @@ impl App {
         }
         if pressed(cmd, Key::Num0) {
             self.settings.text_size = Settings::default().text_size;
+        }
+        // ⌘Z / ⇧⌘Z take back note deletions, unless something with text
+        // (a note, the search field) has the keyboard and undoes its own.
+        if !ctx.wants_keyboard_input() {
+            if pressed(shift_cmd, Key::Z) || (!cfg!(target_os = "macos") && pressed(cmd, Key::Y)) {
+                self.redo_delete();
+            } else if pressed(cmd, Key::Z) {
+                self.undo_delete();
+            }
         }
         if pressed(cmd, Key::Backspace) || pressed(cmd, Key::Delete) {
             if let Some(id) = self.selected.clone() {
