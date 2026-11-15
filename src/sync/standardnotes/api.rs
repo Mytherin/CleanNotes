@@ -73,22 +73,89 @@ fn error_of(v: &Value) -> Option<&Value> {
 /// `X-SNJS-Version` the official clients send).
 pub const SNJS_VERSION: &str = "2.212.11";
 
-pub fn http() -> reqwest::blocking::Client {
-    // The headers every official client sends with every API request
-    // (`FetchRequestHandler.createRequest` in standardnotes/app): the SNJS
-    // version and `<Environment>-<app version>`.
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("X-SNJS-Version", reqwest::header::HeaderValue::from_static(SNJS_VERSION));
-    headers.insert(
-        "X-Application-Version",
-        reqwest::header::HeaderValue::from_str(&format!("Desktop-cleannotes-{}", env!("CARGO_PKG_VERSION"))).expect("ASCII"),
-    );
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
-        .default_headers(headers)
-        .build()
-        .expect("HTTP client")
+/// `X-Application-Version`: `<Environment>-<app version>`.
+pub fn application_version() -> String {
+    format!("Desktop-cleannotes-{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// A server's answer, as any transport gets it.
+pub struct Answer {
+    pub status: u16,
+    /// Lowercase names.
+    pub headers: Vec<(String, String)>,
+    /// The body, or why it couldn't be read in full.
+    pub body: std::result::Result<String, String>,
+}
+
+impl Answer {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// How requests reach the server. Every official Standard Notes client
+/// (desktop, web, iPhone, Android) makes them from a browser engine with
+/// `fetch()`; [`crate::webfetch`] does the same here for the official
+/// server. Self-hosted servers and tests use [`Direct`].
+pub trait Transport: Send + Sync {
+    /// A JSON `POST` with the official clients' headers (and the bearer
+    /// token, if any).
+    fn post(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<Answer>;
+}
+
+/// Plain HTTP from this process.
+pub struct Direct(reqwest::blocking::Client);
+
+impl Direct {
+    pub fn new() -> Direct {
+        // The headers every official client sends with every API request
+        // (`FetchRequestHandler.createRequest` in standardnotes/app): the
+        // SNJS version and `<Environment>-<app version>`.
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-SNJS-Version", reqwest::header::HeaderValue::from_static(SNJS_VERSION));
+        headers.insert("X-Application-Version", reqwest::header::HeaderValue::from_str(&application_version()).expect("ASCII"));
+        Direct(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
+                .default_headers(headers)
+                .build()
+                .expect("HTTP client"),
+        )
+    }
+}
+
+impl Transport for Direct {
+    fn post(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<Answer> {
+        let mut req = self.0.post(url).header("Content-Type", "application/json").body(body.to_owned());
+        if let Some(t) = bearer {
+            req = req.bearer_auth(t);
+        }
+        let resp = req.send().context("contacting the Standard Notes server")?;
+        let status = resp.status().as_u16();
+        let headers = resp.headers().iter().map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned())).collect();
+        let body = resp.text().map_err(|e| e.to_string());
+        Ok(Answer { status, headers, body })
+    }
+}
+
+/// The browser-engine transport for the official server, once the app's
+/// window has made one.
+static BROWSER: std::sync::OnceLock<std::sync::Arc<dyn Transport>> = std::sync::OnceLock::new();
+
+/// Sends requests to the official server through `t` from now on.
+pub fn use_browser_engine(t: std::sync::Arc<dyn Transport>) {
+    let _ = BROWSER.set(t);
+}
+
+/// The transport for a server: the browser engine for Standard Notes' own
+/// (whose Cloudflare front turns away anything that isn't a browser), plain
+/// HTTP otherwise.
+pub fn transport_for(server: &str) -> std::sync::Arc<dyn Transport> {
+    match BROWSER.get() {
+        Some(t) if base(server) == base(super::DEFAULT_SERVER) => t.clone(),
+        _ => std::sync::Arc::new(Direct::new()),
+    }
 }
 
 pub fn base(server: &str) -> String {
@@ -99,21 +166,29 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn read(resp: reqwest::blocking::Response) -> Result<Value> {
-    let status = resp.status().as_u16();
+/// Whether an answer is Cloudflare's browser check rather than the server's.
+/// (A `fetch()` can't see the `cf-mitigated` header cross-origin, so the
+/// page itself is looked at too.)
+pub fn is_browser_check(a: &Answer) -> bool {
+    a.header("cf-mitigated") == Some("challenge")
+        || (a.status == 403
+            && a.header("content-type").map_or(true, |c| c.starts_with("text/html"))
+            && a.body.as_deref().is_ok_and(|b| b.contains("challenge-platform") || b.contains("Just a moment")))
+}
+
+fn read(a: Answer) -> Result<Value> {
+    let status = a.status;
     // Cloudflare, in front of the server, wants a browser check (a page
     // running JavaScript) before letting the request through: the server
     // itself never saw it. Not a wrong password.
-    if resp.headers().get("cf-mitigated").and_then(|h| h.to_str().ok()) == Some("challenge") {
-        anyhow::bail!(
-            "Standard Notes' server is behind a Cloudflare browser check that turned this request away before it reached Standard Notes (HTTP {status}). This isn't about your email or password. Try again later; if it keeps happening, Standard Notes is blocking apps other than its own from this network."
-        );
+    if is_browser_check(&a) {
+        return Err(BrowserCheck(status).into());
     }
     let ok = (200..300).contains(&status);
-    let text = match resp.text() {
+    let text = match a.body {
         Ok(t) => t,
         // A reply cut off half way mustn't pass for an empty one.
-        Err(e) if ok => return Err(anyhow::Error::new(e).context("reading the Standard Notes server's reply")),
+        Err(e) if ok => anyhow::bail!("reading the Standard Notes server's reply: {e}"),
         Err(_) => String::new(),
     };
     let body: Value = if text.trim().is_empty() {
@@ -140,10 +215,26 @@ fn read(resp: reqwest::blocking::Response) -> Result<Value> {
     Err(HttpError { status, message, tag, body }.into())
 }
 
+/// Cloudflare's browser check turned a request away.
+#[derive(Debug)]
+pub struct BrowserCheck(pub u16);
+
+impl std::fmt::Display for BrowserCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Standard Notes' server is behind a Cloudflare browser check that turned this request away before it reached Standard Notes (HTTP {}). This isn't about your email or password.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BrowserCheck {}
+
 /// An unauthenticated POST (sign-in).
-pub fn post(http: &reqwest::blocking::Client, server: &str, path: &str, mut body: Value) -> Result<Value> {
+pub fn post(t: &dyn Transport, server: &str, path: &str, mut body: Value) -> Result<Value> {
     body["api"] = json!(API_VERSION);
-    read(http.post(format!("{}{path}", base(server))).json(&body).send().context("contacting the Standard Notes server")?)
+    read(t.post(&format!("{}{path}", base(server)), None, &body.to_string())?)
 }
 
 pub fn status_of(e: &anyhow::Error) -> Option<u16> {
@@ -164,7 +255,7 @@ pub fn tokens_of(v: &Value) -> Result<(String, String, i64, i64)> {
 
 /// An authorized client.
 pub struct Client {
-    pub http: reqwest::blocking::Client,
+    pub transport: std::sync::Arc<dyn Transport>,
     pub server: String,
     pub session: Session,
     /// The session changed (new tokens) since last saved.
@@ -175,7 +266,7 @@ pub struct Client {
 
 impl Client {
     pub fn new(server: &str, session: Session) -> Client {
-        Client { http: http(), server: base(server), session, renewed: false, on_renewed: None }
+        Client { transport: transport_for(server), server: base(server), session, renewed: false, on_renewed: None }
     }
 
     /// New tokens for the session (`/v1/sessions/refresh`).
@@ -184,7 +275,7 @@ impl Client {
             return Err(NeedsSignIn("the session expired".into()).into());
         }
         let body = json!({ "access_token": self.session.access_token, "refresh_token": self.session.refresh_token });
-        let v = match post(&self.http, &self.server, "/v1/sessions/refresh", body) {
+        let v = match post(self.transport.as_ref(), &self.server, "/v1/sessions/refresh", body) {
             Ok(v) => v,
             Err(e) => {
                 if let Some(h) = e.downcast_ref::<HttpError>() {
@@ -219,13 +310,8 @@ impl Client {
         for attempt in 0..2 {
             let mut b = body.clone();
             b["api"] = json!(API_VERSION);
-            let resp = self
-                .http
-                .post(format!("{}{path}", self.server))
-                .bearer_auth(&self.session.access_token)
-                .json(&b)
-                .send()
-                .context("contacting the Standard Notes server")?;
+            let url = format!("{}{path}", self.server);
+            let resp = self.transport.post(&url, Some(&self.session.access_token), &b.to_string())?;
             match read(resp) {
                 Err(e) if status_of(&e) == Some(EXPIRED_ACCESS_TOKEN) && attempt == 0 => self.refresh()?,
                 Err(e) if status_of(&e) == Some(401) => {

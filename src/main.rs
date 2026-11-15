@@ -26,6 +26,8 @@ mod model;
 mod settings;
 mod sync;
 mod theme;
+#[cfg(any(windows, target_os = "macos"))]
+mod webfetch;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

@@ -106,14 +106,14 @@ impl std::fmt::Display for BadCredentials {
 impl std::error::Error for BadCredentials {}
 
 fn sign_in_as(config: &Config, email: &str, req: &SignInRequest) -> Result<SignInStep> {
-    let http = api::http();
+    let http = api::transport_for(&config.server);
     // PKCE: the login must come from whoever asked for the key params.
     let verifier = crypto::random_hex(32);
     let mut body = json!({ "email": email, "code_challenge": crypto::code_challenge(&verifier) });
     if let Some(code) = &req.mfa_code {
         body["mfa_code"] = json!(code.trim());
     }
-    let params = match api::post(&http, &config.server, "/v2/login-params", body) {
+    let params = match api::post(http.as_ref(), &config.server, "/v2/login-params", body) {
         Ok(v) => api::payload(&v).clone(),
         Err(e) => {
             return match api::tag_of(&e) {
@@ -141,7 +141,7 @@ fn sign_in_as(config: &Config, email: &str, req: &SignInRequest) -> Result<SignI
     let identifier = field("identifier").filter(|i| !i.is_empty()).unwrap_or(email).to_owned();
     let root = crypto::root_key(&req.password, &identifier, nonce)?;
     let body = json!({ "email": email, "password": root.server_password, "ephemeral": false, "code_verifier": verifier });
-    let v = match api::post(&http, &config.server, "/v2/login", body) {
+    let v = match api::post(http.as_ref(), &config.server, "/v2/login", body) {
         Ok(v) => v,
         Err(e) => {
             if matches!(api::status_of(&e), Some(401 | 403)) || api::tag_of(&e) == Some("invalid-auth") {

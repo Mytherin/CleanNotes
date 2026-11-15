@@ -119,6 +119,10 @@ pub struct App {
     redo_deletes: Vec<Deletion>,
     /// Locked notes: the password this session, unlocked notes' text.
     pub lock: locked::LockState,
+    /// The browser engine Standard Notes requests go through (as in its own
+    /// apps), if it could be started.
+    #[cfg(any(windows, target_os = "macos"))]
+    web: Option<crate::webfetch::WebHost>,
 }
 
 /// Notes moved to Recently Deleted together, and how things were before.
@@ -152,6 +156,16 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let worker = Worker::spawn(move || ctx.request_repaint());
         let mut app = App::with(db, store, settings, worker);
+        // Standard Notes requests go through the system's browser engine, as
+        // in Standard Notes' own apps (see webfetch.rs).
+        #[cfg(any(windows, target_os = "macos"))]
+        match crate::webfetch::WebHost::start(cc) {
+            Ok((host, fetch)) => {
+                crate::sync::standardnotes::api::use_browser_engine(fetch);
+                app.web = Some(host);
+            }
+            Err(e) => eprintln!("no browser engine for Standard Notes ({e:#}); using plain HTTP"),
+        }
         app.restore_location();
         app.purge_expired();
         if std::env::var_os("CLEANNOTES_SEED").is_some() && app.store.notes.is_empty() {
@@ -195,6 +209,8 @@ impl App {
             undo_deletes: Vec::new(),
             redo_deletes: Vec::new(),
             lock: Default::default(),
+            #[cfg(any(windows, target_os = "macos"))]
+            web: None,
         }
     }
 
@@ -1342,6 +1358,37 @@ pub fn note_header_time(t: DateTime<Utc>) -> String {
     t.with_timezone(&Local).format("%-d %B %Y at %H:%M").to_string()
 }
 
+impl App {
+    /// Passes Standard Notes requests to the browser engine, and if
+    /// Cloudflare asks for its browser check, shows it (as a browser would)
+    /// below a bar saying what it is, until the user is done.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn browser_check(&mut self, ctx: &egui::Context) {
+        let Some(web) = &mut self.web else { return };
+        web.pump();
+        if !web.check_needed() && !web.checking() {
+            return;
+        }
+        let mut done = false;
+        let bar = egui::TopBottomPanel::top("browser-check").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it below, then click Done.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    done = ui.button("Done").clicked();
+                });
+            });
+        });
+        if done {
+            web.end_check();
+            // Try again now.
+            self.sync_started.clear();
+            return;
+        }
+        let screen = ctx.screen_rect();
+        web.show_check(egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.response.rect.max.y), screen.max));
+    }
+}
+
 /// Shown instead of the app when the notes database can't be opened. (The
 /// app has no console, so a panic would just mean no window at all.)
 pub struct StartupError(String);
@@ -1365,6 +1412,8 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_style(ctx);
         let p = Palette::get(ctx);
+        #[cfg(any(windows, target_os = "macos"))]
+        self.browser_check(ctx);
         while let Ok(r) = self.worker.rx.try_recv() {
             match r {
                 Reply::Synced(r) => self.handle_synced(r),
