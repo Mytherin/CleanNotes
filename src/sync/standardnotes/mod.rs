@@ -365,6 +365,26 @@ impl StandardNotesBackend {
         Ok(out)
     }
 
+    /// Opens Standard Notes' live change notifications if the transport can
+    /// keep them and they aren't open: as the official apps do, with a token
+    /// from `/v1/sockets/tokens`. If the server won't give one, changes are
+    /// still found by looking every half minute.
+    fn live_changes(&mut self) {
+        if !self.client.transport.wants_live_changes() {
+            return;
+        }
+        match self.client.post("/v1/sockets/tokens", &json!({})) {
+            Ok(v) => match api::payload(&v).get("token").and_then(Value::as_str) {
+                Some(token) => {
+                    let url = format!("{}?authToken={}", api::LIVE_CHANGES_URL, token);
+                    self.client.transport.open_live_changes(&url);
+                }
+                None => eprintln!("Standard Notes gave no live-changes token"),
+            },
+            Err(e) => eprintln!("no live changes from Standard Notes: {e:#}"),
+        }
+    }
+
     fn catch_up(&mut self) -> Result<()> {
         self.exchange(vec![]).map(|_| ())
     }
@@ -725,6 +745,7 @@ impl Backend for StandardNotesBackend {
     /// not a version, and changes with every request.)
     fn cursor(&mut self) -> Result<Option<String>> {
         self.catch_up()?;
+        self.live_changes();
         Ok(Some(if self.pending {
             // Changes the engine hasn't seen yet: a marker that won't match.
             format!("{}~{}", self.high_water, uuid::Uuid::new_v4())

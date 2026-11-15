@@ -102,7 +102,19 @@ pub trait Transport: Send + Sync {
     /// A JSON `POST` with the official clients' headers (and the bearer
     /// token, if any).
     fn post(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<Answer>;
+
+    /// Whether this transport can keep Standard Notes' live change
+    /// notifications open (its WebSocket) and has none open now.
+    fn wants_live_changes(&self) -> bool {
+        false
+    }
+
+    /// Opens the live change notifications at `url` (with its token).
+    fn open_live_changes(&self, _url: &str) {}
 }
+
+/// Where Standard Notes' own apps get told of changes as they happen.
+pub const LIVE_CHANGES_URL: &str = "wss://sockets.standardnotes.com";
 
 /// Plain HTTP from this process.
 pub struct Direct(reqwest::blocking::Client);

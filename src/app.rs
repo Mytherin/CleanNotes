@@ -891,7 +891,14 @@ impl App {
                     let changed = quiet
                         && s > StdDuration::from_secs(5)
                         && AccountSnapshot::of(&self.store, &id).has_local_changes();
-                    changed || (refresh > 0 && s > StdDuration::from_secs(refresh as u64 * 60))
+                    // Standard Notes' own apps look for changes every 30
+                    // seconds (and are told of them at once, see
+                    // `live_changes`); asking costs one small request.
+                    let every = match self.store.account(&id).map(|a| &a.backend) {
+                        Some(crate::sync::BackendConfig::StandardNotes(_)) => StdDuration::from_secs(30).min(StdDuration::from_secs(refresh as u64 * 60)),
+                        _ => StdDuration::from_secs(refresh as u64 * 60),
+                    };
+                    changed || (refresh > 0 && s > every)
                 }
             };
             if due {
@@ -1366,6 +1373,21 @@ impl App {
     fn browser_check(&mut self, ctx: &egui::Context) {
         let Some(web) = &mut self.web else { return };
         web.pump();
+        if web.take_changed() {
+            // Told of a change on Standard Notes' server: those accounts
+            // sync now (as soon as they aren't syncing already).
+            let ids: Vec<String> = self
+                .store
+                .accounts
+                .iter()
+                .filter(|a| matches!(&a.backend, crate::sync::BackendConfig::StandardNotes(c) if crate::sync::standardnotes::api::base(&c.server) == crate::sync::standardnotes::api::base(crate::sync::standardnotes::DEFAULT_SERVER)))
+                .map(|a| a.id.clone())
+                .collect();
+            for id in ids {
+                self.sync_started.remove(&id);
+            }
+        }
+        let Some(web) = &mut self.web else { return };
         if !web.check_needed() && !web.checking() {
             return;
         }

@@ -20,7 +20,7 @@
 //! requests.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -58,11 +58,34 @@ window.__cleannotesFetch = async (id, url, headers, body) => {
   }
   window.__cleannotesAnswers[id] = answer;
 };
-// The answers that came in since last asked, as JSON text.
+// Standard Notes' live change notifications, as its WebsocketsService keeps
+// them: told when items change on the server, a ping every 6 minutes.
+window.__cleannotesEvents = [];
+window.__cleannotesSocket = (url) => {
+  try { if (window.__cleannotesWs) window.__cleannotesWs.close(3123); } catch (e) {}
+  const ws = new WebSocket(url);
+  window.__cleannotesWs = ws;
+  let beat;
+  ws.onopen = () => {
+    window.__cleannotesEvents.push('open');
+    beat = setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 360000);
+  };
+  ws.onmessage = (m) => {
+    try {
+      if (JSON.parse(m.data).type === 'ITEMS_CHANGED_ON_SERVER') window.__cleannotesEvents.push('changed');
+    } catch (e) {}
+  };
+  ws.onclose = () => {
+    clearInterval(beat);
+    if (window.__cleannotesWs === ws) window.__cleannotesEvents.push('closed');
+  };
+};
+// The answers and events that came in since last asked, as JSON text.
 window.__cleannotesCollect = () => {
-  const a = window.__cleannotesAnswers;
+  const r = { answers: window.__cleannotesAnswers, events: window.__cleannotesEvents };
   window.__cleannotesAnswers = {};
-  return JSON.stringify(a);
+  window.__cleannotesEvents = [];
+  return JSON.stringify(r);
 };
 </script>
 "#;
@@ -70,12 +93,35 @@ window.__cleannotesCollect = () => {
 /// How often the page is asked for answers while requests are out.
 const COLLECT_EVERY: Duration = Duration::from_millis(40);
 
-/// Hands answers collected from the page to the requests waiting for them.
-/// `result` is what the collecting script returned, as JSON: a string
-/// holding a JSON object of answers by request id.
-fn deliver(result: &str, waiting: &Waiting) {
-    let Ok(text) = serde_json::from_str::<String>(result) else { return };
-    let Ok(Value::Object(answers)) = serde_json::from_str::<Value>(&text) else { return };
+/// The live change notifications' state.
+const LIVE_NONE: u8 = 0;
+const LIVE_OPENING: u8 = 1;
+const LIVE_OPEN: u8 = 2;
+
+/// What [`deliver`] found besides answers.
+struct Events {
+    opened: bool,
+    changed: bool,
+    closed: bool,
+}
+
+/// Hands answers collected from the page to the requests waiting for them,
+/// and returns the live-notification events. `result` is what the
+/// collecting script returned, as JSON: a string holding
+/// `{answers: {id: answer}, events: [..]}`.
+fn deliver(result: &str, waiting: &Waiting) -> Events {
+    let mut events = Events { opened: false, changed: false, closed: false };
+    let Ok(text) = serde_json::from_str::<String>(result) else { return events };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else { return events };
+    for e in v["events"].as_array().into_iter().flatten() {
+        match e.as_str() {
+            Some("open") => events.opened = true,
+            Some("changed") => events.changed = true,
+            Some("closed") => events.closed = true,
+            _ => {}
+        }
+    }
+    let Value::Object(answers) = v["answers"].clone() else { return events };
     for (id, v) in answers {
         let Ok(id) = id.parse::<u64>() else { continue };
         let Some(tx) = waiting.lock().unwrap().remove(&id) else { continue };
@@ -92,6 +138,7 @@ fn deliver(result: &str, waiting: &Waiting) {
         };
         let _ = tx.send(reply);
     }
+    events
 }
 
 /// The script making one request: the official clients' headers, and every
@@ -175,10 +222,25 @@ pub struct WebFetch {
     next: AtomicU64,
     /// Set when Cloudflare asked for its browser check.
     check_needed: Arc<AtomicBool>,
+    /// The live change notifications: `LIVE_*`.
+    live: Arc<AtomicU8>,
     ctx: egui::Context,
 }
 
 impl Transport for WebFetch {
+    fn wants_live_changes(&self) -> bool {
+        self.live.load(Ordering::Relaxed) == LIVE_NONE
+    }
+
+    fn open_live_changes(&self, url: &str) {
+        self.live.store(LIVE_OPENING, Ordering::Relaxed);
+        // (The URL holds a token: not logged.)
+        log("opening live change notifications");
+        let script = format!("window.__cleannotesSocket({});", json!(url));
+        let _ = self.jobs.lock().unwrap().send(Job { id: 0, script });
+        self.ctx.request_repaint();
+    }
+
     fn post(&self, url: &str, bearer: Option<&str>, body: &str) -> Result<Answer> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let script = fetch_script(id, url, bearer, body);
@@ -233,6 +295,10 @@ pub struct WebHost {
     give_back_focus: bool,
     /// When the page was last asked for answers.
     last_collect: std::time::Instant,
+    /// The live change notifications: `LIVE_*` (shared with [`WebFetch`]).
+    live: Arc<AtomicU8>,
+    /// Standard Notes said items changed on the server since last asked.
+    changed: Arc<AtomicBool>,
     ctx: egui::Context,
 }
 
@@ -283,11 +349,13 @@ impl WebHost {
 
         let (tx, jobs) = mpsc::channel();
         let check_needed = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(AtomicU8::new(LIVE_NONE));
         let fetch = Arc::new(WebFetch {
             jobs: Mutex::new(tx),
             waiting: waiting.clone(),
             next: AtomicU64::new(1),
             check_needed: check_needed.clone(),
+            live: live.clone(),
             ctx: ctx.clone(),
         });
         let host = WebHost {
@@ -302,6 +370,8 @@ impl WebHost {
             checking: false,
             give_back_focus: true,
             last_collect: std::time::Instant::now(),
+            live,
+            changed: Arc::new(AtomicBool::new(false)),
             ctx,
         };
         let _ = host.webview.focus_parent();
@@ -312,22 +382,49 @@ impl WebHost {
     /// frame; frames keep coming while requests are out).
     pub fn pump(&mut self) {
         self.send_queued();
-        if self.waiting.lock().unwrap().is_empty() || self.checking {
+        if self.checking {
             return;
         }
-        if self.last_collect.elapsed() >= COLLECT_EVERY {
+        // Often while requests are out; every second while the live change
+        // notifications are open (to hear of changes).
+        let every = if !self.waiting.lock().unwrap().is_empty() {
+            COLLECT_EVERY
+        } else if self.live.load(Ordering::Relaxed) != LIVE_NONE {
+            Duration::from_secs(1)
+        } else {
+            return;
+        };
+        if self.last_collect.elapsed() >= every {
             self.last_collect = std::time::Instant::now();
-            let waiting = self.waiting.clone();
+            let (waiting, live, changed) = (self.waiting.clone(), self.live.clone(), self.changed.clone());
             let ctx = self.ctx.clone();
             let collect = self.webview.evaluate_script_with_callback("window.__cleannotesCollect()", move |result| {
-                deliver(&result, &waiting);
+                let events = deliver(&result, &waiting);
+                if events.opened {
+                    live.store(LIVE_OPEN, Ordering::Relaxed);
+                    log("live change notifications open");
+                }
+                if events.closed {
+                    // Opened again by the next sync.
+                    live.store(LIVE_NONE, Ordering::Relaxed);
+                    log("live change notifications closed");
+                }
+                if events.changed {
+                    changed.store(true, Ordering::Relaxed);
+                    log("told of a change on the server");
+                }
                 ctx.request_repaint();
             });
             if let Err(e) = collect {
                 log(&format!("couldn't ask the page for answers: {e}"));
             }
         }
-        self.ctx.request_repaint_after(COLLECT_EVERY);
+        self.ctx.request_repaint_after(every);
+    }
+
+    /// Whether Standard Notes said something changed since last asked.
+    pub fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::Relaxed)
     }
 
     fn send_queued(&mut self) {
@@ -378,6 +475,8 @@ impl WebHost {
         let _ = self.webview.focus_parent();
         let _ = self.webview.load_url(&self.page_url);
         self.give_back_focus = true;
+        // Reloading the page closed the live notifications.
+        self.live.store(LIVE_NONE, Ordering::Relaxed);
     }
 
     pub fn checking(&self) -> bool {
@@ -415,11 +514,15 @@ mod tests {
         // What WebView2 hands the callback: the script's result (a string)
         // as JSON.
         let page = json!({
-            "1": {"status": 200, "headers": {"Content-Type": "application/json"}, "body": "{\"ok\":true}"},
-            "2": {"error": "Failed to fetch"},
-            "9": {"status": 200, "headers": {}, "body": ""},
+            "answers": {
+                "1": {"status": 200, "headers": {"Content-Type": "application/json"}, "body": "{\"ok\":true}"},
+                "2": {"error": "Failed to fetch"},
+                "9": {"status": 200, "headers": {}, "body": ""},
+            },
+            "events": ["open", "changed"],
         });
-        deliver(&json!(page.to_string()).to_string(), &waiting);
+        let events = deliver(&json!(page.to_string()).to_string(), &waiting);
+        assert!(events.opened && events.changed && !events.closed);
         let a = rx1.try_recv().unwrap().unwrap();
         assert_eq!((a.status, a.body.unwrap()), (200, "{\"ok\":true}".to_owned()));
         assert_eq!(a.headers, vec![("content-type".to_owned(), "application/json".to_owned())]);
