@@ -309,7 +309,10 @@ impl Editor {
         }
         let c = self.sel.caret;
         if c.offset == 0 {
-            if c.block == 0 && self.doc.blocks[0].kind == Kind::Body && self.doc.blocks[0].indent == 0 {
+            // Nothing to undo: no indent or list/quote style to take off,
+            // and nothing above to join (a title stays a title).
+            let first = &self.doc.blocks[0];
+            if c.block == 0 && first.indent == 0 && !first.kind.is_list() && first.kind != Kind::Quote {
                 return;
             }
             self.checkpoint(None);
@@ -384,9 +387,10 @@ impl Editor {
                 }
             }
             Command::EditLink => {
-                let url = self.doc.blocks[self.sel.caret.block]
+                let start = self.sel.start();
+                let url = self.doc.blocks[start.block]
                     .styles
-                    .get(self.sel.start().offset)
+                    .get(start.offset)
                     .and_then(|s| s.link.as_deref().map(str::to_owned))
                     .unwrap_or_default();
                 self.link_sheet = Some(LinkSheet { url, focus: true });
@@ -487,17 +491,24 @@ impl Editor {
 
     /// Matches of `query` (case-insensitive) as (block, char range).
     pub fn matches(&self, query: &str) -> Vec<(usize, std::ops::Range<usize>)> {
-        let q: Vec<char> = query.to_lowercase().chars().collect();
+        // Query and text are folded the same way, character by character
+        // (whole-string lowercasing would turn a final Σ into ς, say).
+        let fold = |s: &str| -> Vec<char> {
+            s.chars()
+                .flat_map(|c| {
+                    let l: Vec<char> = c.to_lowercase().collect();
+                    // Keep char positions aligned (a few characters lowercase to two).
+                    if l.len() == 1 { l } else { vec![c] }
+                })
+                .collect()
+        };
+        let q = fold(query);
         if q.is_empty() {
             return vec![];
         }
         let mut out = Vec::new();
         for (bi, b) in self.doc.blocks.iter().enumerate() {
-            let t: Vec<char> = b.text.chars().flat_map(|c| {
-                let l: Vec<char> = c.to_lowercase().collect();
-                // Keep char positions aligned (a few characters lowercase to two).
-                if l.len() == 1 { l } else { vec![c] }
-            }).collect();
+            let t = fold(&b.text);
             let mut i = 0;
             while i + q.len() <= t.len() {
                 if t[i..i + q.len()] == q[..] {
@@ -564,6 +575,16 @@ impl Editor {
 
     /// One line up (`-1`) or down (`1`) from `p`, aiming for `x`.
     fn line_step(&self, p: Pos, dir: i32, x: f32) -> Pos {
+        // The layout is last frame's: after an edit that added or removed
+        // paragraphs this frame, step by paragraph instead.
+        if self.laid.len() != self.doc.blocks.len() {
+            return match dir {
+                d if d < 0 && p.block > 0 => Pos::new(p.block - 1, 0),
+                d if d < 0 => Pos::new(0, 0),
+                _ if p.block + 1 < self.doc.blocks.len() => Pos::new(p.block + 1, 0),
+                _ => self.doc.end(),
+            };
+        }
         let Some(l) = self.laid.get(p.block) else { return p };
         let cur = l.galley.from_ccursor(CCursor::new(p.offset));
         let row = cur.rcursor.row;
@@ -589,6 +610,9 @@ impl Editor {
     }
 
     fn row_edge(&self, p: Pos, end: bool) -> Pos {
+        if self.laid.len() != self.doc.blocks.len() {
+            return Pos::new(p.block, if end { self.doc.blocks[p.block].len() } else { 0 });
+        }
         let Some(l) = self.laid.get(p.block) else { return p };
         let cur = l.galley.from_ccursor(CCursor::new(p.offset));
         let c = if end { l.galley.cursor_end_of_row(&cur) } else { l.galley.cursor_begin_of_row(&cur) };
@@ -1108,6 +1132,49 @@ mod tests {
         assert_eq!(e.doc.blocks[0].text, "");
         e.insert_text("eggs");
         assert_eq!(e.take_markdown().as_deref(), Some("- eggs\n"));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_a_title_changes_nothing() {
+        let mut e = Editor::new("n", "# Title\nbody\n");
+        e.sel = Selection::caret(Pos::new(0, 0));
+        e.backspace(false);
+        e.backspace(false);
+        assert!(e.undo.is_empty(), "no do-nothing undo steps");
+        assert_eq!(e.take_markdown(), None, "the note isn't changed");
+        // A list item at the top still turns into body text.
+        let mut e = Editor::new("n", "- item\n");
+        e.sel = Selection::caret(Pos::new(0, 0));
+        e.backspace(false);
+        assert_eq!(e.doc.blocks[0].kind, Kind::Body);
+    }
+
+    #[test]
+    fn the_link_sheet_shows_the_link_where_the_selection_starts() {
+        let mut e = Editor::new("n", "[link](https://example.com) text\nsecond line\n");
+        // Dragged forwards, from inside the link into the next paragraph.
+        e.sel = Selection { anchor: Pos::new(0, 1), caret: Pos::new(1, 3) };
+        e.command(Command::EditLink);
+        assert_eq!(e.link_sheet.as_ref().map(|s| s.url.as_str()), Some("https://example.com"));
+    }
+
+    #[test]
+    fn find_folds_case_the_same_way_for_query_and_text() {
+        let e = Editor::new("n", "ΟΔΟΣ and Straße\n");
+        assert_eq!(e.matches("ΟΔΟΣ").len(), 1);
+        assert_eq!(e.matches("οδοσ").len(), 1);
+        assert_eq!(e.matches("STRASSE").len(), 0);
+        assert_eq!(e.matches("straße").len(), 1);
+    }
+
+    #[test]
+    fn arrows_without_an_up_to_date_layout_step_by_paragraph() {
+        // No layout yet (or one from before paragraphs were removed).
+        let e = Editor::new("n", "one\ntwo\nthree\n");
+        assert_eq!(e.line_step(Pos::new(2, 2), 1, 0.0), e.doc.end());
+        assert_eq!(e.line_step(Pos::new(1, 2), 1, 0.0), Pos::new(2, 0));
+        assert_eq!(e.line_step(Pos::new(1, 2), -1, 0.0), Pos::new(0, 0));
+        assert_eq!(e.row_edge(Pos::new(2, 1), true), Pos::new(2, 5));
     }
 
     #[test]
