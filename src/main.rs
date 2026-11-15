@@ -1,4 +1,5 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A windowed app on Windows, in debug builds too: no console window.
+#![windows_subsystem = "windows"]
 
 /// The label for a shortcut on egui's "command" modifier: `cmd_key!("F")` is
 /// "⌘F" on macOS and "Ctrl+F" elsewhere.
