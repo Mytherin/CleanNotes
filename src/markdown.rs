@@ -72,14 +72,15 @@ pub fn to_markdown(doc: &Doc) -> String {
         let inline = inline_markdown(b);
         // Text that would read as a heading, list, quote or code fence gets
         // its first character escaped.
-        let rest = inline.trim_start_matches(' ');
+        // (The reader takes a tab for four spaces.)
+        let rest = inline.trim_start_matches([' ', '\t']);
         let lead = inline.len() - rest.len();
         let prefix = parse_prefix(rest);
-        let reads_as_markup = prefix.is_some() || rest.starts_with("```") || rest.starts_with("~~~");
+        let reads_as_markup = prefix.is_some() || opens_fence(rest).is_some();
         if matches!(b.kind, Kind::Body | Kind::Quote) && reads_as_markup {
             // Digits can't be escaped: "1\. text".
             let at = match prefix {
-                Some(Prefix { kind: Kind::Numbered, len }) => len - 2,
+                Some(Prefix { kind: Kind::Numbered, .. }) => rest.bytes().take_while(u8::is_ascii_digit).count(),
                 _ => 0,
             };
             out.push_str(&inline[..lead + at]);
@@ -140,20 +141,24 @@ fn inline_markdown(b: &Block) -> String {
             }
             switch(&mut out, &mut cur, &Style { code: false, ..s.clone() });
             let text: String = chars[i..j].iter().collect();
-            if text.contains('`') {
-                out.push_str("`` ");
-                out.push_str(&text);
-                out.push_str(" ``");
-            } else {
-                out.push('`');
-                out.push_str(&text);
-                out.push('`');
+            // Fenced by more backticks than any run inside, and padded with a
+            // space (which the reader takes off again) when it holds a
+            // backtick, or has spaces on both ends.
+            let mut longest = 0;
+            let mut run = 0;
+            for ch in text.chars() {
+                run = if ch == '`' { run + 1 } else { 0 };
+                longest = longest.max(run);
             }
+            let fence = "`".repeat(longest + 1);
+            let pad = text.contains('`') || (text.starts_with(' ') && text.ends_with(' ') && !text.trim().is_empty());
+            let pad = if pad { " " } else { "" };
+            out.push_str(&format!("{fence}{pad}{text}{pad}{fence}"));
             i = j;
             continue;
         }
         switch(&mut out, &mut cur, s);
-        escape_char(&mut out, &chars, i);
+        escape_char(&mut out, &chars, &styles, i);
         i += 1;
     }
     close_all(&mut out, &mut cur);
@@ -232,10 +237,12 @@ fn close_all(out: &mut String, cur: &mut Style) {
     }
 }
 
-fn escape_char(out: &mut String, chars: &[char], i: usize) {
+fn escape_char(out: &mut String, chars: &[char], styles: &[Style], i: usize) {
     let c = chars[i];
-    let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-    let next = chars.get(i + 1).copied();
+    // A neighbour in another style has markup (`**`, `[`, …) between it and
+    // this character, so for the reader it isn't part of the same word.
+    let prev = if i > 0 && styles[i - 1] == styles[i] { Some(chars[i - 1]) } else { None };
+    let next = chars.get(i + 1).copied().filter(|_| styles.get(i + 1) == Some(&styles[i]));
     let needs = match c {
         '\\' | '*' | '`' | '[' | ']' | '~' => true,
         // `_` only marks emphasis at the edge of a word.
@@ -301,6 +308,19 @@ fn parse_prefix(line: &str) -> Option<Prefix> {
     None
 }
 
+/// The fence a line opens a code block with, if it does: three or more
+/// backticks or tildes. As in CommonMark, a backtick fence line holds no
+/// other backticks, so a line starting with a code span (```` ```a``b``` ````)
+/// isn't one.
+fn opens_fence(line: &str) -> Option<String> {
+    let first = line.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let mark: String = line.chars().take_while(|&c| c == first).collect();
+    if mark.len() < 3 || (first == '`' && line[mark.len()..].contains('`')) {
+        return None;
+    }
+    Some(mark)
+}
+
 pub fn from_markdown(md: &str) -> Doc {
     let mut blocks = Vec::new();
     let mut fence: Option<String> = None;
@@ -321,13 +341,10 @@ pub fn from_markdown(md: &str) -> Doc {
             }
             continue;
         }
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            let mark: String = trimmed.chars().take_while(|&c| c == '`' || c == '~').collect();
-            if mark.len() >= 3 {
-                fence = Some(mark);
-                list_stack.clear();
-                continue;
-            }
+        if let Some(mark) = opens_fence(trimmed) {
+            fence = Some(mark);
+            list_stack.clear();
+            continue;
         }
         let Some(prefix) = parse_prefix(trimmed) else {
             list_stack.clear();
@@ -345,7 +362,10 @@ pub fn from_markdown(md: &str) -> Doc {
             if list_stack.last() != Some(&spaces) {
                 list_stack.push(spaces);
             }
-            indent = (list_stack.len() - 1).min(crate::doc::MAX_INDENT as usize) as u8;
+            // The app writes four spaces per level, which also holds for an
+            // indented item with nothing above it to nest under.
+            let nesting = (list_stack.len() - 1).max(spaces / INDENT.len());
+            indent = nesting.min(crate::doc::MAX_INDENT as usize) as u8;
         } else {
             list_stack.clear();
         }
@@ -550,14 +570,25 @@ pub fn snippet_of(md: &str, max_chars: usize) -> String {
 
 /// A note's lines with text, as plain text, trimmed.
 fn plain_lines(md: &str) -> impl Iterator<Item = String> + '_ {
-    let mut fence = false;
+    // The open code block's fence, closed (as in `from_markdown`) only by a
+    // line of at least as many of the same character.
+    let mut fence: Option<String> = None;
     md.lines().filter_map(move |raw| {
         let t = raw.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            fence = !fence;
-            return None;
+        match &fence {
+            Some(f) if t.starts_with(f.as_str()) && t.chars().all(|c| c == '`' || c == '~') => {
+                fence = None;
+                return None;
+            }
+            None => {
+                if let Some(f) = opens_fence(t) {
+                    fence = Some(f);
+                    return None;
+                }
+            }
+            _ => {}
         }
-        let text = if fence {
+        let text = if fence.is_some() {
             t.to_owned()
         } else {
             let start = raw.trim_start_matches([' ', '\t']);
@@ -725,8 +756,89 @@ mod tests {
         );
         assert!(d.has_attr(crate::doc::Pos::new(2, 0), crate::doc::Pos::new(2, 4), Attr::Bold));
         assert!(d.has_attr(crate::doc::Pos::new(2, 9), crate::doc::Pos::new(2, 11), Attr::Italic));
-        // The first item of a list is at the top level however it's indented.
-        assert_eq!(d.blocks[3].indent, 0);
+        // Four spaces (or a tab) are a level, even for the first item: the
+        // app writes an indented item after body text that way.
+        assert_eq!(d.blocks[3].indent, 1);
+    }
+
+    fn doc_round_trip(d: &Doc) {
+        let md = to_markdown(d);
+        assert_eq!(&from_markdown(&md), d, "written as {md:?}");
+    }
+
+    fn styled(text: &str, from: usize, to: usize, f: impl Fn(&mut Style)) -> Block {
+        let mut b = Block::new(Kind::Body, text);
+        for s in &mut b.styles[from..to] {
+            f(s);
+        }
+        b
+    }
+
+    #[test]
+    fn underscores_next_to_a_style_change_survive() {
+        for b in [
+            styled("snake_case", 6, 10, |s| s.bold = true),
+            styled("snake_case", 0, 5, |s| s.bold = true),
+            styled("snake_case", 0, 6, |s| s.italic = true),
+            styled("foo_bar", 4, 7, |s| s.link = Some(Arc::from("https://example.com"))),
+            styled("foo_bar", 4, 7, |s| s.code = true),
+            styled("foo_bar", 0, 7, |s| s.bold = true),
+        ] {
+            doc_round_trip(&Doc::new(vec![b]));
+        }
+    }
+
+    #[test]
+    fn lines_that_are_just_a_number_survive() {
+        for t in ["1.", "2024.", "3)", "12) x", "1. step", "  3.", "x 1."] {
+            doc_round_trip(&Doc::new(vec![Block::new(Kind::Body, t)]));
+            doc_round_trip(&Doc::new(vec![Block::new(Kind::Quote, t)]));
+        }
+    }
+
+    #[test]
+    fn body_text_after_a_tab_stays_body_text() {
+        for t in ["\t1. step", "\t- x", "\t# x", "\t> x", "\t+ x", "\t```", " \t* y"] {
+            doc_round_trip(&Doc::new(vec![Block::new(Kind::Body, t)]));
+        }
+    }
+
+    #[test]
+    fn indentation_survives() {
+        let item = |kind, text: &str, indent| {
+            let mut b = Block::new(kind, text);
+            b.indent = indent;
+            b
+        };
+        // An indented first item, a skipped level, and an indented item after
+        // an empty line.
+        doc_round_trip(&Doc::new(vec![Block::new(Kind::Body, "x"), item(Kind::Bulleted, "y", 1)]));
+        doc_round_trip(&Doc::new(vec![item(Kind::Bulleted, "a", 0), item(Kind::Bulleted, "b", 2)]));
+        doc_round_trip(&Doc::new(vec![
+            item(Kind::Bulleted, "a", 0),
+            item(Kind::Bulleted, "b", 1),
+            Block::new(Kind::Body, ""),
+            item(Kind::Bulleted, "c", 1),
+        ]));
+        doc_round_trip(&Doc::new(vec![item(Kind::Quote, "q", 2)]));
+        // Two-space nesting from other editors still nests.
+        let d = from_markdown("- a\n  - b\n    - c\n");
+        assert_eq!(d.blocks.iter().map(|b| b.indent).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn code_spans_with_backticks_and_spaces_survive() {
+        for t in ["a``b", "`x", "x`", " x ", "``", " ", "a ` b", "a```b``c"] {
+            let b = styled(t, 0, t.chars().count(), |s| s.code = true);
+            let mut d = Doc::new(vec![b]);
+            // Text around it, too.
+            let mut around = Block::new(Kind::Body, &format!("p {t} q"));
+            for s in &mut around.styles[2..2 + t.chars().count()] {
+                s.code = true;
+            }
+            d.blocks.push(around);
+            doc_round_trip(&d);
+        }
     }
 
     #[test]
@@ -736,5 +848,10 @@ mod tests {
         assert_eq!(snippet_of(md, 100), "book hotel code last");
         assert_eq!(snippet_of(md, 6), "book h");
         assert_eq!(title_of(""), "");
+        // A longer fence holding a shorter one, and a line starting with a
+        // code span, don't flip in and out of code.
+        let md = "````\n```\ninside\n````\n```a``b``` text\nlast";
+        assert_eq!(title_of(md), "```");
+        assert_eq!(snippet_of(md, 100), "inside a``b text last");
     }
 }
