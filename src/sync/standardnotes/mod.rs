@@ -512,19 +512,30 @@ impl StandardNotesBackend {
             tags.insert(id, (title, parent, created, c));
         }
         let mut out = Tags { unreadable, ..Tags::default() };
+        // Parent cycles (tags moved under each other on two devices at
+        // once) are cut at the same place on every device: the tag with the
+        // smallest id in the cycle counts as top-level. Every tag then has
+        // one path in one tree, so no folders are made up for it.
+        let mut roots: HashSet<String> = HashSet::new();
         for id in tags.keys() {
-            let mut path = Vec::new();
-            let mut seen = HashSet::new();
+            let mut chain: Vec<&str> = Vec::new();
             let mut cur = Some(id.as_str());
-            while let Some(c) = cur {
-                // A parent cycle (moves on two devices at once): the tag
-                // that closes it counts as top-level.
-                if !seen.insert(c) {
+            while let Some(c) = cur.filter(|c| tags.contains_key(*c)) {
+                if let Some(i) = chain.iter().position(|x| *x == c) {
+                    roots.insert(chain[i..].iter().min().unwrap().to_string());
                     break;
                 }
+                chain.push(c);
+                cur = tags[c].1.as_deref();
+            }
+        }
+        for id in tags.keys() {
+            let mut path = Vec::new();
+            let mut cur = Some(id.as_str());
+            while let Some(c) = cur {
                 let Some((title, parent, ..)) = tags.get(c) else { break };
                 path.insert(0, title.clone());
-                cur = parent.as_deref();
+                cur = if roots.contains(c) { None } else { parent.as_deref() };
                 if path.len() > 32 {
                     break;
                 }

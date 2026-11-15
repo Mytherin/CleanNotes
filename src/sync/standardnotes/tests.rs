@@ -538,6 +538,105 @@ fn deleting_for_good_respects_edits_made_since_and_works_after_a_restart() {
 }
 
 #[test]
+fn a_failed_page_doesnt_skip_what_it_held() {
+    let server = server_with_key();
+    let mut b = backend(&server);
+    assert!(b.pull().unwrap().notes.is_empty());
+    {
+        let mut s = server.state();
+        s.limit = 3;
+        for i in 0..10 {
+            s.add("Note", json!({"title": format!("N{i}"), "text": format!("N{i}"), "references": []}));
+        }
+        s.fail_next_page = true;
+    }
+    assert!(b.pull().is_err(), "the second page fails");
+    assert_eq!(b.pull().unwrap().notes.len(), 10, "nothing skipped on the next try");
+}
+
+#[test]
+fn a_folder_made_elsewhere_since_the_last_sync_is_reused() {
+    let server = server_with_key();
+    let mut b = backend(&server);
+    b.pull().unwrap();
+    // Another client makes the tag after this backend's last look.
+    let theirs = server.state().add_tag("Projects", None, &[]);
+    assert_eq!(b.create_folder(&p(&["Projects"])).unwrap(), theirs);
+    assert_eq!(server.state().live("Tag").len(), 1, "no second Projects tag");
+}
+
+#[test]
+fn a_tag_parent_cycle_makes_short_paths_and_no_new_tags() {
+    let server = server_with_key();
+    let (a, b_tag) = {
+        let mut s = server.state();
+        let a = s.add_tag("A", None, &[]);
+        let b = s.add_tag("B", Some(&a), &[]);
+        // Moved under each other on two devices at once.
+        s.edit(&a, |c| {
+            c["references"] = json!([{"uuid": b, "content_type": "Tag", "reference_type": "TagToParentTag"}]);
+        });
+        (a, b)
+    };
+    let mut laptop = Device::new(&server);
+    laptop.sync();
+    laptop.sync();
+    let paths: Vec<Vec<String>> = laptop.store.folders.iter().filter(|f| f.account == "sn").map(|f| laptop.store.folder_path(&f.id)).collect();
+    assert!(paths.iter().all(|p| p.len() <= 2), "{paths:?}");
+    let live = server.state().live("Tag");
+    assert_eq!(live.len(), 2, "no tags made for a cycle");
+    assert!(live.contains(&a) && live.contains(&b_tag));
+}
+
+#[test]
+fn a_tag_that_cant_be_decrypted_keeps_its_folder_here() {
+    let server = server_with_key();
+    let mut laptop = Device::new(&server);
+    let id = laptop.add(&["Work"], "# In work\n");
+    laptop.sync();
+    {
+        // Re-encrypted elsewhere with a key this device doesn't have.
+        let mut s = server.state();
+        let tag = s.tag("Work");
+        let t = s.items[&tag]["updated_at_timestamp"].as_i64().unwrap() + 1;
+        let it = s.items.get_mut(&tag).unwrap();
+        it["items_key_id"] = json!("a-key-we-dont-have");
+        it["updated_at_timestamp"] = json!(t);
+    }
+    laptop.sync();
+    let n = laptop.store.note(&id).unwrap();
+    assert_eq!(laptop.store.folder_path(&n.folder), vec!["Work"]);
+}
+
+#[test]
+fn editing_a_read_only_note_leaves_no_banner_behind() {
+    let server = server_with_key();
+    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Pack light"}]}]}}"#;
+    server.state().add(
+        "Note",
+        json!({"title": "Trip", "text": lexical, "noteType": "super", "editorIdentifier": "com.standardnotes.super-editor", "references": []}),
+    );
+    let mut laptop = Device::new(&server);
+    laptop.sync();
+    let id = laptop.store.notes.iter().find(|n| n.account == "sn").unwrap().id.clone();
+    let body = laptop.store.note(&id).unwrap().body.clone();
+    assert!(body.contains("Shown read-only"));
+    laptop.edit(&id, &format!("{body}\nmore"));
+    laptop.sync();
+    laptop.sync();
+    // The edited copy here has the text as saved, without the banner…
+    let mine = laptop.store.notes.iter().find(|n| n.account == "sn" && n.body.contains("more")).unwrap();
+    assert!(!mine.body.contains("Shown read-only"), "{}", mine.body);
+    // …so a later edit doesn't upload it.
+    let mine = mine.id.clone();
+    let b = laptop.store.note(&mine).unwrap().body.clone();
+    laptop.edit(&mine, &format!("{b}\nand more"));
+    laptop.sync();
+    let s = server.state();
+    assert!(s.live(NOTE).iter().all(|u| !s.content(u)["text"].as_str().unwrap_or("").contains("Shown read-only")));
+}
+
+#[test]
 fn malformed_hex_from_the_server_is_an_error_not_a_panic() {
     assert!(crypto::unhex("aé0").is_err());
     assert!(crypto::unhex("zz").is_err());

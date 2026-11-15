@@ -45,6 +45,8 @@ pub struct State {
     pub limit: usize,
     /// Requests served, as "METHOD /path".
     pub log: Vec<String>,
+    /// Fail the next request for a later page (one with a cursor token).
+    pub fail_next_page: bool,
 }
 
 fn ts(v: &Value) -> i64 {
@@ -231,6 +233,7 @@ impl FakeServer {
             refresh_tokens: HashSet::new(),
             limit: 150,
             log: vec![],
+            fail_next_page: false,
         };
         let state = Arc::new(Mutex::new(state));
         let s = state.clone();
@@ -302,6 +305,10 @@ fn route(s: &mut State, req: &Request) -> (u16, Value) {
         }
         "/v1/items" => {
             let token = req.headers.get("authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+            if s.fail_next_page && body["cursor_token"].is_string() {
+                s.fail_next_page = false;
+                return error(500, None, "the server had a hiccup");
+            }
             match s.tokens.get(token) {
                 Some(true) => sync(s, &body),
                 Some(false) => error(498, Some("expired-access-token"), "The provided access token has expired."),
