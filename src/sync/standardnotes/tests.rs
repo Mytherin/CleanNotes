@@ -493,6 +493,58 @@ impl Device {
 }
 
 #[test]
+fn a_note_deleted_in_standard_notes_but_edited_here_is_uploaded_again() {
+    let server = server_with_key();
+    let mut laptop = Device::new(&server);
+    let id = laptop.add(&["Notes"], "# Keep\nv1\n");
+    laptop.sync();
+    let rid = laptop.store.note(&id).unwrap().sync.remote_id.clone().unwrap();
+    server.state().delete(&rid);
+    laptop.edit(&id, "# Keep\nv2 edited here\n");
+    // `sync` asserts it ends without an error ("notes kept changing").
+    laptop.sync();
+    laptop.sync();
+    let s = server.state();
+    let texts: Vec<String> = s.live(NOTE).iter().map(|u| s.content(u)["text"].as_str().unwrap_or("").to_owned()).collect();
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].contains("v2 edited here"), "{texts:?}");
+}
+
+#[test]
+fn deleting_for_good_respects_edits_made_since_and_works_after_a_restart() {
+    let server = server_with_key();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    let a = laptop.add(&["Work"], "# A\n");
+    let b = laptop.add(&["Work"], "# B\n");
+    laptop.sync();
+    phone.sync();
+    // The phone edits A after the laptop's last sync; the laptop (whose
+    // backend stayed open, with what it saw then) deletes A for good.
+    phone.edit(&a, "# A\nedited on the phone\n");
+    phone.sync();
+    laptop.store.purge_note(&a);
+    let notices = laptop.sync();
+    assert_eq!(notices.len(), 1, "the edit wins: {notices:?}");
+    assert_eq!(laptop.store.note(&a).unwrap().body, "# A\nedited on the phone\n");
+    // After a restart (a fresh backend), deleting a note in a folder that
+    // nobody changed just deletes it.
+    laptop.backend = backend(&server);
+    laptop.store.purge_note(&b);
+    let notices = laptop.sync();
+    assert!(notices.is_empty(), "{notices:?}");
+    phone.sync();
+    assert!(phone.store.note(&b).is_none());
+}
+
+#[test]
+fn malformed_hex_from_the_server_is_an_error_not_a_panic() {
+    assert!(crypto::unhex("aé0").is_err());
+    assert!(crypto::unhex("zz").is_err());
+    assert_eq!(crypto::unhex("0aff").unwrap(), vec![0x0a, 0xff]);
+}
+
+#[test]
 fn two_devices_sync_through_standard_notes() {
     let server = server_with_key();
     let mut laptop = Device::new(&server);

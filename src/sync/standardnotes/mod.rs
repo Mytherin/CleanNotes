@@ -26,7 +26,7 @@
 //!   only the session tokens and the master key (which unlocks the
 //!   account's items keys) are kept in the OS credential store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -213,6 +213,8 @@ struct Tags {
     canonical: HashMap<Vec<String>, String>,
     /// The tags holding each note.
     holding: HashMap<String, Vec<String>>,
+    /// Tags that can't be decrypted (not shared-vault ones).
+    unreadable: Vec<String>,
 }
 
 impl Tags {
@@ -281,6 +283,10 @@ impl StandardNotesBackend {
             self.items.remove(&uuid);
             self.contents.remove(&uuid);
             self.items_keys.remove(&uuid);
+            // The default items key deleted elsewhere: pick one again.
+            if self.default_key.as_deref() == Some(uuid.as_str()) {
+                self.default_key = None;
+            }
         } else {
             self.items.insert(uuid, item);
         }
@@ -296,9 +302,12 @@ impl StandardNotesBackend {
         let mut out = Exchange::default();
         let mut cursor: Option<String> = None;
         let mut first = true;
+        // Kept only once the last page is in: if a page fails, the next
+        // exchange starts from the same token and misses nothing.
+        let mut token = self.sync_token.clone();
         loop {
             let up: &[Value] = if first { &push } else { &[] };
-            let r = self.client.sync(up, self.sync_token.as_deref(), cursor.as_deref())?;
+            let r = self.client.sync(up, token.as_deref(), cursor.as_deref())?;
             for it in list(&r, "retrieved_items") {
                 self.apply(it.clone(), true);
             }
@@ -322,7 +331,7 @@ impl StandardNotesBackend {
                 }
             }
             if let Some(t) = r.get("sync_token").and_then(Value::as_str) {
-                self.sync_token = Some(t.to_owned());
+                token = Some(t.to_owned());
             }
             cursor = r.get("cursor_token").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_owned);
             first = false;
@@ -330,6 +339,7 @@ impl StandardNotesBackend {
                 break;
             }
         }
+        self.sync_token = token;
         self.loaded = true;
         Ok(out)
     }
@@ -486,24 +496,37 @@ impl StandardNotesBackend {
 
     fn tags(&mut self) -> Tags {
         let mut tags: HashMap<String, (String, Option<String>, i64, Value)> = HashMap::new();
+        let mut unreadable = Vec::new();
         for id in self.uuids_of(TAG) {
-            let Some(c) = self.content_of(&id) else { continue };
+            let Some(c) = self.content_of(&id) else {
+                let it = &self.items[&id];
+                if !has(it, "key_system_identifier") && !has(it, "shared_vault_uuid") {
+                    unreadable.push(id);
+                }
+                continue;
+            };
             let title = items::str_field(&c, "title").trim();
             let title = if title.is_empty() { "Untitled" } else { title }.to_owned();
             let parent = items::parent_of(&c).map(str::to_owned);
             let created = self.items[&id].get("created_at_timestamp").and_then(Value::as_i64).unwrap_or(0);
             tags.insert(id, (title, parent, created, c));
         }
-        let mut out = Tags::default();
+        let mut out = Tags { unreadable, ..Tags::default() };
         for id in tags.keys() {
             let mut path = Vec::new();
+            let mut seen = HashSet::new();
             let mut cur = Some(id.as_str());
             while let Some(c) = cur {
+                // A parent cycle (moves on two devices at once): the tag
+                // that closes it counts as top-level.
+                if !seen.insert(c) {
+                    break;
+                }
                 let Some((title, parent, ..)) = tags.get(c) else { break };
                 path.insert(0, title.clone());
                 cur = parent.as_deref();
                 if path.len() > 32 {
-                    break; // a cycle
+                    break;
                 }
             }
             out.paths.insert(id.clone(), path);
@@ -534,7 +557,8 @@ impl StandardNotesBackend {
     /// An item ready to upload, encrypted with the default items key.
     fn encrypted(&self, uuid: &str, content_type: &str, content: &Value, existing: Option<&Value>, created: DateTime<Utc>) -> Result<Value> {
         let key_id = self.default_key.clone().context("no items key")?;
-        let enc = crypto::encrypt_item(uuid, content, &self.items_keys[&key_id], None)?;
+        let key = self.items_keys.get(&key_id).context("the items key is gone (deleted elsewhere); will retry")?;
+        let enc = crypto::encrypt_item(uuid, content, key, None)?;
         let keep = |k: &str, default: Value| existing.and_then(|e| e.get(k)).filter(|v| !v.is_null()).cloned().unwrap_or(default);
         Ok(json!({
             "uuid": uuid,
@@ -588,6 +612,9 @@ impl StandardNotesBackend {
             let item = self.encrypted(&id, NOTE, &content, None, note.created)?;
             match self.push_one(item)? {
                 Pushed::Saved => return Ok(id),
+                // The id was used by a note deleted on the server (its
+                // tombstone blocks the id): save under a new one.
+                Pushed::Conflict if !self.items.contains_key(&id) => continue,
                 // The note is there already (a create whose reply was lost):
                 // the engine matches it up after pulling again.
                 Pushed::Conflict => return Err(Conflict.into()),
@@ -679,6 +706,8 @@ impl Backend for StandardNotesBackend {
             }
         }
         snap.folders.sort_by(|a, b| a.path.cmp(&b.path));
+        // Not deleted: the folders (and notes in them) stay as they are here.
+        snap.unreadable.extend(tags.unreadable.iter().cloned());
         for id in self.uuids_of(NOTE) {
             let Some(content) = self.content_of(&id) else {
                 // Shared-vault notes were never ours; any other note that
@@ -718,6 +747,9 @@ impl Backend for StandardNotesBackend {
             return Ok(DEFAULT_FOLDER_ID.into());
         }
         self.ready()?;
+        // Up to date first: another device may have made this tag since
+        // the last sync, and a second one would split the folder.
+        self.catch_up()?;
         self.ensure_tag(path)
     }
 
@@ -767,7 +799,9 @@ impl Backend for StandardNotesBackend {
             let new_id = self.create_note(None, &copy)?;
             self.move_note(&new_id, &note.folder)?;
             let tags = self.tags();
-            return Ok((new_id.clone(), self.revision(&tags, &new_id)));
+            // A revision the next pull won't match, so the note here takes
+            // the text as saved (without the read-only banner).
+            return Ok((new_id.clone(), format!("{}+banner", self.revision(&tags, &new_id))));
         }
         let mut updated = content.clone();
         if items::update_note(&mut updated, note, &read) {
@@ -787,19 +821,22 @@ impl Backend for StandardNotesBackend {
     }
 
     fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
-        if !self.loaded {
-            self.catch_up()?;
-        }
+        // Unlocked (tags must decrypt for the revision to be right) and up
+        // to date (the backend stays open between syncs).
+        self.ready()?;
+        self.catch_up()?;
+        let Some(base) = base_revision else { return self.delete_item(remote_id) };
         // Edited elsewhere since: an edit beats a delete.
-        if let Some(base) = base_revision {
-            if self.items.contains_key(remote_id) {
-                let tags = self.tags();
-                if self.revision(&tags, remote_id) != base {
-                    return Err(Conflict.into());
-                }
-            }
+        let Some(existing) = self.items.get(remote_id).cloned() else { return Ok(()) };
+        let tags = self.tags();
+        if self.revision(&tags, remote_id) != base {
+            return Err(Conflict.into());
         }
-        self.delete_item(remote_id)
+        match self.push_one(Self::deletion(&existing))? {
+            Pushed::Saved | Pushed::UuidTaken => Ok(()),
+            // Changed in between: the newer version stays.
+            Pushed::Conflict => Err(Conflict.into()),
+        }
     }
 
     fn renewed_secret(&mut self) -> Option<String> {
