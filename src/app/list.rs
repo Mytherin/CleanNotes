@@ -19,6 +19,7 @@ impl App {
             return "Search".into();
         }
         match &self.location {
+            Location::All => "All Notes".into(),
             Location::Folder(f) => self.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
@@ -102,7 +103,7 @@ impl App {
             child.painter().text(area.center() - Vec2::new(0.0, 40.0), Align2::CENTER_CENTER, msg, theme::font(15.0), p.secondary);
             return;
         }
-        let show_folder = !self.search.trim().is_empty() || matches!(self.location, Location::Tag(_));
+        let show_folder = !self.search.trim().is_empty() || matches!(self.location, Location::Tag(_) | Location::All);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (name, ids) in &sections {

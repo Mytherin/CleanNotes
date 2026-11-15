@@ -28,10 +28,15 @@ const RETRY_AFTER_ERROR: StdDuration = StdDuration::from_secs(60);
 const SAVE_EVERY: StdDuration = StdDuration::from_millis(800);
 /// Height of the toolbar row along the top of every pane.
 pub const TOOLBAR_H: f32 = 52.0;
+/// `last_folder` when "All Notes" was showing.
+const ALL_NOTES: &str = "all-notes";
 
 /// What's selected in the sidebar.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Location {
+    /// Every note in every enabled account (when there's more than one
+    /// folder).
+    All,
     Folder(String),
     /// An account's Recently Deleted.
     Deleted(String),
@@ -217,6 +222,13 @@ impl App {
     }
 
     fn restore_location(&mut self) {
+        if self.settings.last_folder.as_deref() == Some(ALL_NOTES) && self.show_all_notes() {
+            self.location = Location::All;
+            let note = self.settings.last_note.clone().filter(|n| self.store.note(n).is_some());
+            let note = note.or_else(|| self.visible_notes().first().cloned());
+            self.select(note);
+            return;
+        }
         let folder = self
             .settings
             .last_folder
@@ -229,6 +241,11 @@ impl App {
         let note = self.settings.last_note.clone().filter(|n| self.store.note(n).is_some());
         let note = note.or_else(|| self.visible_notes().first().cloned());
         self.select(note);
+    }
+
+    /// "All Notes" is in the sidebar once there's more than one folder.
+    pub fn show_all_notes(&self) -> bool {
+        self.store.folders.iter().filter(|f| self.account_enabled(&f.account)).count() > 1
     }
 
     pub fn account_enabled(&self, id: &str) -> bool {
@@ -258,6 +275,7 @@ impl App {
                     n.deleted.is_none() && words.iter().all(|w| body.contains(w.as_str()))
                 } else {
                     match &self.location {
+                        Location::All => n.deleted.is_none(),
                         Location::Folder(f) => n.deleted.is_none() && &n.folder == f,
                         Location::Deleted(a) => n.deleted.is_some() && &n.account == a,
                         Location::Tag(t) => n.deleted.is_none() && n.tags().contains(t),
@@ -334,8 +352,10 @@ impl App {
     }
 
     pub fn go_to(&mut self, loc: Location) {
-        if let Location::Folder(f) = &loc {
-            self.settings.last_folder = Some(f.clone());
+        match &loc {
+            Location::Folder(f) => self.settings.last_folder = Some(f.clone()),
+            Location::All => self.settings.last_folder = Some(ALL_NOTES.to_owned()),
+            _ => {}
         }
         self.location = loc;
         self.search.clear();
@@ -361,7 +381,7 @@ impl App {
 
     pub fn new_note(&mut self) {
         let (account, folder) = self.new_note_target();
-        if !matches!(self.location, Location::Folder(_)) || !self.search.is_empty() {
+        if !matches!(self.location, Location::Folder(_) | Location::All) || !self.search.is_empty() {
             self.location = Location::Folder(folder.clone());
             self.search.clear();
         }
@@ -1090,7 +1110,7 @@ impl App {
         let loc_gone = match &self.location {
             Location::Folder(f) => self.store.folder(f).is_none(),
             Location::Deleted(a) => a == id,
-            Location::Tag(_) => false,
+            Location::Tag(_) | Location::All => false,
         };
         if loc_gone {
             let f = self.store.default_folder(crate::model::LOCAL).map(|f| f.id.clone()).unwrap_or_default();
@@ -1272,6 +1292,31 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, p: &Palette, add: impl FnOnce(&mu
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn all_notes_shows_every_folder_once_there_are_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::for_test(dir.path());
+        assert!(!app.show_all_notes(), "one folder: no All Notes");
+        let notes = app.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+        let work = app.store.ensure_folder_at(crate::model::LOCAL, &["Work".into()]);
+        assert!(app.show_all_notes());
+        let a = Note::new(crate::model::LOCAL, &notes, "# A\n");
+        let b = Note::new(crate::model::LOCAL, &work, "# B\n");
+        let mut gone = Note::new(crate::model::LOCAL, &work, "# Gone\n");
+        gone.deleted = Some(Utc::now());
+        let ids = [a.id.clone(), b.id.clone(), gone.id.clone()];
+        app.store.notes.extend([a, b, gone]);
+        app.go_to(Location::All);
+        let shown = app.visible_notes();
+        assert!(shown.contains(&ids[0]) && shown.contains(&ids[1]));
+        assert!(!shown.contains(&ids[2]), "deleted notes stay in Recently Deleted");
+        // A new note made in All Notes stays in view.
+        app.new_note();
+        assert_eq!(app.location, Location::All);
+        // It's remembered for next time.
+        assert_eq!(app.settings.last_folder.as_deref(), Some(ALL_NOTES));
+    }
 
     #[test]
     fn date_groups() {

@@ -28,6 +28,8 @@ pub enum Icon {
     /// "…": more actions.
     More,
     Lock,
+    /// Stacked notes: All Notes.
+    Notes,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -157,6 +159,14 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             let cut = Stroke::new(s.width, if color.r() > 128 { Color32::BLACK } else { Color32::WHITE });
             line(p, &[at(3.0, -3.5), at(7.0, -3.5)], cut);
             line(p, &[at(5.0, -5.5), at(5.0, -1.5)], cut);
+        }
+        Icon::Notes => {
+            // The note behind: only its edges that show.
+            line(p, &[at(-4.5, -4.5), at(-4.5, -7.0), at(7.0, -7.0), at(7.0, 4.5), at(4.5, 4.5)], s);
+            let front = Rect::from_min_max(at(-7.0, -4.5), at(4.5, 7.0));
+            p.rect_stroke(front, 1.8 * u, s);
+            line(p, &[at(-4.5, -1.0), at(2.0, -1.0)], s);
+            line(p, &[at(-4.5, 2.0), at(2.0, 2.0)], s);
         }
         Icon::Lock => {
             let body = Rect::from_min_max(at(-5.5, -1.0), at(5.5, 7.0));

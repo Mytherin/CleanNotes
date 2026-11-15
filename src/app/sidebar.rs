@@ -38,6 +38,21 @@ impl App {
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(list_rect).layout(egui::Layout::top_down(egui::Align::LEFT)));
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 1.0;
+            // "All Notes": every note, whatever its folder or account.
+            if self.show_all_notes() {
+                let count = self.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)).count();
+                let selected = self.location == Location::All && self.search.is_empty();
+                ui.add_space(4.0);
+                let resp = self.row(ui, p, 0, Icon::Notes, "All Notes", Some(count), selected, None);
+                if resp.clicked() {
+                    self.go_to(Location::All);
+                    self.focus = Pane::Sidebar;
+                }
+                ui.add_space(8.0);
+            } else if self.location == Location::All {
+                let f = self.new_note_target().1;
+                self.go_to(Location::Folder(f));
+            }
             let accounts: Vec<(String, String)> =
                 self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
             for (id, name) in accounts {
