@@ -734,6 +734,34 @@ fn super_notes_are_edited_here_and_saved_back_as_super_notes() {
 }
 
 #[test]
+fn super_notes_synced_by_an_older_version_are_read_again() {
+    let server = server_with_key();
+    let lexical = r#"{"root":{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"Hello","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":0,"textStyle":""}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}"#;
+    server.state().add("Note", json!({"title": "Old", "text": lexical, "noteType": "super", "references": []}));
+    let mut laptop = Device::new(&server);
+    laptop.sync();
+    // As the previous version left it: shown read-only, with its marker and
+    // revision from before Super notes were read.
+    let id = laptop.store.notes.iter().find(|n| n.account == "sn").unwrap().id.clone();
+    {
+        let n = laptop.store.note_mut(&id).unwrap();
+        n.body = "# Old\n> Shown read-only: this is a Super note in Standard Notes. Edit it there; changes to its text made here are saved as a new note.\n\nHello".into();
+        let rev = n.sync.revision.clone().unwrap();
+        n.sync.revision = Some(rev.split("/super").next().unwrap().to_owned());
+        if let Some(base) = &mut n.sync.base {
+            base.body = n.body.clone();
+        }
+    }
+    let acc = laptop.store.accounts.iter_mut().find(|a| a.id == "sn").unwrap();
+    let cursor = acc.cursor.clone().unwrap();
+    acc.cursor = Some(cursor.split('.').next().unwrap().to_owned());
+    // A new backend, as after starting the new version.
+    laptop.backend = backend(&server);
+    laptop.sync();
+    assert_eq!(laptop.store.note(&id).unwrap().body, "# Old\nHello\n");
+}
+
+#[test]
 fn a_super_note_with_something_the_app_cant_show_says_what() {
     let server = server_with_key();
     let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Plan"}]},{"type":"table","children":[],"version":1}]}}"#;

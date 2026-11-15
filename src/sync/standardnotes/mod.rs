@@ -729,7 +729,10 @@ impl Backend for StandardNotesBackend {
             // Changes the engine hasn't seen yet: a marker that won't match.
             format!("{}~{}", self.high_water, uuid::Uuid::new_v4())
         } else {
-            self.high_water.to_string()
+            // With how Super notes are read: when that changes, the marker
+            // saved before doesn't match, so everything is pulled (and read
+            // again) once.
+            format!("{}.{SUPER_READING}", self.high_water)
         }))
     }
 
