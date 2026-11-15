@@ -39,6 +39,11 @@ use crate::model::DEFAULT_FOLDER;
 pub mod api;
 pub mod crypto;
 pub mod items;
+pub mod lexical;
+
+/// How Super notes are read (see [`lexical`]): raised when that changes, so
+/// notes already here are read again.
+const SUPER_READING: u32 = 1;
 #[cfg(test)]
 mod fake;
 #[cfg(test)]
@@ -577,8 +582,15 @@ impl StandardNotesBackend {
         out
     }
 
-    fn revision(&self, tags: &Tags, uuid: &str) -> String {
-        format!("{}/{}", self.items.get(uuid).map(ts).unwrap_or(0), tags.folder_of(uuid).1)
+    fn revision(&mut self, tags: &Tags, uuid: &str) -> String {
+        let base = format!("{}/{}", self.items.get(uuid).map(ts).unwrap_or(0), tags.folder_of(uuid).1);
+        // Super notes carry the version of how the app reads them, so a
+        // change to that (one shown read-only before can be edited now) is
+        // taken in once, as if the note had changed.
+        match self.content_of(uuid) {
+            Some(c) if c.get("noteType").and_then(Value::as_str) == Some("super") => format!("{base}/super{SUPER_READING}"),
+            _ => base,
+        }
     }
 
     /// An item ready to upload, encrypted with the default items key.

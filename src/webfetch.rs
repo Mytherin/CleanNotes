@@ -126,6 +126,34 @@ fn log(line: &str) {
 
 static LOGGING: AtomicBool = AtomicBool::new(false);
 
+/// What an items sync request asked for and got, for the log: counts and
+/// the paging tokens (positions in the change feed, not credentials),
+/// never contents.
+fn items_summary(request: &str, a: &Answer) -> String {
+    let req: Value = serde_json::from_str(request).unwrap_or(Value::Null);
+    let resp: Value = a.body.as_deref().ok().and_then(|b| serde_json::from_str(b).ok()).unwrap_or(Value::Null);
+    let p = api::payload(&resp);
+    let n = |v: &Value, k: &str| v[k].as_array().map_or(0, Vec::len);
+    let s = |v: &Value, k: &str| v[k].as_str().map(str::to_owned).unwrap_or_else(|| "-".into());
+    let types: std::collections::BTreeMap<String, usize> =
+        p["retrieved_items"].as_array().into_iter().flatten().fold(Default::default(), |mut m, it| {
+            *m.entry(it["content_type"].as_str().unwrap_or("?").to_owned()).or_default() += 1;
+            m
+        });
+    format!(
+        "sent {} items, sync_token {}, cursor {} | got {} retrieved {:?}, {} saved, {} conflicts, sync_token {}, cursor {}",
+        n(&req, "items"),
+        s(&req, "sync_token"),
+        s(&req, "cursor_token"),
+        n(p, "retrieved_items"),
+        types,
+        n(p, "saved_items"),
+        n(p, "conflicts") + n(p, "unsaved"),
+        s(p, "sync_token"),
+        s(p, "cursor_token"),
+    )
+}
+
 /// The path of a URL, for the log.
 fn path_of(url: &str) -> &str {
     url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..])).unwrap_or(url)
@@ -164,7 +192,12 @@ impl Transport for WebFetch {
         self.waiting.lock().unwrap().remove(&id);
         let took = asked.elapsed().as_secs_f64();
         match &reply {
-            Ok(Ok(a)) => log(&format!("request {id}: HTTP {} after {took:.3}s{}", a.status, if api::is_browser_check(a) { " (Cloudflare browser check)" } else { "" })),
+            Ok(Ok(a)) => {
+                log(&format!("request {id}: HTTP {} after {took:.3}s{}", a.status, if api::is_browser_check(a) { " (Cloudflare browser check)" } else { "" }));
+                if url.ends_with("/v1/items") {
+                    log(&format!("request {id}: {}", items_summary(body, a)));
+                }
+            }
             Ok(Err(e)) => log(&format!("request {id}: failed after {took:.3}s: {e}")),
             Err(_) => log(&format!("request {id}: no answer after {took:.3}s")),
         }

@@ -72,6 +72,9 @@ pub fn str_field<'a>(content: &'a Value, k: &str) -> &'a str {
 pub enum Kind {
     /// Plain text or Markdown: the text is the note.
     Text,
+    /// A Super note the app can show exactly: edited here as Markdown and
+    /// saved back as a Super note (see [`super::lexical`]).
+    Super,
     /// Written with another editor (Super, rich text, code, a spreadsheet,
     /// …) or locked: shown read-only, never overwritten.
     ReadOnly,
@@ -84,6 +87,7 @@ pub fn kind(content: &Value) -> Kind {
     let editor = content.get("editorIdentifier").and_then(Value::as_str);
     match content.get("noteType").and_then(Value::as_str) {
         Some("plain-text") | Some("markdown") => Kind::Text,
+        Some("super") if super_markdown(str_field(content, "text")).is_ok() => Kind::Super,
         None | Some("") => match editor {
             None | Some("") | Some(PLAIN_EDITOR) => Kind::Text,
             Some(_) => Kind::ReadOnly,
@@ -125,14 +129,16 @@ pub fn read_note(content: &Value) -> ReadNote {
     let title = str_field(content, "title").trim().to_owned();
     let text = str_field(content, "text");
     let kind = kind(content);
-    let (body, title_prepended) = match kind {
-        Kind::Text => {
-            if !title.is_empty() && title_of(text) != title {
-                (format!("# {title}\n{text}"), true)
-            } else {
-                (text.to_owned(), false)
-            }
+    let with_title = |text: &str| {
+        if !title.is_empty() && title_of(text) != title {
+            (format!("# {title}\n{text}"), true)
+        } else {
+            (text.to_owned(), false)
         }
+    };
+    let (body, title_prepended) = match kind {
+        Kind::Text => with_title(text),
+        Kind::Super => with_title(&super_markdown(text).unwrap_or_default()),
         Kind::ReadOnly => (read_only_body(content, &title), false),
     };
     let sn = app_data(content, APP_DOMAIN);
@@ -158,10 +164,43 @@ fn read_only_body(content: &Value, title: &str) -> String {
         _ => format!("```\n{}\n```", text.trim_end_matches('\n')),
     };
     let title = if title.is_empty() { "Untitled" } else { title };
+    // For a Super note: what in it the app can't show yet.
+    let why = match content.get("noteType").and_then(Value::as_str) {
+        Some("super") => match super_markdown(text) {
+            Err(reason) => format!(" with {reason}, which CleanNotes can't show yet"),
+            Ok(_) => String::new(),
+        },
+        _ => String::new(),
+    };
     format!(
-        "# {title}\n{READ_ONLY_BANNER} this is {} in Standard Notes. Edit it there; changes to its text made here are saved as a new note.\n\n{shown}",
+        "# {title}\n{READ_ONLY_BANNER} this is {}{why} in Standard Notes. Edit it there; changes to its text made here are saved as a new note.\n\n{shown}",
         kind_name(content)
     )
+}
+
+/// A Super note's text as the app's Markdown, if it converts exactly: to the
+/// app's document and back to Super gives the same document, and so does
+/// going through Markdown (what the editor reads and writes). `Err` says
+/// what the app can't show.
+pub fn super_markdown(text: &str) -> Result<String, String> {
+    use super::lexical;
+    use crate::markdown::{from_markdown, to_markdown};
+    // Empty paragraphs at the end aren't kept by the Markdown: not a loss.
+    let trimmed = |d: &crate::doc::Doc| {
+        let mut b = d.blocks.clone();
+        while b.last().is_some_and(|l| l.kind == crate::doc::Kind::Body && l.text.is_empty()) {
+            b.pop();
+        }
+        b
+    };
+    let doc = lexical::to_doc(text)?;
+    let md = to_markdown(&doc);
+    let exact = lexical::to_doc(&lexical::from_doc(&doc)).is_ok_and(|d| trimmed(&d) == trimmed(&doc))
+        && trimmed(&from_markdown(&md)) == trimmed(&doc);
+    if !exact {
+        return Err("formatting that doesn't convert exactly".into());
+    }
+    Ok(md)
 }
 
 fn kind_is_locked_text(content: &Value) -> bool {
@@ -208,6 +247,18 @@ pub fn update_note(content: &mut Value, note: &NoteData, read: &ReadNote) -> boo
         if str_field(content, "title") != title || str_field(content, "text") != text {
             content["title"] = json!(title);
             content["text"] = json!(text);
+            content["preview_plain"] = json!(preview(&note.body));
+        }
+    }
+    if read.kind == Kind::Super {
+        let (title, md) = split_body(&note.body, read.title_prepended);
+        if str_field(content, "title") != title {
+            content["title"] = json!(title);
+        }
+        // Only rewritten when the text changed, so a note edited only in
+        // Super keeps exactly what Super wrote.
+        if super_markdown(str_field(content, "text")).ok().as_deref() != Some(md.as_str()) {
+            content["text"] = json!(super::lexical::from_doc(&crate::markdown::from_markdown(&md)));
             content["preview_plain"] = json!(preview(&note.body));
         }
     }
@@ -455,7 +506,7 @@ mod tests {
         assert_eq!(kind(&json!({"text": "x"})), Kind::Text);
         assert_eq!(kind(&json!({"noteType": "markdown", "editorIdentifier": "org.standardnotes.advanced-markdown-editor"})), Kind::Text);
         assert_eq!(kind(&json!({"noteType": "plain-text"})), Kind::Text);
-        assert_eq!(kind(&json!({"noteType": "super"})), Kind::ReadOnly);
+        assert_eq!(kind(&json!({"noteType": "super"})), Kind::Super);
         assert_eq!(kind(&json!({"noteType": "code"})), Kind::ReadOnly);
         assert_eq!(kind(&json!({"editorIdentifier": "org.standardnotes.plus-editor"})), Kind::ReadOnly);
         assert_eq!(kind(&json!({"text": "x", "appData": {APP_DOMAIN: {"locked": true}}})), Kind::ReadOnly);

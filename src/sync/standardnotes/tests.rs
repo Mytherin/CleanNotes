@@ -357,7 +357,7 @@ fn recently_deleted_is_the_trash_and_deleting_for_good_deletes() {
 #[test]
 fn super_notes_are_read_only_and_never_overwritten() {
     let server = server_with_key();
-    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Pack light"}]},{"type":"list","listType":"check","children":[{"type":"listitem","checked":false,"children":[{"type":"text","text":"Tickets"}]}]}]}}"#;
+    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Pack light"}]},{"type":"list","listType":"check","children":[{"type":"listitem","checked":false,"children":[{"type":"text","text":"Tickets"}]}]},{"type":"horizontalrule","version":1}]}}"#;
     let id = server.state().add(
         "Note",
         json!({"title": "Trip", "text": lexical, "noteType": "super", "editorIdentifier": "com.standardnotes.super-editor", "references": []}),
@@ -669,7 +669,7 @@ fn a_tag_that_cant_be_decrypted_keeps_its_folder_here() {
 #[test]
 fn editing_a_read_only_note_leaves_no_banner_behind() {
     let server = server_with_key();
-    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Pack light"}]}]}}"#;
+    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Pack light"}]},{"type":"horizontalrule","version":1}]}}"#;
     server.state().add(
         "Note",
         json!({"title": "Trip", "text": lexical, "noteType": "super", "editorIdentifier": "com.standardnotes.super-editor", "references": []}),
@@ -692,6 +692,56 @@ fn editing_a_read_only_note_leaves_no_banner_behind() {
     laptop.sync();
     let s = server.state();
     assert!(s.live(NOTE).iter().all(|u| !s.content(u)["text"].as_str().unwrap_or("").contains("Shown read-only")));
+}
+
+#[test]
+fn super_notes_are_edited_here_and_saved_back_as_super_notes() {
+    let server = server_with_key();
+    // As Super writes it.
+    let lexical = r#"{"root":{"children":[{"children":[{"detail":0,"format":1,"mode":"normal","style":"","text":"Pack","type":"text","version":1},{"detail":0,"format":0,"mode":"normal","style":"","text":" light","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"paragraph","version":1,"textFormat":1,"textStyle":""},{"children":[{"children":[{"detail":0,"format":0,"mode":"normal","style":"","text":"Tickets","type":"text","version":1}],"direction":"ltr","format":"","indent":0,"type":"listitem","version":1,"checked":false,"value":1}],"direction":"ltr","format":"","indent":0,"type":"list","version":1,"listType":"check","start":1,"tag":"ul"}],"direction":"ltr","format":"","indent":0,"type":"root","version":1}}"#;
+    let uuid = server.state().add(
+        "Note",
+        json!({"title": "Trip", "text": lexical, "noteType": "super", "editorIdentifier": "com.standardnotes.super-editor", "references": []}),
+    );
+    let mut laptop = Device::new(&server);
+    laptop.sync();
+    let id = laptop.store.notes.iter().find(|n| n.account == "sn").unwrap().id.clone();
+    // An ordinary note here: the title on top, the text as Markdown.
+    assert_eq!(laptop.store.note(&id).unwrap().body, "# Trip\n**Pack** light\n- [ ] Tickets\n");
+    // Syncing without edits leaves Super's text exactly as it was.
+    laptop.sync();
+    assert_eq!(server.state().content(&uuid)["text"], lexical);
+
+    laptop.edit(&id, "# Trip\n**Pack** light\n- [x] Tickets\n- [ ] Passport\n");
+    laptop.sync();
+    let c = server.state().content(&uuid);
+    assert_eq!(c["noteType"], "super", "still a Super note");
+    assert_eq!(c["title"], "Trip");
+    let doc = super::lexical::to_doc(c["text"].as_str().unwrap()).unwrap();
+    let items: Vec<(crate::doc::Kind, &str)> = doc.blocks.iter().map(|b| (b.kind, b.text.as_str())).collect();
+    assert_eq!(
+        items,
+        [
+            (crate::doc::Kind::Body, "Pack light"),
+            (crate::doc::Kind::Checklist(true), "Tickets"),
+            (crate::doc::Kind::Checklist(false), "Passport"),
+        ]
+    );
+    assert!(doc.blocks[0].styles[0].bold);
+    // Read back, it's the same note.
+    laptop.sync();
+    assert_eq!(laptop.store.note(&id).unwrap().body, "# Trip\n**Pack** light\n- [x] Tickets\n- [ ] Passport\n");
+}
+
+#[test]
+fn a_super_note_with_something_the_app_cant_show_says_what() {
+    let server = server_with_key();
+    let lexical = r#"{"root":{"type":"root","children":[{"type":"paragraph","children":[{"type":"text","text":"Plan"}]},{"type":"table","children":[],"version":1}]}}"#;
+    server.state().add("Note", json!({"title": "Budget", "text": lexical, "noteType": "super", "references": []}));
+    let mut laptop = Device::new(&server);
+    laptop.sync();
+    let body = &laptop.store.notes.iter().find(|n| n.account == "sn").unwrap().body;
+    assert!(body.contains("Shown read-only: this is a Super note with a table, which CleanNotes can't show yet"), "{body}");
 }
 
 #[test]
