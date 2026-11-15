@@ -19,12 +19,13 @@ pub struct Response {
     pub status: u16,
     pub body: String,
     pub content_type: &'static str,
+    pub headers: Vec<(&'static str, String)>,
 }
 
 impl Response {
     pub fn json(status: u16, v: &serde_json::Value) -> Response {
         let body = if v.is_null() { String::new() } else { v.to_string() };
-        Response { status, body, content_type: "application/json" }
+        Response { status, body, content_type: "application/json", headers: vec![] }
     }
 }
 
@@ -97,11 +98,12 @@ pub fn spawn(handler: impl Fn(&Request) -> Response + Send + Sync + 'static) -> 
                 let mut out = stream;
                 while let Some(req) = read_request(&mut reader) {
                     let resp = handler(&req);
+                    let extra: String = resp.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect();
                     let head = format!(
-                        "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
+                        "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{extra}\r\n",
                         resp.status,
                         resp.content_type,
-                        resp.body.len()
+                        resp.body.len(),
                     );
                     if out.write_all(head.as_bytes()).and_then(|_| out.write_all(resp.body.as_bytes())).is_err() {
                         return;

@@ -102,6 +102,12 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        // The system's light/dark mode, unless CLEANNOTES_THEME says otherwise.
+        match std::env::var("CLEANNOTES_THEME").as_deref() {
+            Ok("light") => cc.egui_ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Light),
+            Ok("dark") => cc.egui_ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Dark),
+            _ => {}
+        }
         let dir = db::data_dir();
         let (db, store, settings) = Db::open(&dir, Secrets::Keyring).expect("opening the notes database");
         let ctx = cc.egui_ctx.clone();

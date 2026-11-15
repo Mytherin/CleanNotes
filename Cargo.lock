@@ -733,7 +733,6 @@ dependencies = [
  "tempfile",
  "ttf-parser",
  "uuid",
- "windows-sys 0.59.0",
 ]
 
 [[package]]

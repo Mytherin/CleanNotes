@@ -685,6 +685,7 @@ fn ck_config(f: &CkForm) -> cloudkit::Config {
         environment: if f.production { "production" } else { "development" }.to_owned(),
         api_token: f.api_token.trim().to_owned(),
         callback_port: f.port.trim().parse().unwrap_or(cloudkit::DEFAULT_CALLBACK_PORT),
+        endpoint: None,
     }
 }
 
