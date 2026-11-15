@@ -237,6 +237,120 @@ fn edits_made_during_a_sync_are_kept() {
 }
 
 #[test]
+fn a_clashing_edit_made_during_a_sync_keeps_both_versions() {
+    let (_d, mut laptop, mut phone) = pair();
+    let id = laptop.add("# A\none\ntwo\n");
+    laptop.sync();
+    phone.sync();
+    phone.edit(&id, "# A\none\nTWO (phone)\n");
+    phone.sync();
+
+    // The laptop's sync takes the phone's line, while the same line is
+    // edited on the laptop.
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    let out = sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    laptop.edit(&id, "# A\none\nTWO (laptop)\n");
+    let notices = apply(&mut laptop.store, &snap, out);
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(laptop.body(&id), "# A\none\nTWO (laptop)\n");
+    laptop.sync();
+    phone.sync();
+    let both = vec!["# A\none\nTWO (laptop)\n".to_owned(), "# A\none\nTWO (phone)\n".to_owned()];
+    assert_eq!(laptop.bodies(), both);
+    assert_eq!(phone.bodies(), both, "the phone's edit isn't lost");
+}
+
+#[test]
+fn a_note_moved_to_another_account_during_a_sync_leaves_it() {
+    let (_d, mut laptop, _phone) = pair();
+    let id = laptop.add("# Moving\n");
+    // The sync uploads the new note; meanwhile it's moved to the local
+    // account (whose move found no remote id to delete yet).
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    let out = sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    let local = laptop.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+    {
+        let n = laptop.store.note_mut(&id).unwrap();
+        n.account = crate::model::LOCAL.into();
+        n.folder = local;
+        n.sync = Default::default();
+        n.touch();
+    }
+    apply(&mut laptop.store, &snap, out);
+    assert_eq!(laptop.store.notes.iter().filter(|n| n.id == id).count(), 1, "no second copy");
+    assert_eq!(laptop.store.note(&id).unwrap().account, crate::model::LOCAL);
+    laptop.sync();
+    assert!(laptop.backend.pull().unwrap().notes.is_empty(), "the uploaded copy is deleted again");
+    assert!(laptop.bodies().is_empty());
+}
+
+/// A backend where another device writes right after each pull, until the
+/// hook runs out.
+struct Racy<'a> {
+    inner: &'a mut SqliteBackend,
+    after_pull: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl Backend for Racy<'_> {
+    fn cursor(&mut self) -> anyhow::Result<Option<String>> {
+        self.inner.cursor()
+    }
+    fn pull(&mut self) -> anyhow::Result<Snapshot> {
+        let s = self.inner.pull();
+        if !self.after_pull.is_empty() {
+            (self.after_pull.remove(0))();
+        }
+        s
+    }
+    fn create_folder(&mut self, path: &[String]) -> anyhow::Result<String> {
+        self.inner.create_folder(path)
+    }
+    fn rename_folder(&mut self, remote_id: &str, old_path: &[String], new_path: &[String]) -> anyhow::Result<()> {
+        self.inner.rename_folder(remote_id, old_path, new_path)
+    }
+    fn delete_folder(&mut self, remote_id: &str, path: &[String]) -> anyhow::Result<()> {
+        self.inner.delete_folder(remote_id, path)
+    }
+    fn save_note(&mut self, remote_id: Option<&str>, base: Option<&str>, note: &NoteData) -> anyhow::Result<(String, String)> {
+        self.inner.save_note(remote_id, base, note)
+    }
+    fn delete_note(&mut self, remote_id: &str) -> anyhow::Result<()> {
+        self.inner.delete_note(remote_id)
+    }
+}
+
+#[test]
+fn a_change_made_elsewhere_during_a_sync_is_pulled_later() {
+    let (d, mut laptop, mut phone) = pair();
+    laptop.add("first");
+    laptop.sync();
+    phone.add("from the phone");
+    phone.sync();
+    // The laptop pulls the phone's note; right after its pull, a third
+    // device saves another one.
+    let path = d.path().join("shared.db");
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    let third = move || {
+        let mut b = SqliteBackend::open(&Config { path }).unwrap();
+        let n = NoteData {
+            id: new_id(),
+            folder: vec![crate::model::DEFAULT_FOLDER.to_owned()],
+            body: "from a third device".into(),
+            created: Utc::now(),
+            modified: Utc::now(),
+            pinned: false,
+            deleted: None,
+        };
+        b.save_note(None, None, &n).unwrap();
+    };
+    let mut racy = Racy { inner: &mut laptop.backend, after_pull: vec![Box::new(third)] };
+    let out = sync_account(&mut racy, &snap, Utc::now()).unwrap();
+    apply(&mut laptop.store, &snap, out);
+    laptop.sync();
+    assert_eq!(laptop.bodies(), vec!["first", "from a third device", "from the phone"]);
+}
+
+#[test]
 fn a_create_whose_reply_was_lost_is_not_duplicated() {
     let (_d, mut laptop, _phone) = pair();
     let id = laptop.add("once");

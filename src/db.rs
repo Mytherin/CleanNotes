@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS secrets (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
 
+/// Whether opening failed because the file isn't a (sound) database.
+fn is_corrupt(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<rusqlite::Error>().and_then(rusqlite::Error::sqlite_error_code),
+            Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+        )
+    })
+}
+
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -80,13 +90,17 @@ impl Db {
         let path = dir.join("data.db");
         let conn = match Self::connect(&path) {
             Ok(c) => c,
-            Err(e) => {
-                // Don't lose an unreadable file: move it aside and start over.
+            // Only a file that isn't a database (or is damaged) is moved
+            // aside to start over. A locked or briefly unreadable one (a
+            // backup tool, a sync client) is an error: starting empty would
+            // look like every note was gone.
+            Err(e) if is_corrupt(&e) => {
                 let aside = path.with_extension(format!("db.broken-{}", Utc::now().format("%Y%m%d%H%M%S")));
-                eprintln!("data.db can't be read ({e:#}); moved to {}", aside.display());
-                std::fs::rename(&path, &aside).ok();
+                eprintln!("data.db can't be read ({e:#}); moving it to {}", aside.display());
+                std::fs::rename(&path, &aside).with_context(|| format!("moving the unreadable {} aside", path.display()))?;
                 Self::connect(&path)?
             }
+            Err(e) => return Err(e.context(format!("opening {}", path.display()))),
         };
         let keyring_prefix = if std::env::var_os("CLEANNOTES_DATA").is_some() || secrets == Secrets::Database {
             format!("{}:", dir.display())
@@ -100,6 +114,8 @@ impl Db {
 
     fn connect(path: &Path) -> Result<Connection> {
         let conn = Connection::open(path)?;
+        // Wait out another process holding a lock rather than failing.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch(SCHEMA)?;
         Ok(conn)
@@ -324,5 +340,23 @@ mod tests {
         assert_eq!(db.secret("a").as_deref(), Some("s3cret"));
         db.set_secret("a", None).unwrap();
         assert_eq!(db.secret("a"), None);
+    }
+
+    #[test]
+    fn a_file_that_isnt_a_database_is_moved_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.db"), "not a database, just some text ".repeat(200)).unwrap();
+        let (_, store, _) = Db::open(dir.path(), Secrets::Database).unwrap();
+        assert!(store.notes.is_empty());
+        let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n.starts_with("data.db.broken-")), "{names:?}");
+    }
+
+    #[test]
+    fn only_damage_counts_as_corrupt() {
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY), None));
+        assert!(!is_corrupt(&busy), "a locked file isn't moved aside");
+        let notadb = anyhow::Error::new(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB), None));
+        assert!(is_corrupt(&notadb.context("opening")));
     }
 }

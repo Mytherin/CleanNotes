@@ -120,14 +120,18 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
         let remote = backend.pull()?;
         reconcile(&mut w, account, remote, &deleting, now, &mut out.notices);
         match push_notes(backend, &mut w) {
-            Ok(false) => {
-                // Nothing else changed while we uploaded: the cursor now
-                // includes our own writes.
-                out.cursor = backend.cursor()?.filter(|_| cursor_before.is_some());
+            Ok((false, false)) => {
+                // Only the cursor from before the pull is known to be
+                // covered: one read now could include another device's
+                // change made since, which would then never be pulled.
+                out.cursor = cursor_before;
                 finished = true;
                 break;
             }
-            Ok(true) => continue,
+            // Conflicts: pull and merge again. Uploads: one more round, so
+            // the saved cursor includes our own writes and the next sync
+            // is cheap.
+            Ok(_) => continue,
             Err(e) => {
                 out.error = Some(format!("{e:#}"));
                 finished = true;
@@ -147,9 +151,8 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
             backend.delete_folder(&t.remote_id, &t.path)?;
             out.tombstones_done.push(t.clone());
         }
-        if !out.tombstones_done.is_empty() || snap.tombstones.iter().any(|t| !t.note) {
-            out.cursor = backend.cursor()?;
-        }
+        // (The cursor stays the one from before the pull, for the same
+        // reason as above.)
     } else {
         out.cursor = None;
     }
@@ -392,8 +395,11 @@ fn take_remote(n: &mut Note, r: &RemoteNote, folder: String) {
 
 /// Uploads changed notes. Returns whether any was refused because it had
 /// changed on the backend (another round is needed).
-fn push_notes(backend: &mut dyn Backend, w: &mut Store) -> Result<bool> {
+/// Uploads changed notes. Returns (whether some were refused as conflicts,
+/// whether anything was written).
+fn push_notes(backend: &mut dyn Backend, w: &mut Store) -> Result<(bool, bool)> {
     let mut conflicts = false;
+    let mut wrote = false;
     for i in 0..w.notes.len() {
         let n = &w.notes[i];
         if !n.sync.dirty && n.sync.remote_id.is_some() {
@@ -409,12 +415,13 @@ fn push_notes(backend: &mut dyn Backend, w: &mut Store) -> Result<bool> {
             Ok((remote_id, revision)) => {
                 let n = &mut w.notes[i];
                 n.sync = NoteSync { remote_id: Some(remote_id), revision: Some(revision), base: Some(data), dirty: false };
+                wrote = true;
             }
             Err(e) if e.is::<Conflict>() => conflicts = true,
             Err(e) => return Err(e),
         }
     }
-    Ok(conflicts)
+    Ok((conflicts, wrote))
 }
 
 /// Applies a sync's outcome to the store. Notes changed while the sync ran
@@ -466,8 +473,19 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
     for o in &out.notes {
         let cur = store.notes.iter().find(|n| n.id == o.id);
         match (cur, before.get(o.id.as_str())) {
+            // Moved to another account during the sync: it stays there, and
+            // what the sync uploaded here is deleted again.
+            (Some(cur), _) if cur.account != account => {
+                if let Some(rid) = &o.sync.remote_id {
+                    if !store.tombstones.iter().any(|t| t.account == account && &t.remote_id == rid) {
+                        store.tombstones.push(Tombstone { account: account.to_owned(), note: true, remote_id: rid.clone(), path: vec![] });
+                    }
+                }
+            }
             (Some(cur), Some(old)) if cur.version != old.version => {
-                notes.push(merge_during_sync(old, cur, o, &mut notices));
+                let (merged, theirs) = merge_during_sync(old, cur, o, &mut notices);
+                notes.push(merged);
+                notes.extend(theirs);
             }
             (Some(cur), _) => notes.push(Note { version: cur.version, ..o.clone() }),
             (None, Some(_)) => {
@@ -509,22 +527,31 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
 }
 
 /// A note edited here while a sync changed it: `old` is how the sync found
-/// it, `cur` how it is now, `synced` what the sync made of it.
-fn merge_during_sync(old: &Note, cur: &Note, synced: &Note, notices: &mut Vec<String>) -> Note {
+/// it, `cur` how it is now, `synced` what the sync made of it. If the texts
+/// can't be merged, the synced text comes back as a second note, so neither
+/// version is lost (ours overwrites the backend's on the next sync).
+fn merge_during_sync(old: &Note, cur: &Note, synced: &Note, notices: &mut Vec<String>) -> (Note, Option<Note>) {
     let mut n = cur.clone();
     n.sync = synced.sync.clone();
     n.sync.dirty = true;
+    let mut theirs = None;
     match merge_text(&old.body, &cur.body, &synced.body) {
         Ok(body) => n.body = body,
-        Err(()) => notices.push(format!(
-            "“{}” changed on another device while you were editing it; your version was kept.",
-            crate::markdown::title_of(&cur.body)
-        )),
+        Err(()) => {
+            let mut copy = Note::new(&synced.account, &synced.folder, &synced.body);
+            copy.created = synced.created;
+            copy.modified = synced.modified;
+            theirs = Some(copy);
+            notices.push(format!(
+                "“{}” changed on another device while you were editing it; both versions were kept.",
+                crate::markdown::title_of(&cur.body)
+            ));
+        }
     }
     n.pinned = merge_value(&old.pinned, &cur.pinned, &synced.pinned);
     n.deleted = merge_value(&old.deleted, &cur.deleted, &synced.deleted);
     n.folder = merge_value(&old.folder, &cur.folder, &synced.folder);
-    n
+    (n, theirs)
 }
 
 /// Same `NoteData` for a note as the engine would upload (for tests).
