@@ -18,6 +18,7 @@ pub mod cloudkit;
 pub mod engine;
 pub mod merge;
 pub mod sqlite;
+pub mod standardnotes;
 pub mod worker;
 #[cfg(test)]
 pub mod test_http;
@@ -33,6 +34,11 @@ pub enum BackendConfig {
     Sqlite(sqlite::Config),
     /// Records in a CloudKit container's private database.
     CloudKit(cloudkit::Config),
+    /// Encrypted items in a Standard Notes account. Behind the
+    /// `standardnotes` feature until Settings has a form for it (the
+    /// settings window matches on every variant).
+    #[cfg(feature = "standardnotes")]
+    StandardNotes(standardnotes::Config),
 }
 
 impl BackendConfig {
@@ -42,6 +48,8 @@ impl BackendConfig {
             BackendConfig::Bitwarden(_) => "Bitwarden",
             BackendConfig::Sqlite(_) => "SQLite",
             BackendConfig::CloudKit(_) => "CloudKit",
+            #[cfg(feature = "standardnotes")]
+            BackendConfig::StandardNotes(_) => "Standard Notes",
         }
     }
 }
@@ -165,5 +173,7 @@ pub fn open(config: &BackendConfig, secret: Option<String>) -> anyhow::Result<Bo
         BackendConfig::Bitwarden(c) => Ok(Box::new(bitwarden::BitwardenBackend::open(c, secret)?)),
         BackendConfig::Sqlite(c) => Ok(Box::new(sqlite::SqliteBackend::open(c)?)),
         BackendConfig::CloudKit(c) => Ok(Box::new(cloudkit::CloudKitBackend::open(c, secret)?)),
+        #[cfg(feature = "standardnotes")]
+        BackendConfig::StandardNotes(c) => Ok(Box::new(standardnotes::StandardNotesBackend::open(c, secret)?)),
     }
 }
