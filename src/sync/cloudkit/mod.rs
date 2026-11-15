@@ -487,11 +487,18 @@ impl Backend for CloudKitBackend {
         Ok((name, tag))
     }
 
-    fn delete_note(&mut self, remote_id: &str) -> Result<()> {
-        let op = json!({ "operationType": "forceDelete", "record": { "recordName": remote_id } });
-        match self.modify_one(op) {
-            Err(e) if e.is::<Conflict>() => Ok(()),
-            r => r.map(|_| ()),
+    fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
+        // With a change tag, CloudKit refuses the delete if the record
+        // changed since.
+        let op = match base_revision {
+            Some(tag) => json!({ "operationType": "delete", "record": { "recordName": remote_id, "recordChangeTag": tag } }),
+            None => json!({ "operationType": "forceDelete", "record": { "recordName": remote_id } }),
+        };
+        let r = self.modify(vec![op])?.into_iter().next().context("CloudKit returned no record")?;
+        match r["serverErrorCode"].as_str() {
+            None | Some("NOT_FOUND" | "UNKNOWN_ITEM") => Ok(()),
+            Some("CONFLICT") => Err(Conflict.into()),
+            Some(code) => bail!("CloudKit refused the delete: {code} {}", r["reason"].as_str().unwrap_or("")),
         }
     }
 

@@ -208,6 +208,7 @@ fn deleting_a_folder_syncs() {
         note: false,
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Work".into()],
+        revision: None,
     });
     laptop.sync();
     assert!(laptop.store.folder_at(ACC, &["Work".into()]).is_none(), "not brought back by the pull");
@@ -235,6 +236,7 @@ fn notes_left_in_a_deleted_folder_end_up_in_the_same_place_everywhere() {
         note: false,
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Projects".into(), "Work".into()],
+        revision: None,
     });
     laptop.sync();
     phone.sync();
@@ -259,6 +261,7 @@ fn a_folder_deleted_here_stays_deleted_when_the_other_device_added_to_it() {
         note: false,
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Work".into()],
+        revision: None,
     });
     // …while the phone adds a note to it.
     let pwork = phone.store.folder_at(ACC, &["Work".into()]).unwrap().id.clone();
@@ -283,9 +286,34 @@ fn a_note_put_back_after_a_delete_gets_a_new_revision() {
     laptop.sync();
     let rid = laptop.store.note(&id).unwrap().sync.remote_id.clone().unwrap();
     let rev1 = laptop.store.note(&id).unwrap().sync.revision.clone().unwrap();
-    laptop.backend.delete_note(&rid).unwrap();
+    laptop.backend.delete_note(&rid, None).unwrap();
     let (_, rev2) = laptop.backend.save_note(Some(&rid), Some(&rev1), &data_of(&laptop.store, &id)).unwrap();
     assert_ne!(rev1, rev2, "a stale device mustn't take the new text for the one it has");
+}
+
+#[test]
+fn an_edit_elsewhere_beats_emptying_recently_deleted() {
+    let (_d, mut laptop, mut phone) = pair();
+    let id = laptop.add("# Keep\nv1\n");
+    laptop.sync();
+    phone.sync();
+    // The laptop deletes it for good while offline; the phone edits it.
+    laptop.store.purge_note(&id);
+    phone.edit(&id, "# Keep\nv2 (phone)\n");
+    phone.sync();
+    let notices = laptop.sync();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(laptop.store.tombstones.is_empty());
+    laptop.sync();
+    phone.sync();
+    assert_eq!(laptop.bodies(), vec!["# Keep\nv2 (phone)\n"]);
+    assert_eq!(phone.bodies(), vec!["# Keep\nv2 (phone)\n"]);
+    // Unchanged elsewhere, it's deleted everywhere.
+    let id2 = laptop.store.notes.iter().find(|n| n.account == ACC).unwrap().id.clone();
+    laptop.store.purge_note(&id2);
+    laptop.sync();
+    phone.sync();
+    assert!(laptop.bodies().is_empty() && phone.bodies().is_empty());
 }
 
 #[test]
@@ -387,8 +415,8 @@ impl Backend for Racy<'_> {
     fn save_note(&mut self, remote_id: Option<&str>, base: Option<&str>, note: &NoteData) -> anyhow::Result<(String, String)> {
         self.inner.save_note(remote_id, base, note)
     }
-    fn delete_note(&mut self, remote_id: &str) -> anyhow::Result<()> {
-        self.inner.delete_note(remote_id)
+    fn delete_note(&mut self, remote_id: &str, base: Option<&str>) -> anyhow::Result<()> {
+        self.inner.delete_note(remote_id, base)
     }
 }
 

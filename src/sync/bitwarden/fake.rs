@@ -395,6 +395,10 @@ fn api(s: &mut State, method: &str, path: &str, body: Value) -> (u16, Value) {
             s.ciphers.insert(id.to_string(), c.clone());
             (200, c)
         }
+        ("GET", ["ciphers", id]) => match s.ciphers.get(*id) {
+            Some(c) => (200, c.clone()),
+            None => (404, json!({"message": "Resource not found."})),
+        },
         ("PUT", ["ciphers", id, "delete"]) => {
             let rev = s.tick();
             match s.ciphers.get_mut(*id) {

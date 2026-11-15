@@ -158,6 +158,9 @@ fn modify(s: &mut State, o: &Value) -> Value {
         }
         "forceReplace" | "forceUpdate" => {}
         "forceDelete" | "delete" => {
+            if o["operationType"] == "delete" && existing.as_ref().is_some_and(|cur| cur["recordChangeTag"] != rec["recordChangeTag"]) {
+                return error(&name, "CONFLICT");
+            }
             return match s.records.remove(&name) {
                 Some(_) => {
                     s.tag();

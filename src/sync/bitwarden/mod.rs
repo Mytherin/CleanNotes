@@ -547,7 +547,17 @@ impl Backend for BitwardenBackend {
         Ok((id, rev))
     }
 
-    fn delete_note(&mut self, remote_id: &str) -> Result<()> {
+    fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
+        if let Some(base) = base_revision {
+            // Bitwarden has no conditional delete: look first.
+            match self.client.send(Http::GET, &format!("/ciphers/{remote_id}"), None) {
+                Ok(c) if get(&c, "deletedDate").is_some() => return Ok(()),
+                Ok(c) if get_str(&c, "revisionDate") != Some(base) => return Err(Conflict.into()),
+                Ok(_) => {}
+                Err(e) if status_of(&e) == Some(404) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
         self.ciphers.remove(remote_id);
         match self.client.send(Http::PUT, &format!("/ciphers/{remote_id}/delete"), None) {
             Err(e) if status_of(&e) == Some(404) => Ok(()),

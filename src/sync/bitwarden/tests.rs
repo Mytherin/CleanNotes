@@ -153,7 +153,7 @@ fn outdated_updates_are_conflicts() {
     b.save_note(Some(&rid), Some(&rev2), &note("n1", &["Notes"], "c")).unwrap();
     // Gone from the vault (deleted elsewhere): also a conflict, so the engine
     // re-pulls and decides.
-    b.delete_note(&rid).unwrap();
+    b.delete_note(&rid, None).unwrap();
     assert!(b.save_note(Some(&rid), None, &note("n1", &["Notes"], "d")).unwrap_err().is::<Conflict>());
 }
 
@@ -247,9 +247,14 @@ fn folders_rename_with_their_subfolders_and_delete() {
 fn deleting_moves_to_bitwardens_trash() {
     let server = FakeServer::start(EMAIL, PASSWORD, KDF);
     let mut b = backend(&server);
-    let (rid, _) = b.save_note(None, None, &note("n1", &["Notes"], "bye")).unwrap();
-    b.delete_note(&rid).unwrap();
-    b.delete_note(&rid).unwrap();
+    let (rid, r1) = b.save_note(None, None, &note("n1", &["Notes"], "bye")).unwrap();
+    let (_, r2) = b.save_note(Some(&rid), Some(&r1), &note("n1", &["Notes"], "bye, edited")).unwrap();
+    // A delete based on an old version is refused: the edit wins.
+    assert!(b.delete_note(&rid, Some(&r1)).unwrap_err().is::<Conflict>());
+    assert!(server.state().ciphers[&rid]["deletedDate"].is_null());
+    b.delete_note(&rid, Some(&r2)).unwrap();
+    b.delete_note(&rid, Some(&r2)).unwrap();
+    b.delete_note(&rid, None).unwrap();
     assert!(server.state().ciphers[&rid]["deletedDate"].is_string());
     assert!(b.pull().unwrap().notes.is_empty());
 }

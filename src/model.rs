@@ -189,6 +189,10 @@ pub struct Tombstone {
     /// A folder's path on the backend.
     #[serde(default)]
     pub path: Vec<String>,
+    /// A note's revision when it was last synced: if it changed on the
+    /// backend since (edited on another device), it isn't deleted there.
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -367,6 +371,7 @@ impl Store {
                 note: true,
                 remote_id: remote_id.clone(),
                 path: vec![],
+                revision: n.sync.revision.clone(),
             });
         }
         Some(n)

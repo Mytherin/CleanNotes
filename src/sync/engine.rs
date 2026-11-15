@@ -107,7 +107,15 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
     // Notes emptied from Recently Deleted go first, so a pull doesn't bring
     // them back.
     for t in snap.tombstones.iter().filter(|t| t.note) {
-        backend.delete_note(&t.remote_id)?;
+        match backend.delete_note(&t.remote_id, t.revision.as_deref()) {
+            Ok(()) => {}
+            // Edited on another device since: it stays, and the pull below
+            // brings it back here.
+            Err(e) if e.is::<Conflict>() => {
+                out.notices.push("A note you deleted was changed on another device, so it was kept.".into());
+            }
+            Err(e) => return Err(e),
+        }
         out.tombstones_done.push(t.clone());
     }
     push_folders(backend, &mut w)?;
@@ -496,7 +504,13 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
             (Some(cur), _) if cur.account != account => {
                 if let Some(rid) = &o.sync.remote_id {
                     if !store.tombstones.iter().any(|t| t.account == account && &t.remote_id == rid) {
-                        store.tombstones.push(Tombstone { account: account.to_owned(), note: true, remote_id: rid.clone(), path: vec![] });
+                        store.tombstones.push(Tombstone {
+                            account: account.to_owned(),
+                            note: true,
+                            remote_id: rid.clone(),
+                            path: vec![],
+                            revision: o.sync.revision.clone(),
+                        });
                     }
                 }
             }
@@ -514,6 +528,7 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
                         note: true,
                         remote_id: o.sync.remote_id.clone().unwrap(),
                         path: vec![],
+                        revision: o.sync.revision.clone(),
                     });
                 }
             }

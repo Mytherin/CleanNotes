@@ -98,9 +98,13 @@ fn outdated_saves_are_conflicts() {
     assert!(b.save_note(Some(&rid), Some(&t1), &note("n1", &["Notes"], "c")).unwrap_err().is::<Conflict>());
     // A retried create finds the record there.
     assert!(b.save_note(None, None, &note("n1", &["Notes"], "c")).unwrap_err().is::<Conflict>());
-    b.save_note(Some(&rid), Some(&t2), &note("n1", &["Notes"], "c")).unwrap();
-    b.delete_note(&rid).unwrap();
-    b.delete_note(&rid).unwrap();
+    let (_, t3) = b.save_note(Some(&rid), Some(&t2), &note("n1", &["Notes"], "c")).unwrap();
+    // A delete based on an old version is refused: the edit wins.
+    assert!(b.delete_note(&rid, Some(&t2)).unwrap_err().is::<Conflict>());
+    assert_eq!(b.pull().unwrap().notes.len(), 1);
+    b.delete_note(&rid, Some(&t3)).unwrap();
+    b.delete_note(&rid, Some(&t3)).unwrap();
+    b.delete_note(&rid, None).unwrap();
     assert!(b.save_note(Some(&rid), Some(&t2), &note("n1", &["Notes"], "d")).unwrap_err().is::<Conflict>());
 }
 

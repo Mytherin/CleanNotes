@@ -155,8 +155,10 @@ pub trait Backend: Send {
         -> anyhow::Result<(String, String)>;
 
     /// Deletes a note for good (a backend with a trash may move it there).
-    /// Deleting one that's gone already succeeds.
-    fn delete_note(&mut self, remote_id: &str) -> anyhow::Result<()>;
+    /// Deleting one that's gone already succeeds. With a `base_revision`,
+    /// a note that changed since (edited elsewhere) is left alone and
+    /// [`Conflict`] returned: an edit beats a delete.
+    fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> anyhow::Result<()>;
 
     /// Credentials the backend renewed since last asked, to be saved in
     /// place of the old ones.

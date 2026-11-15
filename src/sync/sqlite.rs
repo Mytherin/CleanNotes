@@ -281,8 +281,15 @@ impl Backend for SqliteBackend {
         Ok((id, revision.to_string()))
     }
 
-    fn delete_note(&mut self, remote_id: &str) -> Result<()> {
+    fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(base) = base_revision {
+            let current: Option<i64> =
+                tx.query_row("SELECT revision FROM notes WHERE id = ?1", [remote_id], |r| r.get(0)).optional()?;
+            if current.is_some_and(|c| c.to_string() != base) {
+                return Err(Conflict.into());
+            }
+        }
         if tx.execute("DELETE FROM notes WHERE id = ?1", [remote_id])? > 0 {
             Self::bump(&tx)?;
         }
