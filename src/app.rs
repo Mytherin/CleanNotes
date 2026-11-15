@@ -668,6 +668,26 @@ impl App {
         self.unsaved.insert(id.to_owned());
     }
 
+    /// After the search text changed. Notes the search hides drop out of the
+    /// selection (so a Delete doesn't reach them). Once the search is
+    /// cleared, a note opened from its results stays open: the list moves
+    /// to its folder.
+    pub fn search_changed(&mut self) {
+        if self.search.trim().is_empty() && self.multi.is_empty() {
+            if let Some(id) = self.selected.clone().filter(|id| !self.visible_notes().contains(id)) {
+                if let Some(n) = self.store.note(&id).filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)) {
+                    // Not `go_to`, which would open the folder's first note.
+                    let folder = n.folder.clone();
+                    self.location = Location::Folder(folder.clone());
+                    self.settings.last_folder = Some(folder);
+                    self.scroll_list = true;
+                    return;
+                }
+            }
+        }
+        self.retain_visible(None);
+    }
+
     /// Drops notes the list no longer shows from the selection. If the open
     /// note is one of them, `fallback` (if shown) or the first shown note is
     /// opened instead.
@@ -1518,6 +1538,24 @@ mod tests {
         app.search = "note 3".into();
         app.retain_visible(None);
         assert_eq!(app.selected_ids(), app.visible_notes());
+    }
+
+    #[test]
+    fn clearing_the_search_keeps_the_found_note_open_in_its_folder() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        let elsewhere = app.folder_named("Elsewhere");
+        app.add(&home, "# Here\n");
+        let found = app.add(&elsewhere, "# Found it\n");
+        app.go_to(Location::Folder(home));
+        app.search = "found".into();
+        app.search_changed();
+        app.select(Some(found.clone()));
+        app.search.clear();
+        app.search_changed();
+        assert_eq!(app.selected, Some(found.clone()));
+        assert_eq!(app.location, Location::Folder(elsewhere));
+        assert!(app.visible_notes().contains(&found));
     }
 
     #[test]

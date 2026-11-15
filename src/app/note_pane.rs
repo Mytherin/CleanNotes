@@ -319,12 +319,12 @@ impl App {
             self.scroll_list = true;
             // Notes the search hides drop out of the selection, so a Delete
             // doesn't reach notes that aren't shown.
-            self.retain_visible(None);
+            self.search_changed();
         }
         if te.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
             self.search.clear();
             te.surrender_focus();
-            self.retain_visible(None);
+            self.search_changed();
         }
         if te.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowDown)) {
             self.focus = Pane::List;
@@ -338,7 +338,7 @@ impl App {
             if resp.clicked() {
                 self.search.clear();
                 self.search_open = false;
-                self.retain_visible(None);
+                self.search_changed();
             }
         }
         r.left()
