@@ -167,6 +167,7 @@ impl Backend for SqliteBackend {
         let mut snap = Snapshot {
             folders: folders.iter().map(|f| RemoteFolder { remote_id: f.0.clone(), path: path_of(&f.0) }).collect(),
             notes: Vec::new(),
+            unreadable: Vec::new(),
         };
         let mut st = tx.prepare("SELECT id, folder_id, body, created, modified, pinned, deleted, revision FROM notes")?;
         let rows = st.query_map([], |r| {

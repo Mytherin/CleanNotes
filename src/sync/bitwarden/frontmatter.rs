@@ -159,6 +159,12 @@ pub fn read(item: &Item) -> NoteData {
     };
     let header = &rest[..end];
     let mut body = rest[end..].strip_prefix("---").unwrap_or("").strip_prefix('\n').unwrap_or("").to_owned();
+    // Ours always starts with an id. Anything else between `---` lines was
+    // typed into the vault (a horizontal rule, say) and is part of the text.
+    let has_id = header.lines().next().and_then(|l| l.split_once(':')).is_some_and(|(k, v)| k.trim() == "id" && !unquote(v.trim()).is_empty());
+    if !has_id {
+        return fallback();
+    }
     let mut n = fallback();
     let mut parts = 1;
     for line in header.lines() {
@@ -175,6 +181,8 @@ pub fn read(item: &Item) -> NoteData {
             _ => {}
         }
     }
+    // A damaged count mustn't make us loop (nearly) forever.
+    let parts = parts.min(item.fields.len() + 1);
     for i in 2..=parts {
         let name = format!("{PART_FIELD}{i}");
         if let Some((_, v)) = item.fields.iter().find(|(k, _)| *k == name) {
@@ -281,6 +289,32 @@ mod tests {
         // Something that only looks like front matter.
         let w = Written { name: "X".into(), notes: "---\nnot closed".into(), parts: vec![] };
         assert_eq!(read(&item(&w, &[])).body, "# X\n---\nnot closed");
+    }
+
+    #[test]
+    fn vault_notes_between_rules_keep_their_text() {
+        // Starts with `---` … `---`, but isn't our front matter.
+        let w = Written { name: "Plan".into(), notes: "---\nDraft v2\nstatus: open\n---\nrest".into(), parts: vec![] };
+        let n = read(&item(&w, &[]));
+        assert_eq!(n.body, "# Plan\n---\nDraft v2\nstatus: open\n---\nrest");
+        assert_eq!(n.id, "bw-c1");
+    }
+
+    #[test]
+    fn a_damaged_part_count_is_bounded() {
+        let n = note("# Short\n");
+        let with_parts = |count: &str| {
+            let mut w = write(&n);
+            w.notes = w.notes.replacen("modified:", &format!("parts: {count}\nmodified:"), 1);
+            w
+        };
+        // Would loop for ever if taken at its word.
+        let w = with_parts("18446744073709551615");
+        assert_eq!(read(&item(&w, &[])).body, "# Short\n");
+        // More parts promised than fields given: what's there is read.
+        let fields = vec![(format!("{PART_FIELD}2"), "more\n".to_owned())];
+        let w = with_parts("5");
+        assert_eq!(read(&item(&w, &fields)).body, "# Short\nmore\n");
     }
 
     #[test]

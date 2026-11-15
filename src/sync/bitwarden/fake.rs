@@ -44,6 +44,9 @@ pub struct State {
     refresh_tokens: HashSet<String>,
     /// Requests served, as "METHOD /path".
     pub log: Vec<String>,
+    /// When set, `/sync` answers 200 with this body as a web page (a
+    /// captive portal, a proxy).
+    pub sync_page: Option<String>,
 }
 
 impl State {
@@ -117,6 +120,28 @@ impl State {
         v
     }
 
+    /// Makes a cipher's notes unreadable to us, as a newer client's
+    /// encryption type would.
+    pub fn scramble_note(&mut self, cipher_id: &str) {
+        let rev = self.tick();
+        let c = self.ciphers.get_mut(cipher_id).unwrap();
+        c["notes"] = json!("7.dW5rbm93bg==");
+        c["revisionDate"] = json!(rev);
+    }
+
+    /// Makes the name of the folder called `name` unreadable to us.
+    pub fn scramble_folder(&mut self, name: &str) {
+        let key = self.user_key.clone();
+        let rev = self.tick();
+        let f = self
+            .folders
+            .values_mut()
+            .find(|f| f["name"].as_str().and_then(|n| crypto::decrypt_str(&key, n).ok()).as_deref() == Some(name))
+            .unwrap();
+        f["name"] = json!("9.c29tZXRoaW5n");
+        f["revisionDate"] = json!(rev);
+    }
+
     pub fn decrypt_field(&self, cipher: &Value, field: &str) -> String {
         crypto::decrypt_str(&self.user_key, cipher[field].as_str().unwrap()).unwrap()
     }
@@ -148,12 +173,16 @@ impl FakeServer {
             tokens: HashMap::new(),
             refresh_tokens: HashSet::new(),
             log: vec![],
+            sync_page: None,
         };
         let state = Arc::new(Mutex::new(state));
         let s = state.clone();
         let url = test_http::spawn(move |req| {
             let mut s = s.lock().unwrap();
             s.log.push(format!("{} {}", req.method, req.path));
+            if let Some(page) = s.sync_page.as_ref().filter(|_| req.path.ends_with("/sync")) {
+                return Response { status: 200, body: page.clone(), content_type: "text/html", headers: vec![] };
+            }
             let (status, body) = route(&mut s, req);
             Response::json(status, &body)
         });

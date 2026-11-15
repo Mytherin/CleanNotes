@@ -68,17 +68,35 @@ pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
+// The bounds Bitwarden's clients enforce on KDF settings.
+pub const PBKDF2_MIN_ITERATIONS: u32 = 5_000;
+pub const PBKDF2_MAX_ITERATIONS: u32 = 2_000_000;
+pub const ARGON2_MIN_MEMORY_MIB: u32 = 16;
+pub const ARGON2_MAX_MEMORY_MIB: u32 = 1_024;
+pub const ARGON2_MIN_ITERATIONS: u32 = 2;
+pub const ARGON2_MAX_ITERATIONS: u32 = 10;
+pub const ARGON2_MAX_PARALLELISM: u32 = 16;
+
 pub fn master_key(password: &str, email: &str, kdf: Kdf) -> Result<[u8; 32]> {
     let email = normalize_email(email);
     let mut key = [0u8; 32];
     match kdf {
         Kdf::Pbkdf2 { iterations } => {
-            if iterations == 0 {
-                bail!("bad KDF settings");
+            // The server picks these. Weak settings would let whoever runs
+            // it (or sits in between) brute-force the password from the
+            // hash we send, so refuse them as Bitwarden's own clients do.
+            if !(PBKDF2_MIN_ITERATIONS..=PBKDF2_MAX_ITERATIONS).contains(&iterations) {
+                bail!("the server asks for unsafe KDF settings ({iterations} PBKDF2 iterations)");
             }
             pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), email.as_bytes(), iterations, &mut key);
         }
         Kdf::Argon2id { iterations, memory, parallelism } => {
+            if !(ARGON2_MIN_MEMORY_MIB..=ARGON2_MAX_MEMORY_MIB).contains(&memory)
+                || !(ARGON2_MIN_ITERATIONS..=ARGON2_MAX_ITERATIONS).contains(&iterations)
+                || !(1..=ARGON2_MAX_PARALLELISM).contains(&parallelism)
+            {
+                bail!("the server asks for unsafe KDF settings (Argon2id: {memory} MiB, {iterations} iterations, {parallelism} threads)");
+            }
             let salt = Sha256::digest(email.as_bytes());
             let params = argon2::Params::new(memory * 1024, iterations, parallelism, Some(32))
                 .map_err(|e| anyhow::anyhow!("bad Argon2 settings: {e}"))?;
@@ -199,6 +217,24 @@ mod tests {
     fn argon2_master_key_matches_node() {
         let mk = master_key(PASSWORD, EMAIL, Kdf::Argon2id { iterations: 3, memory: 16, parallelism: 2 }).unwrap();
         assert_eq!(hex(&mk), KAT_ARGON2);
+    }
+
+    #[test]
+    fn unsafe_kdf_settings_from_the_server_are_refused() {
+        for kdf in [
+            Kdf::Pbkdf2 { iterations: 0 },
+            Kdf::Pbkdf2 { iterations: 1 },
+            Kdf::Pbkdf2 { iterations: 4999 },
+            Kdf::Pbkdf2 { iterations: u32::MAX },
+            Kdf::Argon2id { iterations: 1, memory: 64, parallelism: 4 },
+            Kdf::Argon2id { iterations: 3, memory: 1, parallelism: 4 },
+            Kdf::Argon2id { iterations: 3, memory: 64, parallelism: 0 },
+            // Would overflow `memory * 1024`.
+            Kdf::Argon2id { iterations: 3, memory: 4_194_304, parallelism: 4 },
+            Kdf::Argon2id { iterations: 3, memory: u32::MAX, parallelism: 4 },
+        ] {
+            assert!(master_key(PASSWORD, EMAIL, kdf).is_err(), "{kdf:?} was accepted");
+        }
     }
 
     #[test]

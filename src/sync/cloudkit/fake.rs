@@ -22,6 +22,8 @@ pub struct State {
     counter: u64,
     pub log: Vec<String>,
     url: String,
+    /// When set, `records/changes` answers 200 with this raw body.
+    pub changes_reply: Option<String>,
 }
 
 pub struct FakeCloudKit {
@@ -39,6 +41,7 @@ impl FakeCloudKit {
             counter: 0,
             log: vec![],
             url: String::new(),
+            changes_reply: None,
         }));
         let s = state.clone();
         let url = test_http::spawn(move |req| route(&mut s.lock().unwrap(), req));
@@ -99,6 +102,9 @@ fn route(s: &mut State, req: &Request) -> Response {
             } else {
                 json!({"zones": [{"zoneID": {"zoneName": "CleanNotes"}, "serverErrorCode": "ZONE_NOT_FOUND"}]})
             }
+        }
+        "records/changes" if s.changes_reply.is_some() => {
+            return Response { status: 200, body: s.changes_reply.clone().unwrap(), content_type: "text/html", headers: vec![] };
         }
         "records/changes" => {
             if !s.zones.contains("CleanNotes") {

@@ -129,9 +129,19 @@ fn read(resp: reqwest::blocking::Response) -> Result<(Value, Option<String>)> {
         .get("X-Apple-CloudKit-Web-Auth-Token")
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
-    let text = resp.text().unwrap_or_default();
-    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    if (200..300).contains(&status) {
+    let ok = (200..300).contains(&status);
+    let text = match resp.text() {
+        Ok(t) => t,
+        Err(e) if ok => return Err(anyhow::Error::new(e).context("reading CloudKit's reply")),
+        Err(_) => String::new(),
+    };
+    let body: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        // A cut-off reply or a proxy's web page mustn't pass for "nothing".
+        Err(_) if ok && !text.trim().is_empty() => anyhow::bail!("CloudKit's reply isn't JSON (a proxy or captive portal in the way?)"),
+        Err(_) => Value::Null,
+    };
+    if ok {
         return Ok((body, renewed));
     }
     let code = body["serverErrorCode"].as_str().unwrap_or("").to_owned();
@@ -216,12 +226,11 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 3 <= b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%' && i + 3 <= b.len() && b[i + 1].is_ascii_hexdigit() && b[i + 2].is_ascii_hexdigit() {
+            // Both are ASCII, so this slice is on char boundaries.
+            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).expect("two hex digits"));
+            i += 3;
+            continue;
         }
         out.push(if b[i] == b'+' { b' ' } else { b[i] });
         i += 1;
@@ -315,23 +324,29 @@ impl CloudKitBackend {
         self.ensure_zone()?;
         let mut out = Vec::new();
         let mut token: Option<String> = None;
+        // A partial list would make the engine delete the notes it misses,
+        // so anything short of the whole zone is an error.
         for _ in 0..10_000 {
             let mut body = json!({ "zoneID": Self::zone_id(), "resultsLimit": 200 });
             if let Some(t) = &token {
                 body["syncToken"] = json!(t);
             }
             let v = self.post("records/changes", &body)?;
-            for r in v["records"].as_array().into_iter().flatten() {
+            let records = v["records"].as_array().context("CloudKit's reply has no record list")?;
+            for r in records {
                 if r["deleted"].as_bool() != Some(true) {
                     out.push(r.clone());
                 }
             }
-            token = v["syncToken"].as_str().map(str::to_owned);
             if v["moreComing"].as_bool() != Some(true) {
-                break;
+                return Ok(out);
+            }
+            match v["syncToken"].as_str() {
+                Some(t) if token.as_deref() != Some(t) => token = Some(t.to_owned()),
+                _ => anyhow::bail!("CloudKit said more records were coming but gave no way to fetch them"),
             }
         }
-        Ok(out)
+        anyhow::bail!("the CloudKit zone has too many records to list")
     }
 
     fn folder_list(&mut self) -> Result<Vec<(String, Vec<String>, String)>> {
@@ -402,8 +417,10 @@ impl Backend for CloudKitBackend {
                     snap.folders.push(RemoteFolder { remote_id: id, path });
                 }
                 Some("Note") => {
-                    if let Some(n) = Self::read_note(r) {
-                        snap.notes.push(n);
+                    match Self::read_note(r) {
+                        Some(n) => snap.notes.push(n),
+                        // Not a deletion: leave the note alone here.
+                        None => snap.unreadable.extend(r["recordName"].as_str().map(str::to_owned)),
                     }
                 }
                 _ => {}

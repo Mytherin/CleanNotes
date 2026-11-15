@@ -211,11 +211,12 @@ fn reconcile(
     // ---- Folders --------------------------------------------------------
     let remote_folders: HashMap<&str, &Vec<String>> =
         remote.folders.iter().map(|f| (f.remote_id.as_str(), &f.path)).collect();
+    let unreadable: HashSet<&str> = remote.unreadable.iter().map(String::as_str).collect();
     // Folders deleted on the backend.
     let gone: Vec<String> = w
         .folders
         .iter()
-        .filter(|f| f.sync.remote_id.as_deref().is_some_and(|r| !remote_folders.contains_key(r)))
+        .filter(|f| f.sync.remote_id.as_deref().is_some_and(|r| !remote_folders.contains_key(r) && !unreadable.contains(r)))
         .map(|f| f.id.clone())
         .collect();
     let default_id = w.default_folder(account).map(|f| f.id.clone()).unwrap_or_default();
@@ -287,6 +288,10 @@ fn reconcile(
             None => by_id.get(note.id.as_str()).copied().filter(|r| !matched.contains(&r.remote_id)),
         };
         let Some(r) = found else {
+            if note.sync.remote_id.as_deref().is_some_and(|r| unreadable.contains(r)) {
+                // Still there, just not readable right now: keep ours as is.
+                continue;
+            }
             if note.sync.remote_id.is_some() {
                 if note.sync.dirty {
                     // Deleted there, edited here: put it back.

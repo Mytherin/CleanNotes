@@ -115,6 +115,38 @@ fn many_records_page() {
 }
 
 #[test]
+fn broken_or_partial_change_lists_are_errors() {
+    let server = FakeCloudKit::start();
+    let mut b = backend(&server);
+    b.save_note(None, None, &note("n1", &["Notes"], "x")).unwrap();
+    for reply in [
+        // A proxy's web page, or a reply cut off half way.
+        "<html>Log in to the network</html>",
+        r#"{"records": [{"recordName": "#,
+        // JSON, but not a change list.
+        "{}",
+        // More is coming, but there's no token to fetch it with.
+        r#"{"records": [], "moreComing": true}"#,
+    ] {
+        server.state().changes_reply = Some(reply.into());
+        assert!(b.pull().is_err(), "{reply} was taken for a (partial) zone");
+    }
+    server.state().changes_reply = None;
+    assert_eq!(b.pull().unwrap().notes.len(), 1);
+}
+
+#[test]
+fn percent_decoding_never_panics() {
+    assert_eq!(percent_decode("a%20b+c"), "a b c");
+    assert_eq!(percent_decode("%e2%9c%93"), "✓");
+    // Not escapes: kept as they are, even with multibyte text after the %.
+    assert_eq!(percent_decode("%aé"), "%aé");
+    assert_eq!(percent_decode("%é"), "%é");
+    assert_eq!(percent_decode("100%"), "100%");
+    assert_eq!(percent_decode("%zz"), "%zz");
+}
+
+#[test]
 fn folders_rename_with_their_subfolders() {
     let server = FakeCloudKit::start();
     let mut b = backend(&server);

@@ -12,7 +12,7 @@ use crate::sync::engine::{apply, sync_account, AccountSnapshot};
 const EMAIL: &str = "Alice@Example.com";
 const PASSWORD: &str = "hunter2 hunter2";
 // Few iterations to keep the tests fast; the KDF itself is tested in crypto.rs.
-const KDF: Kdf = Kdf::Pbkdf2 { iterations: 1000 };
+const KDF: Kdf = Kdf::Pbkdf2 { iterations: 5000 };
 
 fn config(server: &FakeServer) -> Config {
     Config { server: server.url.clone(), email: EMAIL.into(), folder: "Notes".into() }
@@ -352,4 +352,49 @@ fn two_devices_sync_through_the_vault() {
     server.state().log.clear();
     laptop.sync();
     assert_eq!(server.state().log, vec!["GET /api/accounts/revision-date"]);
+}
+
+#[test]
+fn a_web_page_instead_of_the_vault_is_an_error_not_an_empty_vault() {
+    let server = FakeServer::start(EMAIL, PASSWORD, KDF);
+    let mut laptop = Device::new(&server);
+    let id = laptop.add(&["Notes"], "# Keep me\n");
+    laptop.sync();
+    server.state().sync_page = Some("<html><body>Sign in to the hotel Wi-Fi</body></html>".into());
+    // Something changed elsewhere, so the sync pulls.
+    server.state().add_folder("Notes/Elsewhere");
+    let snap = AccountSnapshot::of(&laptop.store, "bw");
+    let err = match sync_account(&mut laptop.backend, &snap, Utc::now()) {
+        Err(e) => format!("{e:#}"),
+        Ok(out) => out.error.expect("the sync must fail"),
+    };
+    assert!(err.contains("JSON"), "{err}");
+    assert!(laptop.store.note(&id).is_some(), "the note survives");
+    // A JSON reply without the lists isn't an empty vault either.
+    server.state().sync_page = Some("{}".into());
+    assert!(laptop.backend.pull().is_err());
+}
+
+#[test]
+fn items_that_cant_be_decrypted_are_kept_locally() {
+    let server = FakeServer::start(EMAIL, PASSWORD, KDF);
+    let mut laptop = Device::new(&server);
+    let a = laptop.add(&["Notes"], "# A\n");
+    let b = laptop.add(&["Work"], "# B\n");
+    laptop.sync();
+    {
+        // Another client re-encrypts one note and the Work folder with
+        // something we can't read.
+        let rid = laptop.store.note(&a).unwrap().sync.remote_id.clone().unwrap();
+        let mut s = server.state();
+        s.scramble_note(&rid);
+        s.scramble_folder("Notes/Work");
+    }
+    let snap = laptop.backend.pull().unwrap();
+    assert_eq!(snap.unreadable.len(), 3, "the note, the folder and the note in it: {:?}", snap.unreadable);
+    laptop.sync();
+    assert_eq!(laptop.store.note(&a).unwrap().body, "# A\n");
+    assert_eq!(laptop.store.note(&b).unwrap().body, "# B\n");
+    let bf = laptop.store.note(&b).unwrap().folder.clone();
+    assert_eq!(laptop.store.folder_path(&bf), vec!["Work"]);
 }

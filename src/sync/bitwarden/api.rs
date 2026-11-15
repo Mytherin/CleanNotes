@@ -141,9 +141,24 @@ pub fn http() -> reqwest::blocking::Client {
 
 fn read(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
-    let body: Value = if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::String(text)) };
-    if (200..300).contains(&status) {
+    let ok = (200..300).contains(&status);
+    let text = match resp.text() {
+        Ok(t) => t,
+        // A reply cut off half way mustn't pass for an empty one.
+        Err(e) if ok => return Err(anyhow::Error::new(e).context("reading the Bitwarden server's reply")),
+        Err(_) => String::new(),
+    };
+    let body: Value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(v) => v,
+            // A captive portal or proxy answering with a web page.
+            Err(_) if ok => bail!("the Bitwarden server's reply isn't JSON (a proxy or captive portal in the way?)"),
+            Err(_) => Value::String(text),
+        }
+    };
+    if ok {
         Ok(body)
     } else {
         Err(HttpError { status, message: message_of(&body), body }.into())
@@ -168,7 +183,8 @@ pub fn token_request(http: &reqwest::blocking::Client, urls: &Urls, form: &[(&st
 pub fn prelogin(http: &reqwest::blocking::Client, urls: &Urls, email: &str) -> Result<crypto::Kdf> {
     let body = json!({ "email": crypto::normalize_email(email) });
     let v = read(http.post(format!("{}/accounts/prelogin", urls.identity)).json(&body).send().context("contacting the Bitwarden server")?)?;
-    let num = |k: &str| get(&v, k).and_then(Value::as_u64).map(|n| n as u32);
+    // Out-of-range numbers become u32::MAX, which the KDF bounds then refuse.
+    let num = |k: &str| get(&v, k).and_then(Value::as_u64).map(|n| u32::try_from(n).unwrap_or(u32::MAX));
     Ok(match num("kdf").unwrap_or(0) {
         0 => crypto::Kdf::Pbkdf2 { iterations: num("kdfIterations").unwrap_or(600_000) },
         1 => crypto::Kdf::Argon2id {

@@ -14,7 +14,7 @@
 //! - The master password is never stored: signing in unlocks the user key,
 //!   which is kept (with the tokens) in the OS credential store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -436,11 +436,28 @@ impl Backend for BitwardenBackend {
 
     fn pull(&mut self) -> Result<Snapshot> {
         let v = self.client.send(Http::GET, "/sync?excludeDomains=true", None)?;
-        let folder_list = get(&v, "folders").and_then(Value::as_array).cloned().unwrap_or_default();
+        // A reply without these isn't an empty vault: taking it for one would
+        // delete every note here.
+        let folder_list = get(&v, "folders").and_then(Value::as_array).context("the vault reply has no folder list")?.clone();
+        let cipher_list = get(&v, "ciphers").and_then(Value::as_array).context("the vault reply has no item list")?.clone();
         let mut paths: HashMap<String, Vec<String>> = HashMap::new();
         let mut snap = Snapshot::default();
         let root = self.root().to_owned();
-        for f in self.decrypt_folders(&folder_list) {
+        // Folders whose name can't be decrypted might be ours; they and
+        // their notes are kept as they are locally.
+        let mut unreadable_folders: HashSet<String> = HashSet::new();
+        let mut folders = Vec::new();
+        for f in &folder_list {
+            let Some(id) = get_str(f, "id") else { continue };
+            match get_str(f, "name").map(|n| crypto::decrypt_str(&self.keys, n)) {
+                Some(Ok(name)) => folders.push(VaultFolder { id: id.to_owned(), name }),
+                _ => {
+                    unreadable_folders.insert(id.to_owned());
+                }
+            }
+        }
+        snap.unreadable.extend(unreadable_folders.iter().cloned());
+        for f in folders {
             let Some(path) = self.app_path(&f.name) else { continue };
             // A vault folder "<root>/Notes" holds default-folder notes too, but
             // isn't listed as a folder of its own.
@@ -452,14 +469,20 @@ impl Backend for BitwardenBackend {
             paths.insert(f.id, path);
         }
         self.ciphers.clear();
-        for c in get(&v, "ciphers").and_then(Value::as_array).into_iter().flatten() {
+        for c in &cipher_list {
+            let in_unreadable_folder = get_str(c, "folderId").is_some_and(|f| unreadable_folders.contains(f));
             match self.read_cipher(c, &paths) {
                 Ok(Some(n)) => {
                     self.ciphers.insert(n.remote_id.clone(), c.clone());
                     snap.notes.push(n);
                 }
+                Ok(None) if in_unreadable_folder => snap.unreadable.extend(get_str(c, "id").map(str::to_owned)),
                 Ok(None) => {}
-                Err(e) => eprintln!("skipping a vault item that can't be read: {e:#}"),
+                Err(e) => {
+                    // Not a deletion: the note stays as it is here.
+                    eprintln!("skipping a vault item that can't be read: {e:#}");
+                    snap.unreadable.extend(get_str(c, "id").map(str::to_owned));
+                }
             }
         }
         Ok(snap)

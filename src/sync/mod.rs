@@ -88,6 +88,10 @@ pub struct RemoteFolder {
 pub struct Snapshot {
     pub folders: Vec<RemoteFolder>,
     pub notes: Vec<RemoteNote>,
+    /// Remote ids of notes and folders the backend has but couldn't read
+    /// (undecryptable, written by a newer client, …). They're left alone
+    /// locally instead of being taken as deleted.
+    pub unreadable: Vec<String>,
 }
 
 /// An update or delete was refused because the note changed on the backend
