@@ -77,9 +77,12 @@ impl SqliteBackend {
         Ok(SqliteBackend { conn })
     }
 
-    fn bump(tx: &rusqlite::Transaction) -> Result<()> {
+    /// Counts a change, returning the new count. It doubles as the revision
+    /// of the notes changed, so a revision is never used twice (even for a
+    /// note deleted and put back).
+    fn bump(tx: &rusqlite::Transaction) -> Result<i64> {
         tx.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'change'", [])?;
-        Ok(())
+        Ok(tx.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'change'", [], |r| r.get(0))?)
     }
 
     /// The folder id at a path, `None` for the empty path.
@@ -233,10 +236,11 @@ impl Backend for SqliteBackend {
             .query_row("SELECT parent_id FROM folders WHERE id = ?1", [remote_id], |r| r.get(0))
             .optional()?;
         let Some(parent) = parent else { return Ok(()) };
+        let change = Self::bump(&tx)?;
         tx.execute("UPDATE folders SET parent_id = ?1 WHERE parent_id = ?2", params![parent, remote_id])?;
-        tx.execute("UPDATE notes SET folder_id = ?1 WHERE folder_id = ?2", params![parent, remote_id])?;
+        // A new revision, so other computers see the notes' new place.
+        tx.execute("UPDATE notes SET folder_id = ?1, revision = ?3 WHERE folder_id = ?2", params![parent, remote_id, change])?;
         tx.execute("DELETE FROM folders WHERE id = ?1", [remote_id])?;
-        Self::bump(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -246,15 +250,16 @@ impl Backend for SqliteBackend {
         let id = remote_id.unwrap_or(&note.id).to_owned();
         let current: Option<i64> =
             tx.query_row("SELECT revision FROM notes WHERE id = ?1", [&id], |r| r.get(0)).optional()?;
-        let revision = match (remote_id, current) {
+        match (remote_id, current) {
             // A create retried after a lost reply, or an update of a note
             // that changed since: let the engine reconcile.
             (None, Some(_)) => return Err(Conflict.into()),
             (Some(_), Some(cur)) if base_revision != Some(cur.to_string().as_str()) => return Err(Conflict.into()),
-            (_, Some(cur)) => cur + 1,
-            // Updating a note deleted meanwhile puts it back.
-            (_, None) => 1,
-        };
+            // Otherwise an update, a create, or an update of a note deleted
+            // meanwhile, which puts it back.
+            _ => {}
+        }
+        let revision = Self::bump(&tx)?;
         let folder = Self::ensure_folder(&tx, &note.folder)?;
         let title = crate::markdown::title_of(&note.body);
         tx.execute(
@@ -272,7 +277,6 @@ impl Backend for SqliteBackend {
         for tag in tags {
             tx.execute("INSERT OR IGNORE INTO tags (note_id, tag) VALUES (?1, ?2)", params![id, tag])?;
         }
-        Self::bump(&tx)?;
         tx.commit()?;
         Ok((id, revision.to_string()))
     }

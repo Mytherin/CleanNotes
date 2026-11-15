@@ -241,6 +241,11 @@ fn reconcile(
         }
         for n in w.notes.iter_mut().filter(|n| n.folder == id) {
             n.folder = default_id.clone();
+            // One the backend has is taken again from it below, with the
+            // folder the backend put it in, even if its revision didn't move.
+            if n.sync.remote_id.is_some() && !n.sync.dirty {
+                n.sync.revision = None;
+            }
         }
         w.folders.retain(|f| f.id != id);
     }

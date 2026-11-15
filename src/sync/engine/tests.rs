@@ -216,6 +216,48 @@ fn deleting_a_folder_syncs() {
 }
 
 #[test]
+fn notes_left_in_a_deleted_folder_end_up_in_the_same_place_everywhere() {
+    let (_d, mut laptop, mut phone) = pair();
+    let work = laptop.store.ensure_folder_at(ACC, &["Projects".into(), "Work".into()]);
+    laptop.sync();
+    phone.sync();
+    // The phone puts a note in Work; the laptop deletes Work (as if before
+    // it heard of the note), so the backend moves the note up to Projects.
+    let pwork = phone.store.folder_at(ACC, &["Projects".into(), "Work".into()]).unwrap().id.clone();
+    let n = Note::new(ACC, &pwork, "late note");
+    let id = n.id.clone();
+    phone.store.notes.push(n);
+    phone.sync();
+    let f = laptop.store.folders.iter().position(|f| f.id == work).unwrap();
+    let f = laptop.store.folders.remove(f);
+    laptop.store.tombstones.push(Tombstone {
+        account: ACC.into(),
+        note: false,
+        remote_id: f.sync.remote_id.unwrap(),
+        path: vec!["Projects".into(), "Work".into()],
+    });
+    laptop.sync();
+    phone.sync();
+    laptop.sync();
+    for d in [&laptop, &phone] {
+        let folder = d.store.note(&id).unwrap().folder.clone();
+        assert_eq!(d.store.folder_path(&folder), vec!["Projects"]);
+    }
+}
+
+#[test]
+fn a_note_put_back_after_a_delete_gets_a_new_revision() {
+    let (_d, mut laptop, _phone) = pair();
+    let id = laptop.add("v1");
+    laptop.sync();
+    let rid = laptop.store.note(&id).unwrap().sync.remote_id.clone().unwrap();
+    let rev1 = laptop.store.note(&id).unwrap().sync.revision.clone().unwrap();
+    laptop.backend.delete_note(&rid).unwrap();
+    let (_, rev2) = laptop.backend.save_note(Some(&rid), Some(&rev1), &data_of(&laptop.store, &id)).unwrap();
+    assert_ne!(rev1, rev2, "a stale device mustn't take the new text for the one it has");
+}
+
+#[test]
 fn edits_made_during_a_sync_are_kept() {
     let (_d, mut laptop, mut phone) = pair();
     let id = laptop.add("# A\none\ntwo\n");
