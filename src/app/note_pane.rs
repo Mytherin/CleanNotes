@@ -317,14 +317,14 @@ impl App {
         }
         if te.changed() {
             self.scroll_list = true;
-            let first = self.visible_notes().first().cloned();
-            if !self.visible_notes().contains(&self.selected.clone().unwrap_or_default()) {
-                self.select(first);
-            }
+            // Notes the search hides drop out of the selection, so a Delete
+            // doesn't reach notes that aren't shown.
+            self.retain_visible(None);
         }
         if te.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
             self.search.clear();
             te.surrender_focus();
+            self.retain_visible(None);
         }
         if te.has_focus() && ui.input(|i| i.key_pressed(Key::ArrowDown)) {
             self.focus = Pane::List;
@@ -338,6 +338,7 @@ impl App {
             if resp.clicked() {
                 self.search.clear();
                 self.search_open = false;
+                self.retain_visible(None);
             }
         }
         r.left()

@@ -224,8 +224,9 @@ impl App {
     fn restore_location(&mut self) {
         if self.settings.last_folder.as_deref() == Some(ALL_NOTES) && self.show_all_notes() {
             self.location = Location::All;
-            let note = self.settings.last_note.clone().filter(|n| self.store.note(n).is_some());
-            let note = note.or_else(|| self.visible_notes().first().cloned());
+            let visible = self.visible_notes();
+            let note = self.settings.last_note.clone().filter(|n| visible.contains(n));
+            let note = note.or_else(|| visible.first().cloned());
             self.select(note);
             return;
         }
@@ -238,8 +239,11 @@ impl App {
             .or_else(|| self.store.default_folder(crate::model::LOCAL).map(|f| f.id.clone()))
             .unwrap_or_default();
         self.location = Location::Folder(folder);
-        let note = self.settings.last_note.clone().filter(|n| self.store.note(n).is_some());
-        let note = note.or_else(|| self.visible_notes().first().cloned());
+        // Only if the list shows it: the last note may have been a search
+        // hit from elsewhere, deleted, or in a disabled account.
+        let visible = self.visible_notes();
+        let note = self.settings.last_note.clone().filter(|n| visible.contains(n));
+        let note = note.or_else(|| visible.first().cloned());
         self.select(note);
     }
 
@@ -366,7 +370,7 @@ impl App {
     /// The account and folder new notes go to from here.
     pub fn new_note_target(&self) -> (String, String) {
         if let Location::Folder(f) = &self.location {
-            if let Some(folder) = self.store.folder(f) {
+            if let Some(folder) = self.store.folder(f).filter(|f| self.account_enabled(&f.account)) {
                 return (folder.account.clone(), folder.id.clone());
             }
         }
@@ -381,16 +385,18 @@ impl App {
 
     pub fn new_note(&mut self) {
         let (account, folder) = self.new_note_target();
-        if !matches!(self.location, Location::Folder(_) | Location::All) || !self.search.is_empty() {
+        // In a tag, a new note carries the tag (as in Apple Notes), and the
+        // tag stays shown; All Notes shows it too.
+        let body_tag = match &self.location {
+            Location::Tag(t) => Some(format!("#{t}")),
+            _ => None,
+        };
+        let stays_shown = matches!(self.location, Location::Folder(ref f) if *f == folder) || self.location == Location::All;
+        if body_tag.is_none() && !stays_shown {
             self.location = Location::Folder(folder.clone());
-            self.search.clear();
         }
+        self.search.clear();
         let mut n = Note::new(&account, &folder, "");
-        // In a tag, a new note carries the tag (as in Apple Notes).
-        let mut body_tag = None;
-        if let Location::Tag(t) = &self.location {
-            body_tag = Some(format!("#{t}"));
-        }
         if let Some(t) = &body_tag {
             n.body = format!("\n{t}\n");
         }
@@ -576,9 +582,10 @@ impl App {
             self.store.purge_note(id);
             self.unsaved.insert(id.clone());
         }
-        if self.selected.as_ref().is_some_and(|s| ids.contains(s)) {
-            self.selected = None;
-            self.editor = None;
+        let open_gone = self.selected.as_ref().is_some_and(|s| ids.contains(s));
+        // Also drops them from a selection of several notes.
+        self.prune_missing();
+        if open_gone && self.selected.is_none() {
             self.select(next);
         }
     }
@@ -611,14 +618,18 @@ impl App {
         }
     }
 
+    /// Moves notes to a folder, possibly in another account. The selection
+    /// then moves on to a note still shown, if they've left the list.
     pub fn move_notes(&mut self, ids: &[String], folder: &str) {
+        // Worked out before anything moves, so it's never one of them.
+        let next = self.neighbour_of(ids);
         for id in ids {
-            self.move_note(id, folder);
+            self.move_one(id, folder);
         }
+        self.retain_visible(next);
     }
 
-    /// Moves a note to a folder, possibly in another account.
-    pub fn move_note(&mut self, id: &str, folder: &str) {
+    fn move_one(&mut self, id: &str, folder: &str) {
         let Some(target) = self.store.folder(folder).cloned() else { return };
         let Some(n) = self.store.note(id).cloned() else { return };
         if n.account == target.account {
@@ -645,9 +656,31 @@ impl App {
             n.touch();
         }
         self.unsaved.insert(id.to_owned());
-        if !self.visible_notes().contains(&id.to_owned()) && self.selected.as_deref() == Some(id) {
-            let next = self.neighbour_of(&[id.to_owned()]);
-            self.select(next);
+    }
+
+    /// Drops notes the list no longer shows from the selection. If the open
+    /// note is one of them, `fallback` (if shown) or the first shown note is
+    /// opened instead.
+    pub fn retain_visible(&mut self, fallback: Option<String>) {
+        let visible = self.visible_notes();
+        let pick = |fallback: Option<String>| fallback.filter(|f| visible.contains(f)).or_else(|| visible.first().cloned());
+        if !self.multi.is_empty() {
+            self.multi.retain(|id| visible.contains(id));
+            if self.multi.len() > 1 {
+                if !self.selected.as_ref().is_some_and(|s| self.multi.contains(s)) {
+                    self.selected = self.multi.first().cloned();
+                }
+                return;
+            }
+            // Down to one (or none): show it on its own.
+            let keep = self.multi.pop().or_else(|| pick(fallback));
+            self.selected = None;
+            self.editor = None;
+            self.select(keep);
+            return;
+        }
+        if self.selected.as_ref().is_some_and(|s| !visible.contains(s)) {
+            self.select(pick(fallback));
         }
     }
 
@@ -877,6 +910,29 @@ impl App {
                 self.location = Location::Folder(folder);
             }
         }
+        self.prune_missing();
+    }
+
+    /// Drops notes that no longer exist (purged, deleted by a sync) from
+    /// the selection.
+    fn prune_missing(&mut self) {
+        if self.selected.as_ref().is_some_and(|s| self.store.note(s).is_none()) {
+            self.selected = None;
+            self.editor = None;
+        }
+        if self.multi.is_empty() {
+            return;
+        }
+        let store = &self.store;
+        self.multi.retain(|id| store.note(id).is_some());
+        if self.multi.len() < 2 {
+            let keep = self.multi.pop();
+            self.selected = None;
+            self.editor = None;
+            self.select(keep);
+        } else if self.selected.is_none() {
+            self.selected = self.multi.first().cloned();
+        }
     }
 
     // ---- Keyboard -------------------------------------------------------------
@@ -885,7 +941,15 @@ impl App {
         let cmd = Modifiers::COMMAND;
         let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
         let alt_cmd = Modifiers::COMMAND | Modifiers::ALT;
-        let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
+        // A modal question takes the keyboard (Enter, Esc) for itself.
+        if self.confirm.is_some() {
+            return;
+        }
+        // Modifiers must match exactly: egui's own matching ignores extra
+        // Shift/Alt, so ↓ would swallow Shift+↓ and ⌘N would swallow ⇧⌘N.
+        let pressed = |m: Modifiers, k: Key| ctx.input_mut(|i| consume_exact(i, m, k));
+        // For keys whose Shift depends on the keyboard layout (+, =).
+        let pressed_loose = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
         if pressed(cmd, Key::N) {
             self.new_note();
         }
@@ -932,10 +996,10 @@ impl App {
         }
         // Text size: ⌘+ / ⌘- / ⌘0.
         let sizes = crate::settings::TEXT_SIZES;
-        if pressed(cmd, Key::Plus) || pressed(cmd, Key::Equals) || pressed(shift_cmd, Key::Equals) {
+        if pressed_loose(cmd, Key::Plus) || pressed_loose(cmd, Key::Equals) {
             self.settings.text_size = sizes.iter().copied().find(|&s| s > self.settings.text_size).unwrap_or(sizes[sizes.len() - 1]);
         }
-        if pressed(cmd, Key::Minus) {
+        if pressed_loose(cmd, Key::Minus) {
             self.settings.text_size = sizes.iter().rev().copied().find(|&s| s < self.settings.text_size).unwrap_or(sizes[0]);
         }
         if pressed(cmd, Key::Num0) {
@@ -950,7 +1014,8 @@ impl App {
                 self.undo_delete();
             }
         }
-        if pressed(cmd, Key::Backspace) || pressed(cmd, Key::Delete) {
+        // Not while typing: there Ctrl+Backspace deletes a word.
+        if !ctx.wants_keyboard_input() && (pressed(cmd, Key::Backspace) || pressed(cmd, Key::Delete)) {
             self.delete_notes(self.selected_ids());
         }
         // The notes list.
@@ -989,7 +1054,10 @@ impl App {
     /// Grows or shrinks a Shift selection by one note.
     fn extend_selection(&mut self, d: i32) {
         let shown = self.shown.clone();
-        let Some(cur) = self.selected.clone() else { return self.step_selection(d) };
+        if shown.is_empty() {
+            return;
+        }
+        let Some(cur) = self.selected.clone().filter(|s| shown.contains(s)) else { return self.step_selection(d) };
         let anchor = self.anchor.clone().unwrap_or_else(|| cur.clone());
         // The moving end is the selected note farthest from the anchor.
         let ids = self.selected_ids();
@@ -1260,6 +1328,18 @@ impl eframe::App for App {
     }
 }
 
+/// Consumes a press of `key` with exactly these modifiers (⌘ meaning Ctrl
+/// off macOS). Unlike egui's `consume_shortcut`, extra Shift/Alt don't match.
+pub fn consume_exact(i: &mut egui::InputState, modifiers: Modifiers, key: Key) -> bool {
+    let mut found = false;
+    i.events.retain(|e| {
+        let hit = matches!(e, egui::Event::Key { key: k, pressed: true, modifiers: m, .. } if *k == key && m.matches_exact(modifiers));
+        found |= hit;
+        !hit
+    });
+    found
+}
+
 /// A dialog in the middle of the window, dimming everything behind it.
 pub fn modal<R>(ctx: &egui::Context, id: &str, p: &Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> Option<R> {
     let screen = ctx.screen_rect();
@@ -1328,6 +1408,179 @@ mod tests {
         assert_eq!(date_group(at(2026, 10, 25), today), "Previous 30 Days");
         assert_eq!(date_group(at(2026, 3, 1), today), "March");
         assert_eq!(date_group(at(2025, 12, 1), today), "2025");
+    }
+
+    // ---- The app's selection logic, without a window -----------------------
+
+    fn app() -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let app = App::for_test(dir.path());
+        (app, dir)
+    }
+
+    impl App {
+        /// A note in `folder`, saved as if typed (not a fresh empty one).
+        fn add(&mut self, folder: &str, body: &str) -> String {
+            let mut n = Note::new(crate::model::LOCAL, folder, body);
+            // Distinct dates keep the list order fixed: later adds first.
+            n.modified = Utc::now() + chrono::Duration::seconds(self.store.notes.len() as i64);
+            let id = n.id.clone();
+            self.store.notes.push(n);
+            id
+        }
+
+        fn folder_named(&mut self, name: &str) -> String {
+            self.store.ensure_folder_at(crate::model::LOCAL, &[name.to_owned()])
+        }
+
+        /// What the list would show this frame.
+        fn draw(&mut self) {
+            self.shown = self.visible_notes();
+        }
+    }
+
+    #[test]
+    fn moving_several_notes_leaves_a_shown_note_selected() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        let other = app.folder_named("Other");
+        let a = app.add(&home, "# A\n");
+        let b = app.add(&home, "# B\n");
+        let c = app.add(&home, "# C\n");
+        let keep = app.add(&home, "# Keep\n");
+        app.go_to(Location::Folder(home.clone()));
+        app.draw();
+        app.click_note(&c, Modifiers::NONE);
+        app.click_note(&a, Modifiers::SHIFT);
+        assert_eq!(app.selected_ids().len(), 3);
+        app.move_notes(&app.selected_ids(), &other);
+        app.draw();
+        assert_eq!(app.shown, vec![keep.clone()]);
+        assert_eq!(app.selected.as_deref(), Some(keep.as_str()));
+        assert!(app.multi.is_empty());
+        assert_eq!(app.editor.as_ref().map(|e| e.note_id.clone()), Some(keep));
+        // All of them moved: nothing (rather than a hidden note) is open.
+        let _ = b;
+        app.click_note(&app.shown[0].clone(), Modifiers::NONE);
+        app.move_notes(&app.selected_ids(), &other);
+        assert!(app.selected.is_none() && app.editor.is_none());
+    }
+
+    #[test]
+    fn a_search_drops_hidden_notes_from_the_selection() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        for i in 0..5 {
+            app.add(&home, &format!("# Note {i}\n"));
+        }
+        let apple = app.add(&home, "# Apple pie\n");
+        app.go_to(Location::Folder(home.clone()));
+        app.draw();
+        app.click_note(&apple, Modifiers::NONE);
+        app.shown = app.visible_notes();
+        let all = app.shown.clone();
+        app.set_multi(all, &apple, None);
+        assert_eq!(app.selected_ids().len(), 6);
+        app.search = "apple".into();
+        app.retain_visible(None);
+        assert_eq!(app.selected_ids(), vec![apple.clone()], "Delete must only reach what's shown");
+        assert!(app.editor.is_some());
+        // A search that hides the open note opens the first hit instead.
+        app.search = "note 3".into();
+        app.retain_visible(None);
+        assert_eq!(app.selected_ids(), app.visible_notes());
+    }
+
+    #[test]
+    fn a_new_note_in_a_tag_carries_the_tag() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        app.add(&home, "# Plan\n#work\n");
+        app.go_to(Location::Tag("work".into()));
+        app.new_note();
+        assert_eq!(app.location, Location::Tag("work".into()));
+        let id = app.selected.clone().unwrap();
+        assert!(app.store.note(&id).unwrap().tags().contains(&"work".to_owned()));
+        assert!(app.visible_notes().contains(&id));
+    }
+
+    #[test]
+    fn new_notes_never_go_to_a_disabled_account() {
+        let (mut app, _dir) = app();
+        let mut acc = app.store.accounts[0].clone();
+        acc.id = "other".into();
+        acc.name = "Other".into();
+        app.store.accounts.push(acc);
+        app.store.ensure_local();
+        let f = app.store.ensure_folder_at("other", &["Stuff".into()]);
+        app.go_to(Location::Folder(f.clone()));
+        assert_eq!(app.new_note_target().1, f);
+        app.store.account_mut("other").unwrap().enabled = false;
+        let (account, _) = app.new_note_target();
+        assert_ne!(account, "other");
+    }
+
+    #[test]
+    fn startup_only_reopens_a_note_the_list_shows() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        let elsewhere = app.folder_named("Elsewhere");
+        let here = app.add(&home, "# Here\n");
+        let there = app.add(&elsewhere, "# There\n");
+        app.settings.last_folder = Some(home.clone());
+        app.settings.last_note = Some(there);
+        app.restore_location();
+        assert_eq!(app.selected, Some(here));
+    }
+
+    #[test]
+    fn shift_arrows_on_an_empty_list_do_nothing() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        let n = app.add(&home, "# Gone from view\n");
+        app.selected = Some(n);
+        app.shown.clear();
+        app.extend_selection(1);
+        app.extend_selection(-1);
+        app.step_selection(1);
+    }
+
+    #[test]
+    fn purging_drops_notes_from_a_selection_of_several() {
+        let (mut app, _dir) = app();
+        let home = folder_id_or_default(&app.store);
+        let ids: Vec<String> = (0..3).map(|i| app.add(&home, &format!("# {i}\n"))).collect();
+        app.go_to(Location::Folder(home));
+        app.draw();
+        let primary = app.shown[0].clone();
+        app.set_multi(ids.clone(), &primary, None);
+        let others: Vec<String> = ids.iter().filter(|i| **i != primary).cloned().collect();
+        app.delete_forever(&others);
+        assert!(app.multi.is_empty());
+        assert_eq!(app.selected_ids(), vec![primary]);
+        assert!(app.editor.is_some());
+    }
+
+    fn key(k: Key, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn shortcuts_match_modifiers_exactly() {
+        let mut i = egui::InputState::default();
+        i.events = vec![key(Key::ArrowDown, Modifiers::SHIFT)];
+        assert!(!consume_exact(&mut i, Modifiers::NONE, Key::ArrowDown), "↓ mustn't take Shift+↓");
+        assert!(consume_exact(&mut i, Modifiers::SHIFT, Key::ArrowDown));
+        assert!(i.events.is_empty());
+        let shift_cmd = Modifiers::COMMAND | Modifiers::SHIFT;
+        i.events = vec![key(Key::N, shift_cmd), key(Key::G, shift_cmd)];
+        assert!(!consume_exact(&mut i, Modifiers::COMMAND, Key::N), "⌘N mustn't take ⇧⌘N");
+        assert!(!consume_exact(&mut i, Modifiers::COMMAND, Key::G), "⌘G mustn't take ⇧⌘G");
+        assert!(consume_exact(&mut i, shift_cmd, Key::N));
+        assert!(consume_exact(&mut i, shift_cmd, Key::G));
+        // Key releases aren't presses.
+        i.events = vec![egui::Event::Key { key: Key::Z, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::COMMAND }];
+        assert!(!consume_exact(&mut i, Modifiers::COMMAND, Key::Z));
     }
 }
 

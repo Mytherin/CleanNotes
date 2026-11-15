@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, RichText, Sense, Ui, Vec2};
 
-use super::{modal, App, Confirm};
+use super::{modal, App, Confirm, Location};
 use crate::model::{new_id, Account, LOCAL};
 use crate::settings::{refresh_label, SortBy, StartWith, REFRESH_CHOICES, TEXT_SIZES};
 use crate::sync::bitwarden::{self, Method, SignInRequest, SignInStep, TwoFactorCode, TwoFactorKind};
@@ -450,9 +450,24 @@ impl App {
             }
         });
         if name != a.name || enabled != a.enabled {
+            let disabled = a.enabled && !enabled;
             let acc = self.store.account_mut(id).unwrap();
             acc.name = name;
             acc.enabled = enabled;
+            if disabled {
+                // Its notes vanish from view: don't stay in one of its
+                // folders, or keep one of its notes open.
+                let inside = match &self.location {
+                    Location::Folder(f) => self.store.folder(f).is_some_and(|f| f.account == id),
+                    Location::Deleted(acc) => acc == id,
+                    _ => false,
+                };
+                if inside {
+                    let (_, folder) = self.new_note_target();
+                    self.go_to(Location::Folder(folder));
+                }
+                self.retain_visible(None);
+            }
         }
     }
 
