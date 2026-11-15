@@ -69,10 +69,24 @@ fn error_of(v: &Value) -> Option<&Value> {
     payload(v).get("error").or_else(|| v.get("error")).filter(|e| e.is_object())
 }
 
+/// The SNJS release whose protocol this client follows (the
+/// `X-SNJS-Version` the official clients send).
+pub const SNJS_VERSION: &str = "2.212.11";
+
 pub fn http() -> reqwest::blocking::Client {
+    // The headers every official client sends with every API request
+    // (`FetchRequestHandler.createRequest` in standardnotes/app): the SNJS
+    // version and `<Environment>-<app version>`.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("X-SNJS-Version", reqwest::header::HeaderValue::from_static(SNJS_VERSION));
+    headers.insert(
+        "X-Application-Version",
+        reqwest::header::HeaderValue::from_str(&format!("Desktop-cleannotes-{}", env!("CARGO_PKG_VERSION"))).expect("ASCII"),
+    );
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
         .build()
         .expect("HTTP client")
 }

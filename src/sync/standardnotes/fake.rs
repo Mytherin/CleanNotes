@@ -264,6 +264,11 @@ fn route(s: &mut State, req: &Request) -> (u16, Value) {
     if req.method != "POST" || body["api"] != super::api::API_VERSION {
         return error(400, Some("invalid-parameters"), "bad request");
     }
+    // Every request carries the headers the official clients send.
+    let header = |k: &str| req.headers.get(k).map(String::as_str).unwrap_or("");
+    if header("x-snjs-version") != super::api::SNJS_VERSION || !header("x-application-version").starts_with("Desktop-") {
+        return error(400, Some("invalid-parameters"), "missing client version headers");
+    }
     match req.path.as_str() {
         "/v2/login-params" => {
             let email = body["email"].as_str().unwrap_or("");
