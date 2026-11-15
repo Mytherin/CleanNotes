@@ -126,6 +126,9 @@ pub struct WebHost {
     check_needed: Arc<AtomicBool>,
     /// The WebView is showing Standard Notes' server for the browser check.
     checking: bool,
+    /// Give the keyboard back to the app's window once the page has loaded
+    /// (WebView2 takes it when it loads a page).
+    give_back_focus: bool,
 }
 
 impl WebHost {
@@ -170,6 +173,8 @@ impl WebHost {
         let webview = wry::WebViewBuilder::new()
             .with_url(&page_url)
             .with_visible(false)
+            // Hidden, it mustn't take the keyboard from the app's window.
+            .with_focused(false)
             .with_bounds(wry::Rect { position: LogicalPosition::new(0.0, 0.0).into(), size: LogicalSize::new(1.0, 1.0).into() })
             .with_ipc_handler(handler)
             .build_as_child(cc)
@@ -184,7 +189,8 @@ impl WebHost {
             check_needed: check_needed.clone(),
             ctx,
         });
-        let host = WebHost { webview, page_url, jobs, queued: Vec::new(), waiting, ready, check_needed, checking: false };
+        let host = WebHost { webview, page_url, jobs, queued: Vec::new(), waiting, ready, check_needed, checking: false, give_back_focus: true };
+        let _ = host.webview.focus_parent();
         Ok((host, fetch))
     }
 
@@ -193,6 +199,10 @@ impl WebHost {
         self.queued.extend(self.jobs.try_iter());
         if !self.ready.load(Ordering::Relaxed) || self.checking {
             return;
+        }
+        if self.give_back_focus {
+            self.give_back_focus = false;
+            let _ = self.webview.focus_parent();
         }
         for job in self.queued.drain(..) {
             if let Err(e) = self.webview.evaluate_script(&job.script) {
@@ -228,7 +238,9 @@ impl WebHost {
         self.checking = false;
         self.check_needed.store(false, Ordering::Relaxed);
         let _ = self.webview.set_visible(false);
+        let _ = self.webview.focus_parent();
         let _ = self.webview.load_url(&self.page_url);
+        self.give_back_focus = true;
     }
 
     pub fn checking(&self) -> bool {
