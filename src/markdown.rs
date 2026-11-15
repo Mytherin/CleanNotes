@@ -51,6 +51,14 @@ pub fn to_markdown(doc: &Doc) -> String {
             out.push_str(&f);
             out.push('\n');
         }
+        if let Kind::Cell { cols, header_row, header_col } = b.kind {
+            // A table, written whole at its first cell.
+            if i == 0 || !doc.blocks[i - 1].kind.is_cell() {
+                let end = doc.blocks[i..].iter().position(|x| !x.kind.is_cell()).map_or(doc.blocks.len(), |n| i + n);
+                table_markdown(&doc.blocks[i..end], cols as usize, header_row, header_col, &mut out);
+            }
+            continue;
+        }
         if b.kind.indents() {
             for _ in 0..b.indent {
                 out.push_str(INDENT);
@@ -67,6 +75,7 @@ pub fn to_markdown(doc: &Doc) -> String {
             Kind::Checklist(false) => "- [ ] ".to_owned(),
             Kind::Checklist(true) => "- [x] ".to_owned(),
             Kind::Quote => "> ".to_owned(),
+            Kind::Cell { .. } => String::new(),
         };
         out.push_str(&prefix);
         let inline = inline_markdown(b);
@@ -76,7 +85,8 @@ pub fn to_markdown(doc: &Doc) -> String {
         let rest = inline.trim_start_matches([' ', '\t']);
         let lead = inline.len() - rest.len();
         let prefix = parse_prefix(rest);
-        let reads_as_markup = prefix.is_some() || opens_fence(rest).is_some();
+        // (A line starting with `|` could start a table.)
+        let reads_as_markup = prefix.is_some() || opens_fence(rest).is_some() || rest.starts_with('|');
         if matches!(b.kind, Kind::Body | Kind::Quote) && reads_as_markup {
             // Digits can't be escaped: "1\. text".
             let at = match prefix {
@@ -266,8 +276,9 @@ fn escape_char(out: &mut String, chars: &[char], styles: &[Style], i: usize) {
         // `_` only marks emphasis at the edge of a word.
         '_' => !prev.is_some_and(|p| p.is_alphanumeric()) || !next.is_some_and(|n| n.is_alphanumeric()),
         '<' => {
-            let rest: String = chars[i + 1..chars.len().min(i + 4)].iter().collect();
-            rest.starts_with("u>") || rest.starts_with("/u>")
+            let rest: String = chars[i + 1..chars.len().min(i + 6)].iter().collect::<String>().to_ascii_lowercase();
+            // (`<br>` is a line break in a table cell.)
+            rest.starts_with("u>") || rest.starts_with("/u>") || rest.starts_with("br>") || rest.starts_with("br/>") || rest.starts_with("br />")
         }
         _ => false,
     };
@@ -346,8 +357,11 @@ pub fn from_markdown(md: &str) -> Doc {
     // file is indented.
     let mut list_stack: Vec<usize> = Vec::new();
     let md = md.strip_suffix('\n').unwrap_or(md);
-    for raw in md.split('\n') {
-        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+    let lines: Vec<&str> = md.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut li = 0;
+    while li < lines.len() {
+        let raw = lines[li];
+        li += 1;
         let expanded = raw.replace('\t', INDENT);
         let trimmed = expanded.trim_start_matches(' ');
         let spaces = expanded.len() - trimmed.len();
@@ -361,6 +375,36 @@ pub fn from_markdown(md: &str) -> Doc {
         }
         if let Some(mark) = opens_fence(trimmed) {
             fence = Some(mark);
+            list_stack.clear();
+            continue;
+        }
+        // A table: a row of cells, then a separator row.
+        if trimmed.starts_with('|') && lines.get(li).is_some_and(|l| is_separator(l)) {
+            let header = split_row(trimmed);
+            let separator = split_row(lines[li]);
+            li += 1;
+            let mut rows = Vec::new();
+            while li < lines.len() && lines[li].trim_start().starts_with('|') {
+                rows.push(split_row(lines[li].trim_start()));
+                li += 1;
+            }
+            let header_row = header.iter().any(|c| !c.trim().is_empty());
+            let header_col = separator.first().is_some_and(|s| s.starts_with(':') && !s.ends_with(':'));
+            if header_row {
+                rows.insert(0, header);
+            }
+            let cols = rows.iter().map(Vec::len).max().unwrap_or(1).max(header_col as usize).max(1);
+            let kind = Kind::Cell { cols: cols as u16, header_row, header_col };
+            if blocks.last().is_some_and(|b: &Block| b.kind.is_cell()) {
+                blocks.push(Block::default());
+            }
+            for row in &rows {
+                for c in 0..cols {
+                    let mut b = row.get(c).map_or_else(|| Block::new(kind, ""), |t| cell_from_markdown(t));
+                    b.kind = kind;
+                    blocks.push(b);
+                }
+            }
             list_stack.clear();
             continue;
         }
@@ -404,6 +448,126 @@ pub fn from_markdown(md: &str) -> Doc {
         blocks.push(b);
     }
     Doc::new(blocks)
+}
+
+/// Whether a line is a table's separator row (`| --- | :---: |`).
+fn is_separator(line: &str) -> bool {
+    let line = line.trim();
+    if !line.contains('-') || !line.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t')) {
+        return false;
+    }
+    let cells = split_row(line);
+    !cells.is_empty() && cells.iter().all(|c| {
+        let c = c.trim().trim_start_matches(':').trim_end_matches(':');
+        !c.is_empty() && c.chars().all(|x| x == '-')
+    })
+}
+
+/// A table row's cells (their Markdown, trimmed), split at unescaped `|`.
+fn split_row(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut backslashes = 0;
+    for c in line.chars() {
+        if c == '|' && backslashes % 2 == 0 {
+            cells.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+        backslashes = if c == '\\' { backslashes + 1 } else { 0 };
+    }
+    // Text after the last `|` is a cell only if there is any.
+    if !cur.trim().is_empty() {
+        cells.push(cur);
+    }
+    cells.into_iter().map(|c| c.trim().to_owned()).collect()
+}
+
+/// A cell's paragraph from its Markdown: `<br>` are line breaks in it.
+fn cell_from_markdown(md: &str) -> Block {
+    let mut b = Block::new(Kind::Body, "");
+    let lower = md.to_ascii_lowercase();
+    // An unescaped `<br>` (`\<br>` is the text).
+    let unescaped = |i: usize| md[..i].bytes().rev().take_while(|&c| c == b'\\').count() % 2 == 0;
+    let find_br = |from: usize| -> Option<(usize, usize)> {
+        let mut best: Option<(usize, usize)> = None;
+        for t in ["<br>", "<br/>", "<br />"] {
+            let mut s = from;
+            while let Some(i) = lower[s..].find(t).map(|i| s + i) {
+                if unescaped(i) {
+                    if best.is_none_or(|(bi, _)| i < bi) {
+                        best = Some((i, t.len()));
+                    }
+                    break;
+                }
+                s = i + 1;
+            }
+        }
+        best
+    };
+    let mut at = 0;
+    let mut first = true;
+    loop {
+        let next = find_br(at);
+        let piece = &md[at..next.map_or(md.len(), |(i, _)| i)];
+        if !first {
+            push(&mut b, '\n', &Style::default());
+        }
+        first = false;
+        let p = parse_inline(piece);
+        b.text.push_str(&p.text);
+        b.styles.extend(p.styles);
+        match next {
+            Some((i, n)) => at = i + n,
+            None => break,
+        }
+    }
+    b
+}
+
+/// A cell's Markdown: its inline Markdown with `|` escaped and line breaks
+/// as `<br>`, on one line.
+fn cell_markdown(b: &Block) -> String {
+    inline_markdown(b).replace('|', "\\|").replace('\n', "<br>")
+}
+
+/// A table (its cells, row by row) as Markdown. A table without a header
+/// row gets an empty one (Markdown tables must have one); a header column
+/// is marked by the first column's `:---`.
+fn table_markdown(cells: &[Block], cols: usize, header_row: bool, header_col: bool, out: &mut String) {
+    let cols = cols.max(1);
+    let row_line = |row: &[Block]| {
+        let mut s = String::from("|");
+        for c in 0..cols {
+            s.push(' ');
+            if let Some(b) = row.get(c) {
+                s.push_str(&cell_markdown(b));
+            }
+            s.push_str(" |");
+        }
+        s
+    };
+    let rows: Vec<&[Block]> = cells.chunks(cols).collect();
+    let body = if header_row && !rows.is_empty() {
+        out.push_str(&row_line(rows[0]));
+        &rows[1..]
+    } else {
+        out.push('|');
+        out.push_str(&" |".repeat(cols));
+        &rows[..]
+    };
+    out.push('\n');
+    out.push('|');
+    for c in 0..cols {
+        out.push_str(if c == 0 && header_col { " :--- |" } else { " --- |" });
+    }
+    out.push('\n');
+    for r in body {
+        out.push_str(&row_line(r));
+        out.push('\n');
+    }
 }
 
 /// Parses a line's inline Markdown into a body paragraph.
@@ -626,6 +790,12 @@ fn plain_lines(md: &str) -> impl Iterator<Item = String> + '_ {
         }
         let text = if fence.is_some() {
             t.to_owned()
+        } else if t.starts_with('|') {
+            // A table row: its cells' text (the separator row: nothing).
+            if is_separator(t) {
+                return None;
+            }
+            split_row(t).iter().map(|c| cell_from_markdown(c).text.replace('\n', " ")).filter(|c| !c.trim().is_empty()).collect::<Vec<_>>().join("  ")
         } else {
             let start = raw.trim_start_matches([' ', '\t']);
             let body = parse_prefix(start).map_or(start, |p| &start[p.len..]);
@@ -879,6 +1049,36 @@ mod tests {
         // Two-space nesting from other editors still nests.
         let d = from_markdown("- a\n  - b\n    - c\n");
         assert_eq!(d.blocks.iter().map(|b| b.indent).collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    #[test]
+    fn tables_round_trip() {
+        // Apple Notes-style: no header row (an empty one is written).
+        round_trip("Before\n| | |\n| --- | --- |\n| a | **b** |\n| c\\|d | e<br>f |\n\nAfter\n");
+        let d = from_markdown("| | |\n| --- | --- |\n| a | **b** |\n| c\\|d | e<br>f |\n");
+        let cells: Vec<&str> = d.blocks.iter().filter(|b| b.kind.is_cell()).map(|b| b.text.as_str()).collect();
+        assert_eq!(cells, ["a", "b", "c|d", "e\nf"]);
+        assert_eq!(d.blocks[0].kind, Kind::Cell { cols: 2, header_row: false, header_col: false });
+        assert!(d.blocks[1].styles[0].bold);
+        // There's always a paragraph after a table to write in.
+        assert_eq!(d.blocks.last().unwrap().kind, Kind::Body);
+        // Header row and header column (as Super makes them).
+        round_trip("| Name | Qty |\n| :--- | --- |\n| eggs | 6 |\n");
+        let d = from_markdown("| Name | Qty |\n| :--- | --- |\n| eggs | 6 |\n");
+        assert_eq!(d.blocks[0].kind, Kind::Cell { cols: 2, header_row: true, header_col: true });
+        // Tables from elsewhere: ragged rows, no outer pipes on the right.
+        let d = from_markdown("| a | b | c\n|---|---|---|\n| 1 | 2\n");
+        let cells: Vec<&str> = d.blocks.iter().filter(|b| b.kind.is_cell()).map(|b| b.text.as_str()).collect();
+        assert_eq!(cells, ["a", "b", "c", "1", "2", ""]);
+        // Text that only looks like a table stays text.
+        doc_round_trip(&Doc::new(vec![Block::new(Kind::Body, "| not | a table |"), Block::new(Kind::Body, "|---|---|")]));
+        doc_round_trip(&Doc::new(vec![Block::new(Kind::Body, "a literal <br> here")]));
+        let mut cell = Block::new(Kind::cell(1), "typed <br> and | pipes");
+        cell.kind = Kind::cell(1);
+        doc_round_trip(&Doc::new(vec![cell, Block::default()]));
+        // Titles and snippets show the cells' text.
+        assert_eq!(title_of("| Item | Price |\n| --- | --- |\n| Tea | 3 |\n"), "Item  Price");
+        assert_eq!(snippet_of("| Item | Price |\n| --- | --- |\n| Tea | 3 |\n", 50), "Tea  3");
     }
 
     #[test]

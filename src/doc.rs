@@ -28,11 +28,24 @@ pub enum Kind {
     Checklist(bool),
     /// A block quote (a bar down the left).
     Quote,
+    /// A table cell. A table is a run of cells, row by row; every cell says
+    /// how many columns its table has and whether its first row and first
+    /// column are headers. A cell's text may hold line breaks.
+    Cell { cols: u16, header_row: bool, header_col: bool },
 }
 
 impl Kind {
     pub fn is_list(self) -> bool {
         matches!(self, Kind::Bulleted | Kind::Dashed | Kind::Numbered | Kind::Checklist(_))
+    }
+
+    pub fn is_cell(self) -> bool {
+        matches!(self, Kind::Cell { .. })
+    }
+
+    /// A table cell of an Apple Notes-style table (no headers).
+    pub fn cell(cols: usize) -> Kind {
+        Kind::Cell { cols: cols as u16, header_row: false, header_col: false }
     }
 
     /// Whether `self` and `other` are the same style, ignoring whether a
@@ -234,8 +247,163 @@ impl Doc {
         if blocks.is_empty() {
             Doc::default()
         } else {
-            Doc { blocks }
+            let mut d = Doc { blocks };
+            // There's always a paragraph after a table to go on writing in
+            // (as in Apple Notes); the Markdown doesn't keep it if empty.
+            if d.blocks.last().is_some_and(|b| b.kind.is_cell()) {
+                d.blocks.push(Block::default());
+            }
+            d
         }
+    }
+
+    // ---- Tables ---------------------------------------------------------
+
+    /// The table a block is a cell of: its blocks and its number of columns.
+    pub fn table_of(&self, block: usize) -> Option<(std::ops::Range<usize>, usize)> {
+        let Kind::Cell { cols, .. } = self.blocks.get(block)?.kind else { return None };
+        let mut a = block;
+        while a > 0 && self.blocks[a - 1].kind.is_cell() {
+            a -= 1;
+        }
+        let mut b = block + 1;
+        while b < self.blocks.len() && self.blocks[b].kind.is_cell() {
+            b += 1;
+        }
+        Some((a..b, (cols as usize).max(1)))
+    }
+
+    /// A cell's row and column.
+    pub fn cell_at(&self, block: usize) -> Option<(usize, usize)> {
+        let (r, cols) = self.table_of(block)?;
+        let i = block - r.start;
+        Some((i / cols, i % cols))
+    }
+
+    fn set_table_kind(&mut self, range: std::ops::Range<usize>, kind: Kind) {
+        for b in &mut self.blocks[range] {
+            b.kind = kind;
+        }
+    }
+
+    /// Inserts an empty table at `p` (splitting its paragraph, or in place of
+    /// an empty one), with a paragraph after it. Returns its first cell.
+    pub fn insert_table(&mut self, p: Pos, rows: usize, cols: usize) -> Pos {
+        if self.blocks[p.block].kind.is_cell() || rows == 0 || cols == 0 {
+            return p;
+        }
+        let len = self.blocks[p.block].len();
+        let at = if self.blocks[p.block].is_empty() {
+            self.blocks.remove(p.block);
+            p.block
+        } else if p.offset == 0 {
+            p.block
+        } else if p.offset == len {
+            p.block + 1
+        } else {
+            let rest = self.blocks[p.block].slice(p.offset, len);
+            self.blocks[p.block].remove(p.offset, len);
+            self.blocks.insert(p.block + 1, rest);
+            p.block + 1
+        };
+        let n = rows * cols;
+        self.blocks.splice(at..at, (0..n).map(|_| Block::new(Kind::cell(cols), "")));
+        if self.blocks.get(at + n).map_or(true, |b| b.kind.is_cell()) {
+            self.blocks.insert(at + n, Block::default());
+        }
+        Pos::new(at, 0)
+    }
+
+    /// Adds a row above or below the cell's. Returns the new row's cell in
+    /// the same column.
+    pub fn add_row(&mut self, block: usize, below: bool) -> Pos {
+        let Some((r, cols)) = self.table_of(block) else { return Pos::new(block, 0) };
+        let (row, col) = ((block - r.start) / cols, (block - r.start) % cols);
+        let kind = self.blocks[block].kind;
+        let at = r.start + (row + below as usize) * cols;
+        self.blocks.splice(at..at, (0..cols).map(|_| Block::new(kind, "")));
+        Pos::new(at + col, 0)
+    }
+
+    /// Adds a column before or after the cell's. Returns the new column's
+    /// cell in the same row.
+    pub fn add_column(&mut self, block: usize, after: bool) -> Pos {
+        let Some((r, cols)) = self.table_of(block) else { return Pos::new(block, 0) };
+        let Kind::Cell { header_row, header_col, .. } = self.blocks[block].kind else { return Pos::new(block, 0) };
+        let (row, col) = ((block - r.start) / cols, (block - r.start) % cols);
+        let new_col = col + after as usize;
+        let rows = r.len() / cols;
+        let kind = Kind::Cell { cols: cols as u16 + 1, header_row, header_col };
+        for rw in (0..rows).rev() {
+            self.blocks.insert(r.start + rw * cols + new_col, Block::new(kind, ""));
+        }
+        self.set_table_kind(r.start..r.start + rows * (cols + 1), kind);
+        Pos::new(r.start + row * (cols + 1) + new_col, 0)
+    }
+
+    /// Deletes the cell's row (the table, if it's the only one). Returns
+    /// where the caret goes.
+    pub fn delete_row(&mut self, block: usize) -> Pos {
+        let Some((r, cols)) = self.table_of(block) else { return Pos::new(block, 0) };
+        let rows = r.len() / cols;
+        if rows <= 1 {
+            return self.delete_table(block);
+        }
+        let (row, col) = ((block - r.start) / cols, (block - r.start) % cols);
+        let at = r.start + row * cols;
+        self.blocks.drain(at..at + cols);
+        Pos::new(r.start + row.min(rows - 2) * cols + col, 0)
+    }
+
+    /// Deletes the cell's column (the table, if it's the only one).
+    pub fn delete_column(&mut self, block: usize) -> Pos {
+        let Some((r, cols)) = self.table_of(block) else { return Pos::new(block, 0) };
+        if cols <= 1 {
+            return self.delete_table(block);
+        }
+        let Kind::Cell { header_row, header_col, .. } = self.blocks[block].kind else { return Pos::new(block, 0) };
+        let (row, col) = ((block - r.start) / cols, (block - r.start) % cols);
+        let rows = r.len() / cols;
+        for rw in (0..rows).rev() {
+            self.blocks.remove(r.start + rw * cols + col);
+        }
+        self.set_table_kind(r.start..r.start + rows * (cols - 1), Kind::Cell { cols: cols as u16 - 1, header_row, header_col });
+        Pos::new(r.start + row * (cols - 1) + col.min(cols - 2), 0)
+    }
+
+    /// Deletes the whole table. Returns the paragraph after it.
+    pub fn delete_table(&mut self, block: usize) -> Pos {
+        let Some((r, _)) = self.table_of(block) else { return Pos::new(block, 0) };
+        let at = r.start;
+        self.blocks.drain(r);
+        if self.blocks.is_empty() {
+            self.blocks.push(Block::default());
+        }
+        // Two tables that now touch stay apart.
+        if at > 0 && at < self.blocks.len() && self.blocks[at - 1].kind.is_cell() && self.blocks[at].kind.is_cell() {
+            self.blocks.insert(at, Block::default());
+        }
+        let at = at.min(self.blocks.len() - 1);
+        Pos::new(at, 0)
+    }
+
+    /// Turns the header row or column on or off for the cell's table.
+    pub fn toggle_header(&mut self, block: usize, column: bool) {
+        let Some((r, _)) = self.table_of(block) else { return };
+        let Kind::Cell { cols, header_row, header_col } = self.blocks[block].kind else { return };
+        let kind = if column {
+            Kind::Cell { cols, header_row, header_col: !header_col }
+        } else {
+            Kind::Cell { cols, header_row: !header_row, header_col }
+        };
+        self.set_table_kind(r, kind);
+    }
+
+    /// The cell after (`dir` 1) or before (-1) a cell, row by row.
+    pub fn next_cell(&self, block: usize, dir: i32) -> Option<usize> {
+        let (r, _) = self.table_of(block)?;
+        let i = block as i64 + dir as i64;
+        (i >= r.start as i64 && i < r.end as i64).then_some(i as usize)
     }
 
     pub fn end(&self) -> Pos {
@@ -292,6 +460,8 @@ impl Doc {
         }
         if start.block == end.block {
             self.blocks[start.block].remove(start.offset, end.offset);
+        } else if (start.block..=end.block).any(|i| self.blocks[i].kind.is_cell()) {
+            self.delete_around_cells(start, end);
         } else {
             let tail = {
                 let last = &self.blocks[end.block];
@@ -306,9 +476,45 @@ impl Doc {
         start
     }
 
+    /// A deletion touching table cells: cells are emptied, never removed or
+    /// joined to anything (the grid stays), unless their whole table is
+    /// inside the range; other paragraphs inside go; the ends join only if
+    /// neither is a cell and nothing is left between them.
+    fn delete_around_cells(&mut self, start: Pos, end: Pos) {
+        let (first, last) = (start.block, end.block);
+        self.blocks[last].remove(0, end.offset);
+        let n = self.blocks[first].len();
+        self.blocks[first].remove(start.offset, n);
+        let (mut kept, mut removed) = (0, 0);
+        for i in (first + 1..last).rev() {
+            // Where the range's last paragraph is now.
+            let last_now = last - removed;
+            let whole_table = self.table_of(i).is_some_and(|(r, _)| r.start > first && r.end <= last_now);
+            if self.blocks[i].kind.is_cell() && !whole_table {
+                let n = self.blocks[i].len();
+                self.blocks[i].remove(0, n);
+                kept += 1;
+            } else {
+                self.blocks.remove(i);
+                removed += 1;
+            }
+        }
+        let last_now = first + 1 + kept;
+        if kept == 0 && !self.blocks[first].kind.is_cell() && !self.blocks[last_now].kind.is_cell() {
+            let tail = self.blocks.remove(last_now);
+            self.blocks[first].append(tail);
+        }
+    }
+
     /// Inserts text (which may hold newlines: new paragraphs of the same
-    /// kind) at `p` in `style`. Returns the position after it.
+    /// kind; line breaks in a table cell) at `p` in `style`. Returns the
+    /// position after it.
     pub fn insert(&mut self, p: Pos, text: &str, style: &Style) -> Pos {
+        if self.blocks[p.block].kind.is_cell() {
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            self.blocks[p.block].insert(p.offset, &text, style);
+            return Pos::new(p.block, p.offset + text.chars().count());
+        }
         let mut p = p;
         for (i, line) in text.split('\n').enumerate() {
             if i > 0 {
@@ -325,6 +531,42 @@ impl Doc {
     /// goes into the paragraph at `p`; the following ones keep their own
     /// style. Returns the position after the inserted text.
     pub fn insert_blocks(&mut self, p: Pos, blocks: Vec<Block>) -> Pos {
+        // Into a cell: the pasted paragraphs as lines of it.
+        if self.blocks[p.block].kind.is_cell() {
+            let mut at = p.offset;
+            for (i, b) in blocks.into_iter().enumerate() {
+                if i > 0 {
+                    self.blocks[p.block].insert(at, "\n", &Style::default());
+                    at += 1;
+                }
+                let n = b.len();
+                let cell = &mut self.blocks[p.block];
+                let (bi, tail) = (cell.byte(at), cell.slice(at, cell.len()));
+                cell.text.truncate(bi);
+                cell.styles.truncate(at);
+                cell.append(b);
+                cell.append(tail);
+                at += n;
+            }
+            return Pos::new(p.block, at);
+        }
+        // A pasted table goes in whole, between the two halves of the
+        // paragraph at `p`.
+        if blocks.iter().any(|b| b.kind.is_cell()) {
+            let target = &mut self.blocks[p.block];
+            let tail = target.slice(p.offset, target.len());
+            let n = target.len();
+            target.remove(p.offset, n);
+            let count = blocks.len();
+            let at = p.block + 1;
+            self.blocks.splice(at..at, blocks);
+            let last = at + count - 1;
+            let end = Pos::new(last, self.blocks[last].len());
+            if self.blocks[last].kind.is_cell() || !tail.is_empty() {
+                self.blocks.insert(last + 1, Block { kind: if tail.kind.is_cell() { Kind::Body } else { tail.kind }, ..tail });
+            }
+            return end;
+        }
         let mut blocks = blocks.into_iter();
         let Some(first) = blocks.next() else { return p };
         let rest: Vec<Block> = blocks.collect();
@@ -356,6 +598,12 @@ impl Doc {
     /// list or quote (an unchecked item after a checklist item); after a
     /// heading it's body text. Returns the start of the new paragraph.
     pub fn split(&mut self, p: Pos) -> Pos {
+        // Return in a table cell: a line break in it (as in Apple Notes).
+        if self.blocks[p.block].kind.is_cell() {
+            let style = self.style_at(p);
+            self.blocks[p.block].insert(p.offset, "\n", &style);
+            return Pos::new(p.block, p.offset + 1);
+        }
         let b = &mut self.blocks[p.block];
         let mut rest = b.slice(p.offset, b.len());
         let n = b.len();
@@ -395,6 +643,20 @@ impl Doc {
     /// level, a list item or quote becomes body text, and body text joins the
     /// paragraph above. Returns the new caret.
     pub fn backspace_at_start(&mut self, block: usize) -> Pos {
+        // At the start of a cell: nothing to join it to.
+        if self.blocks[block].kind.is_cell() {
+            return Pos::new(block, 0);
+        }
+        // Right after a table: never joined into its last cell. An empty
+        // paragraph goes (unless it's the last one), else the caret moves
+        // into the table.
+        if block > 0 && self.blocks[block - 1].kind.is_cell() && self.blocks[block].indent == 0 && !self.blocks[block].kind.is_list() {
+            let end = Pos::new(block - 1, self.blocks[block - 1].len());
+            if self.blocks[block].is_empty() && block + 1 < self.blocks.len() && !self.blocks[block + 1].kind.is_cell() {
+                self.blocks.remove(block);
+            }
+            return end;
+        }
         let b = &mut self.blocks[block];
         if b.indent > 0 {
             b.indent -= 1;
@@ -421,9 +683,10 @@ impl Doc {
     /// quote style they all already have turns them back into body text, as
     /// the Aa menu and its shortcuts do.
     pub fn set_kind(&mut self, blocks: std::ops::RangeInclusive<usize>, kind: Kind) {
-        let all = self.blocks[blocks.clone()].iter().all(|b| b.kind.same(kind));
+        // Table cells keep being cells.
+        let all = self.blocks[blocks.clone()].iter().filter(|b| !b.kind.is_cell()).all(|b| b.kind.same(kind));
         let toggle_off = all && (kind.is_list() || kind == Kind::Quote || kind == Kind::Monospaced);
-        for b in &mut self.blocks[blocks] {
+        for b in self.blocks[blocks].iter_mut().filter(|b| !b.kind.is_cell()) {
             if toggle_off {
                 b.kind = Kind::Body;
                 b.indent = 0;
@@ -492,6 +755,11 @@ impl Doc {
     /// whether they moved.
     pub fn move_blocks(&mut self, blocks: std::ops::RangeInclusive<usize>, delta: i32) -> bool {
         let (a, b) = (*blocks.start(), *blocks.end());
+        // Tables aren't moved, nor paragraphs into or past them.
+        let touches_cell = |i: usize| self.blocks.get(i).is_some_and(|x| x.kind.is_cell());
+        if (a..=b).any(touches_cell) || (delta < 0 && a > 0 && touches_cell(a - 1)) || (delta > 0 && touches_cell(b + 1)) {
+            return false;
+        }
         if delta < 0 && a > 0 {
             let above = self.blocks.remove(a - 1);
             self.blocks.insert(b, above);
@@ -839,5 +1107,74 @@ mod tests {
         assert_eq!(tags_in("#Work notes about #home-office and #1 or a#b (#x)"), vec!["work", "home-office", "x"]);
         let d = doc(&[(Kind::Body, "#a #b"), (Kind::Monospaced, "#code"), (Kind::Body, "#A")]);
         assert_eq!(d.tags(), vec!["a", "b"]);
+    }
+
+    fn grid(d: &Doc) -> Vec<Vec<String>> {
+        let (r, cols) = d.blocks.iter().position(|b| b.kind.is_cell()).and_then(|i| d.table_of(i)).unwrap();
+        d.blocks[r].chunks(cols).map(|row| row.iter().map(|b| b.text.clone()).collect()).collect()
+    }
+
+    #[test]
+    fn inserting_a_table_and_editing_its_rows_and_columns() {
+        let mut d = doc(&[(Kind::Body, "Before"), (Kind::Body, "")]);
+        let p = d.insert_table(Pos::new(1, 0), 2, 2);
+        // In place of the empty paragraph, with one after it to go on in.
+        assert_eq!(p, Pos::new(1, 0));
+        assert_eq!(d.blocks.len(), 1 + 4 + 1);
+        assert_eq!(d.cell_at(4), Some((1, 1)));
+        let p = d.insert(p, "a", &Style::default());
+        let p = d.insert(Pos::new(p.block + 1, 0), "b", &Style::default());
+        let _ = d.insert(Pos::new(p.block + 2, 0), "d", &Style::default());
+        assert_eq!(grid(&d), [["a", "b"], ["", "d"]]);
+        let p = d.add_row(2, true);
+        assert_eq!(p, Pos::new(4, 0));
+        assert_eq!(grid(&d), [["a", "b"], ["", ""], ["", "d"]]);
+        let p = d.add_column(1, false);
+        assert_eq!(p, Pos::new(1, 0));
+        assert_eq!(grid(&d), [["", "a", "b"], ["", "", ""], ["", "", "d"]]);
+        d.delete_column(1);
+        d.delete_row(4);
+        assert_eq!(grid(&d), [["a", "b"], ["", "d"]]);
+        let p = d.delete_table(2);
+        assert_eq!(texts(&d), [(Kind::Body, "Before".into()), (Kind::Body, String::new())]);
+        assert_eq!(p, Pos::new(1, 0));
+    }
+
+    #[test]
+    fn typing_in_cells_never_breaks_the_grid() {
+        let mut d = doc(&[(Kind::Body, "Intro"), (Kind::Body, "")]);
+        d.insert_table(Pos::new(1, 0), 2, 2);
+        // Return is a line break in the cell; pasted lines too.
+        let p = d.enter(Pos::new(1, 0));
+        assert_eq!((p, d.blocks[1].text.as_str()), (Pos::new(1, 1), "\n"));
+        d.insert(Pos::new(2, 0), "x\ny", &Style::default());
+        assert_eq!(d.blocks[2].text, "x\ny");
+        // Backspace at a cell's start, and Delete at the end of the
+        // paragraph before the table, join nothing.
+        assert_eq!(d.backspace_at_start(3), Pos::new(3, 0));
+        d.delete(Pos::new(0, 5), Pos::new(1, 0));
+        assert_eq!(grid(&d), [["\n", "x\ny"], ["", ""]]);
+        // A selection from the intro into the table empties the cells it
+        // covers but keeps them.
+        d.delete(Pos::new(0, 2), Pos::new(2, 1));
+        assert_eq!(d.blocks[0].text, "In");
+        assert_eq!(grid(&d), [["", "\ny"], ["", ""]]);
+        // Selecting over the whole table removes it.
+        let last = d.blocks.len() - 1;
+        d.delete(Pos::new(0, 2), Pos::new(last, 0));
+        assert_eq!(texts(&d), [(Kind::Body, "In".into())]);
+        // Paragraph styles and moves leave cells alone.
+        let mut d = doc(&[(Kind::Body, "")]);
+        d.insert_table(Pos::new(0, 0), 1, 2);
+        d.set_kind(0..=2, Kind::Bulleted);
+        assert!(d.blocks[0].kind.is_cell() && d.blocks[1].kind.is_cell());
+        assert_eq!(d.blocks[2].kind, Kind::Bulleted);
+        assert!(!d.move_blocks(2..=2, -1));
+        // Backspace after a table: a bullet goes first, then the caret
+        // moves into the last cell (nothing is joined into it).
+        assert_eq!(d.backspace_at_start(2), Pos::new(2, 0));
+        assert_eq!(d.blocks[2].kind, Kind::Body);
+        assert_eq!(d.backspace_at_start(2), Pos::new(1, 0));
+        assert_eq!(d.blocks.len(), 3);
     }
 }
