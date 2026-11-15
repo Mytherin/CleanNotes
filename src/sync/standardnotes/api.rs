@@ -73,9 +73,10 @@ fn error_of(v: &Value) -> Option<&Value> {
 /// `X-SNJS-Version` the official clients send).
 pub const SNJS_VERSION: &str = "2.212.11";
 
-/// `X-Application-Version`: `<Environment>-<app version>`.
+/// `X-Application-Version`: `<Environment>-<app version>`, in the format of
+/// the official clients, with this app's own version.
 pub fn application_version() -> String {
-    format!("Desktop-cleannotes-{}", env!("CARGO_PKG_VERSION"))
+    format!("Desktop-{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// A server's answer, as any transport gets it.
