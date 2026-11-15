@@ -313,8 +313,13 @@ fn recently_deleted_is_the_trash_and_deleting_for_good_deletes() {
     server.state().edit(&rid, |c| c["trashed"] = json!(true));
     let r = b.pull().unwrap().notes.remove(0);
     assert_eq!(r.data.deleted, Some(r.data.modified));
-    b.delete_note(&rid).unwrap();
-    b.delete_note(&rid).unwrap();
+    // A delete based on an older version is refused: the edit wins.
+    let stale = r.revision.clone();
+    server.state().edit(&rid, |c| c["text"] = json!("edited elsewhere"));
+    let r = b.pull().unwrap().notes.remove(0);
+    assert!(b.delete_note(&rid, Some(&stale)).unwrap_err().is::<Conflict>());
+    b.delete_note(&rid, Some(&r.revision)).unwrap();
+    b.delete_note(&rid, None).unwrap();
     assert_eq!(server.state().items[&rid]["deleted"], true);
     assert!(b.pull().unwrap().notes.is_empty());
 }

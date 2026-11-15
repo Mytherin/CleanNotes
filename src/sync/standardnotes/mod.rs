@@ -778,9 +778,18 @@ impl Backend for StandardNotesBackend {
         Ok((id.to_owned(), self.revision(&tags, id)))
     }
 
-    fn delete_note(&mut self, remote_id: &str) -> Result<()> {
+    fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
         if !self.loaded {
             self.catch_up()?;
+        }
+        // Edited elsewhere since: an edit beats a delete.
+        if let Some(base) = base_revision {
+            if self.items.contains_key(remote_id) {
+                let tags = self.tags();
+                if self.revision(&tags, remote_id) != base {
+                    return Err(Conflict.into());
+                }
+            }
         }
         self.delete_item(remote_id)
     }
