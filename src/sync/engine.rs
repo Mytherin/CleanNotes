@@ -280,6 +280,18 @@ fn reconcile(
     }
 
     // ---- Notes ----------------------------------------------------------
+    // Where a note goes locally: a folder this sync is deleting isn't made
+    // again for it; the note goes where the backend will move it, the
+    // deleted folder's parent (or the default folder).
+    let deleted_paths: Vec<&Vec<String>> =
+        remote.folders.iter().filter(|f| deleting.contains(f.remote_id.as_str())).map(|f| &f.path).collect();
+    let place = |path: &[String]| -> Vec<String> {
+        match deleted_paths.iter().filter(|d| !d.is_empty() && path.starts_with(d)).min_by_key(|d| d.len()) {
+            Some(d) if d.len() > 1 => d[..d.len() - 1].to_vec(),
+            Some(_) => vec![crate::model::DEFAULT_FOLDER.to_owned()],
+            None => path.to_vec(),
+        }
+    };
     let by_remote: HashMap<&str, &RemoteNote> = remote.notes.iter().map(|n| (n.remote_id.as_str(), n)).collect();
     let mut by_id: HashMap<&str, &RemoteNote> = HashMap::new();
     for n in &remote.notes {
@@ -319,23 +331,24 @@ fn reconcile(
         if w.notes[i].sync.revision.as_deref() == Some(&r.revision) {
             continue;
         }
-        let folder = w.ensure_folder_at(account, &r.data.folder);
         if !w.notes[i].sync.dirty {
+            let folder = w.ensure_folder_at(account, &place(&r.data.folder));
             take_remote(&mut w.notes[i], r, folder);
             continue;
         }
-        // Changed on both sides.
+        // Changed on both sides. (Only the folder used is made, so a folder
+        // being deleted isn't brought back.)
         let base = w.notes[i].sync.base.clone().unwrap_or_else(|| r.data.clone());
         let ours_path = w.note_data(&w.notes[i]).folder;
         let path = merge_value(&base.folder, &ours_path, &r.data.folder);
-        let merged_folder = w.ensure_folder_at(account, &path);
+        let merged_folder = w.ensure_folder_at(account, &place(&path));
         let n = &mut w.notes[i];
-        n.folder = merged_folder;
+        n.folder = merged_folder.clone();
         match merge_text(&base.body, &n.body, &r.data.body) {
             Ok(body) => n.body = body,
             Err(()) => {
                 // Keep both: theirs becomes a new note next to ours.
-                let mut copy = Note::new(account, &folder, &r.data.body);
+                let mut copy = Note::new(account, &merged_folder, &r.data.body);
                 copy.created = r.data.created;
                 copy.modified = r.data.modified;
                 notices.push(format!(
@@ -360,14 +373,14 @@ fn reconcile(
         if w.notes.iter().any(|n| n.id == r.data.id) {
             // Two backend notes claim the same id (a create retried after a
             // lost reply): keep the second under a new id.
-            let folder = w.ensure_folder_at(account, &r.data.folder);
+            let folder = w.ensure_folder_at(account, &place(&r.data.folder));
             let mut n = blank(account, &folder);
             take_remote(&mut n, r, folder);
             n.id = new_id();
             w.notes.push(n);
             continue;
         }
-        let folder = w.ensure_folder_at(account, &r.data.folder);
+        let folder = w.ensure_folder_at(account, &place(&r.data.folder));
         let mut n = blank(account, &folder);
         take_remote(&mut n, r, folder);
         n.id = r.data.id.clone();

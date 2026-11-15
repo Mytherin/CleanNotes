@@ -246,6 +246,37 @@ fn notes_left_in_a_deleted_folder_end_up_in_the_same_place_everywhere() {
 }
 
 #[test]
+fn a_folder_deleted_here_stays_deleted_when_the_other_device_added_to_it() {
+    let (_d, mut laptop, mut phone) = pair();
+    let work = laptop.store.ensure_folder_at(ACC, &["Work".into()]);
+    laptop.sync();
+    phone.sync();
+    // The laptop deletes Work while offline…
+    let f = laptop.store.folders.iter().position(|f| f.id == work).unwrap();
+    let f = laptop.store.folders.remove(f);
+    laptop.store.tombstones.push(Tombstone {
+        account: ACC.into(),
+        note: false,
+        remote_id: f.sync.remote_id.unwrap(),
+        path: vec!["Work".into()],
+    });
+    // …while the phone adds a note to it.
+    let pwork = phone.store.folder_at(ACC, &["Work".into()]).unwrap().id.clone();
+    let n = Note::new(ACC, &pwork, "added on the phone");
+    let id = n.id.clone();
+    phone.store.notes.push(n);
+    phone.sync();
+    laptop.sync();
+    laptop.sync();
+    phone.sync();
+    let work_path = vec!["Work".to_owned()];
+    for d in [&laptop, &phone] {
+        assert!(d.store.folder_at(ACC, &work_path).is_none(), "Work came back");
+        assert!(d.store.note(&id).is_some(), "the phone's note is kept");
+    }
+}
+
+#[test]
 fn a_note_put_back_after_a_delete_gets_a_new_revision() {
     let (_d, mut laptop, _phone) = pair();
     let id = laptop.add("v1");
