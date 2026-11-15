@@ -680,7 +680,15 @@ impl Backend for StandardNotesBackend {
         }
         snap.folders.sort_by(|a, b| a.path.cmp(&b.path));
         for id in self.uuids_of(NOTE) {
-            let Some(content) = self.content_of(&id) else { continue };
+            let Some(content) = self.content_of(&id) else {
+                // Shared-vault notes were never ours; any other note that
+                // can't be decrypted (yet) is left alone, not deleted here.
+                let it = &self.items[&id];
+                if !has(it, "key_system_identifier") && !has(it, "shared_vault_uuid") {
+                    snap.unreadable.push(id.clone());
+                }
+                continue;
+            };
             let it = &self.items[&id];
             let read = items::read_note(&content);
             let updated = from_micros(ts(it)).unwrap_or_else(Utc::now);

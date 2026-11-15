@@ -87,9 +87,24 @@ pub fn now_ms() -> i64 {
 
 fn read(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status().as_u16();
-    let text = resp.text().unwrap_or_default();
-    let body: Value = if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::String(text)) };
-    if (200..300).contains(&status) && error_of(&body).is_none() {
+    let ok = (200..300).contains(&status);
+    let text = match resp.text() {
+        Ok(t) => t,
+        // A reply cut off half way mustn't pass for an empty one.
+        Err(e) if ok => return Err(anyhow::Error::new(e).context("reading the Standard Notes server's reply")),
+        Err(_) => String::new(),
+    };
+    let body: Value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(v) => v,
+            // A captive portal or proxy answering with a web page.
+            Err(_) if ok => anyhow::bail!("the Standard Notes server's reply isn't JSON (a proxy or captive portal in the way?)"),
+            Err(_) => Value::String(text),
+        }
+    };
+    if ok && error_of(&body).is_none() {
         return Ok(body);
     }
     let err = error_of(&body);
