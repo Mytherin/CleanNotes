@@ -8,6 +8,7 @@ use std::sync::Arc;
 use eframe::egui::{self, text::LayoutJob, Align2, Color32, FontId, Galley, Pos2, Rect, Stroke, TextFormat, Vec2};
 
 use crate::doc::{Block, Kind};
+pub use crate::doc::{auto_links, font_size as size, tag_ranges};
 use crate::theme::{self, Palette};
 
 /// Width of a list marker's column, and of one indent level.
@@ -27,16 +28,6 @@ pub struct Laid {
     pub checkbox: Option<Rect>,
 }
 
-/// Font size of a paragraph style, for a body size.
-pub fn size(kind: Kind, body: f32) -> f32 {
-    match kind {
-        Kind::Title => (body * 1.6).round(),
-        Kind::Heading => (body * 1.33).round(),
-        Kind::Subheading => (body * 1.13).round(),
-        Kind::Monospaced => body * 0.93,
-        _ => body,
-    }
-}
 
 /// Space above a paragraph.
 pub fn space_before(kind: Kind, prev: Option<Kind>, body: f32) -> f32 {
@@ -72,59 +63,6 @@ pub struct Marks {
     pub current: Option<Range<usize>>,
 }
 
-/// Plain URLs in text (Apple Notes makes them links), as char ranges.
-pub fn auto_links(text: &str) -> Vec<(Range<usize>, String)> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let at_word = i == 0 || !chars[i - 1].is_alphanumeric();
-        let rest: String = chars[i..chars.len().min(i + 8)].iter().collect::<String>().to_lowercase();
-        let scheme = ["https://", "http://", "www."].into_iter().find(|s| rest.starts_with(s));
-        if let (true, Some(s)) = (at_word, scheme) {
-            let mut j = i + s.chars().count();
-            while j < chars.len() && !chars[j].is_whitespace() && !matches!(chars[j], '<' | '>' | '"') {
-                j += 1;
-            }
-            // Trailing punctuation isn't part of the link.
-            while j > i && matches!(chars[j - 1], '.' | ',' | ';' | ':' | '!' | '?' | ')' | '\'') {
-                j -= 1;
-            }
-            if j > i + s.chars().count() {
-                let url: String = chars[i..j].iter().collect();
-                let url = if s == "www." { format!("https://{url}") } else { url };
-                out.push((i..j, url));
-            }
-            i = j.max(i + 1);
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
-
-/// Hashtag ranges in a paragraph (chars), drawn in the accent color.
-fn tag_ranges(text: &str) -> Vec<Range<usize>> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '#' && (i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == '(') {
-            let mut j = i + 1;
-            while j < chars.len() && (chars[j].is_alphanumeric() || matches!(chars[j], '-' | '_' | '/')) {
-                j += 1;
-            }
-            let tag: String = chars[i + 1..j].iter().collect();
-            if !tag.is_empty() && tag.chars().any(|c| !c.is_ascii_digit()) {
-                out.push(i..j);
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
 
 /// The galley text and formats for a paragraph.
 pub fn job(b: &Block, body: f32, p: &Palette, wrap: f32, marks: &Marks) -> LayoutJob {

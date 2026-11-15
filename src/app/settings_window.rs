@@ -572,10 +572,7 @@ impl App {
     /// The account to save after signing in: the existing one (signing in
     /// again keeps its sync state) or a new one.
     fn account_for(&self, id: &str, name: String, backend: BackendConfig) -> Account {
-        match self.lib.store.account(id) {
-            Some(a) => Account { name, backend, enabled: true, ..a.clone() },
-            None => Account { id: id.to_owned(), name, backend, enabled: true, cursor: None, last_sync: None },
-        }
+        self.lib.account_for(id, name, backend)
     }
 
     fn account_sheet(&mut self, ctx: &egui::Context, p: &Palette) {

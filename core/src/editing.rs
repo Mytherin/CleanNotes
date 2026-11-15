@@ -393,6 +393,20 @@ impl Editing {
         self.insert_text(&text);
     }
 
+    /// Replaces text as it is, with none of typing's list handling: for
+    /// bringing the document back in line with a system text view that
+    /// changed its text by itself.
+    pub fn replace_raw(&mut self, start: Pos, end: Pos, text: &str) {
+        let (start, end) = (self.doc.clamp(start), self.doc.clamp(end));
+        let (start, end) = if end < start { (end, start) } else { (start, end) };
+        self.checkpoint(Some(Group::Typing));
+        self.sel = Selection { anchor: start, caret: end };
+        let style = self.typing_style();
+        let at = self.delete_selection();
+        let end = self.doc.insert(at, &text.replace("\r\n", "\n"), &style);
+        self.sel = Selection::caret(end);
+    }
+
     pub fn command(&mut self, cmd: Command) {
         let blocks = self.sel.blocks();
         match cmd {

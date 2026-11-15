@@ -788,6 +788,15 @@ impl Library {
         self.save(true);
     }
 
+    /// The account to save after signing in: the existing one (signing in
+    /// again keeps its sync state) or a new one.
+    pub fn account_for(&self, id: &str, name: String, backend: crate::sync::BackendConfig) -> Account {
+        match self.store.account(id) {
+            Some(a) => Account { name, backend, enabled: true, ..a.clone() },
+            None => Account { id: id.to_owned(), name, backend, enabled: true, cursor: None, last_sync: None },
+        }
+    }
+
     /// Adds a signed-in account (or replaces it, signed in again), and
     /// starts its first sync.
     pub fn add_account(&mut self, account: Account, secret: Option<String>) {
