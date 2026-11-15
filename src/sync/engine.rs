@@ -123,7 +123,7 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
         snap.tombstones.iter().filter(|t| !t.note).map(|t| t.remote_id.as_str()).collect();
 
     let mut finished = false;
-    for _ in 0..MAX_ROUNDS {
+    for round in 0..MAX_ROUNDS {
         let cursor_before = backend.cursor()?;
         let remote = backend.pull()?;
         reconcile(&mut w, account, remote, &deleting, now, &mut out.notices);
@@ -133,6 +133,13 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
                 // covered: one read now could include another device's
                 // change made since, which would then never be pulled.
                 out.cursor = cursor_before;
+                finished = true;
+                break;
+            }
+            // Everything uploaded, but no round left to confirm it: done,
+            // with no cursor, so the next sync pulls everything.
+            Ok((false, true)) if round + 1 == MAX_ROUNDS => {
+                out.cursor = None;
                 finished = true;
                 break;
             }
@@ -318,6 +325,14 @@ fn reconcile(
         let Some(r) = found else {
             if note.sync.remote_id.as_deref().is_some_and(|r| unreadable.contains(r)) {
                 // Still there, just not readable right now: keep ours as is.
+                // Edited here too, ours can't be saved over what we can't
+                // read (or merged with it): it becomes a note of its own.
+                if note.sync.dirty {
+                    let n = &mut w.notes[i];
+                    n.sync.remote_id = None;
+                    n.sync.revision = None;
+                    n.sync.base = None;
+                }
                 continue;
             }
             if note.sync.remote_id.is_some() {
@@ -340,8 +355,12 @@ fn reconcile(
             continue;
         }
         if !w.notes[i].sync.dirty {
-            let folder = w.ensure_folder_at(account, &place(&r.data.folder));
+            let path = place(&r.data.folder);
+            let folder = w.ensure_folder_at(account, &path);
             take_remote(&mut w.notes[i], r, folder);
+            // Moved out of a folder being deleted: upload the move (before
+            // the delete), as not every backend moves notes up itself.
+            w.notes[i].sync.dirty = path != r.data.folder;
             continue;
         }
         // Changed on both sides. (Only the folder used is made, so a folder
@@ -381,16 +400,20 @@ fn reconcile(
         if w.notes.iter().any(|n| n.id == r.data.id) {
             // Two backend notes claim the same id (a create retried after a
             // lost reply): keep the second under a new id.
-            let folder = w.ensure_folder_at(account, &place(&r.data.folder));
+            let path = place(&r.data.folder);
+            let folder = w.ensure_folder_at(account, &path);
             let mut n = blank(account, &folder);
             take_remote(&mut n, r, folder);
+            n.sync.dirty = path != r.data.folder;
             n.id = new_id();
             w.notes.push(n);
             continue;
         }
-        let folder = w.ensure_folder_at(account, &place(&r.data.folder));
+        let path = place(&r.data.folder);
+        let folder = w.ensure_folder_at(account, &path);
         let mut n = blank(account, &folder);
         take_remote(&mut n, r, folder);
+        n.sync.dirty = path != r.data.folder;
         n.id = r.data.id.clone();
         w.notes.push(n);
     }
@@ -495,6 +518,17 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
     // ---- Notes ----------------------------------------------------------
     let before: HashMap<&str, &Note> = snap.notes.iter().map(|n| (n.id.as_str(), n)).collect();
     let outcome_ids: HashSet<&str> = out.notes.iter().map(|n| n.id.as_str()).collect();
+    // A note deleted for good (or moved to another account) while this
+    // sync uploaded it: its tombstone still has the revision from before,
+    // which would make the delete look like it lost to an edit elsewhere.
+    for o in &out.notes {
+        let (Some(rid), Some(old)) = (&o.sync.remote_id, before.get(o.id.as_str())) else { continue };
+        for t in store.tombstones.iter_mut().filter(|t| t.note && t.account == account && &t.remote_id == rid) {
+            if t.revision == old.sync.revision {
+                t.revision = o.sync.revision.clone();
+            }
+        }
+    }
     let mut notes: Vec<Note> = Vec::new();
     for o in &out.notes {
         let cur = store.notes.iter().find(|n| n.id == o.id);

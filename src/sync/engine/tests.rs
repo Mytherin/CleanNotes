@@ -476,3 +476,24 @@ fn offline_changes_on_both_sides_converge() {
     assert_eq!(laptop.bodies().len(), 10);
     assert_eq!(laptop.bodies(), phone.bodies());
 }
+
+#[test]
+fn deleting_for_good_while_a_sync_uploads_the_note_still_deletes_it() {
+    let (_d, mut laptop, mut phone) = pair();
+    let id = laptop.add("# Bye\n");
+    laptop.sync();
+    phone.sync();
+    // Moved to Recently Deleted, which a sync uploads; meanwhile the user
+    // deletes it for good.
+    laptop.store.note_mut(&id).unwrap().deleted = Some(Utc::now());
+    laptop.store.note_mut(&id).unwrap().touch();
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    let out = sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    laptop.store.purge_note(&id);
+    apply(&mut laptop.store, &snap, out);
+    let notices = laptop.sync();
+    assert!(notices.is_empty(), "not mistaken for an edit elsewhere: {notices:?}");
+    phone.sync();
+    assert!(laptop.bodies().is_empty());
+    assert!(phone.bodies().is_empty());
+}

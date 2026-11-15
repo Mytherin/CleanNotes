@@ -125,7 +125,16 @@ struct Deletion {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// The app, or (if the notes database can't be opened, say because
+    /// another program holds it) a window saying why.
+    pub fn start(cc: &eframe::CreationContext<'_>) -> Box<dyn eframe::App> {
+        match App::new(cc) {
+            Ok(app) => Box::new(app),
+            Err(e) => Box::new(StartupError(format!("{e:#}"))),
+        }
+    }
+
+    fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         theme::install_fonts(&cc.egui_ctx);
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
         // The system's light/dark mode, unless CLEANNOTES_THEME says otherwise.
@@ -135,7 +144,7 @@ impl App {
             _ => {}
         }
         let dir = db::data_dir();
-        let (db, store, settings) = Db::open(&dir, Secrets::Keyring).expect("opening the notes database");
+        let (db, store, settings) = Db::open(&dir, Secrets::Keyring)?;
         let ctx = cc.egui_ctx.clone();
         let worker = Worker::spawn(move || ctx.request_repaint());
         let mut app = App::with(db, store, settings, worker);
@@ -144,7 +153,7 @@ impl App {
         if std::env::var_os("CLEANNOTES_SEED").is_some() && app.store.notes.is_empty() {
             app.seed();
         }
-        app
+        Ok(app)
     }
 
     fn with(db: Db, store: Store, settings: Settings, worker: Worker) -> Self {
@@ -1263,6 +1272,25 @@ pub fn list_time(t: DateTime<Utc>) -> String {
 /// The date at the top of a note: "15 November 2026 at 11:32".
 pub fn note_header_time(t: DateTime<Utc>) -> String {
     t.with_timezone(&Local).format("%-d %B %Y at %H:%M").to_string()
+}
+
+/// Shown instead of the app when the notes database can't be opened. (The
+/// app has no console, so a panic would just mean no window at all.)
+pub struct StartupError(String);
+
+impl eframe::App for StartupError {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.3);
+                ui.heading("Your notes can't be opened right now");
+                ui.add_space(8.0);
+                ui.label("Another program (a backup or sync tool, or CleanNotes itself) may be using them. Close it and start CleanNotes again.");
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(&self.0).weak().small());
+            });
+        });
+    }
 }
 
 impl eframe::App for App {

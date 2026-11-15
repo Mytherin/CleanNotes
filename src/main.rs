@@ -36,5 +36,5 @@ fn main() -> eframe::Result {
             .with_icon(app_icon::icon_data(256)),
         ..Default::default()
     };
-    eframe::run_native("CleanNotes", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))
+    eframe::run_native("CleanNotes", options, Box::new(|cc| Ok(app::App::start(cc))))
 }

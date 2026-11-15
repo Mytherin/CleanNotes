@@ -412,3 +412,52 @@ fn items_that_cant_be_decrypted_are_kept_locally() {
     let bf = laptop.store.note(&b).unwrap().folder.clone();
     assert_eq!(laptop.store.folder_path(&bf), vec!["Work"]);
 }
+
+#[test]
+fn an_unreadable_note_edited_here_is_kept_as_a_copy_and_syncs_go_on() {
+    let server = FakeServer::start(EMAIL, PASSWORD, KDF);
+    let mut laptop = Device::new(&server);
+    let a = laptop.add(&["Notes"], "# A\n");
+    laptop.sync();
+    let rid = laptop.store.note(&a).unwrap().sync.remote_id.clone().unwrap();
+    server.state().scramble_note(&rid);
+    laptop.edit(&a, "# A\nedited here\n");
+    // `sync` asserts it finishes without an error.
+    laptop.sync();
+    laptop.sync();
+    assert_eq!(laptop.store.note(&a).unwrap().body, "# A\nedited here\n");
+    let s = server.state();
+    assert_eq!(s.ciphers.len(), 2, "the unreadable item is left as it is, ours is a new one");
+    assert_eq!(s.ciphers[&rid]["notes"], "7.dW5rbm93bg==");
+}
+
+#[test]
+fn notes_in_a_folder_deleted_elsewhere_survive_on_bitwarden() {
+    let server = FakeServer::start(EMAIL, PASSWORD, KDF);
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    laptop.add(&["Work"], "# In work\n");
+    laptop.sync();
+    phone.sync();
+    // The laptop deletes Work while the phone adds another note to it.
+    let work = laptop.store.folder_at("bw", &["Work".into()]).unwrap().clone();
+    laptop.store.folders.retain(|f| f.id != work.id);
+    laptop.store.tombstones.push(crate::model::Tombstone {
+        account: "bw".into(),
+        note: false,
+        remote_id: work.sync.remote_id.clone().unwrap(),
+        path: vec!["Work".into()],
+        revision: None,
+    });
+    let late = phone.add(&["Work"], "# Added on the phone\n");
+    phone.sync();
+    laptop.sync();
+    phone.sync();
+    laptop.sync();
+    for d in [&laptop, &phone] {
+        let n = d.store.note(&late).expect("the phone's note survives");
+        assert_eq!(d.store.folder_path(&n.folder), vec!["Notes"]);
+        assert!(d.store.folder_at("bw", &["Work".into()]).is_none(), "Work stays deleted");
+    }
+    assert!(server.state().folder_names().iter().all(|f| f != "Notes/Work"));
+}
