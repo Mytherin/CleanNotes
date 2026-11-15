@@ -455,6 +455,10 @@ impl Backend for CloudKitBackend {
                 "recordName": id, "recordType": "Folder", "recordChangeTag": tag,
                 "fields": { "path": { "value": renamed, "type": "STRING_LIST" } } } }));
         }
+        if ops.is_empty() {
+            // Gone from CloudKit already (deleted elsewhere): nothing to do.
+            return Ok(());
+        }
         for r in self.modify(ops)? {
             if let Some(code) = r["serverErrorCode"].as_str() {
                 bail!("couldn't rename a folder: {code}");

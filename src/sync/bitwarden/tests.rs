@@ -221,6 +221,15 @@ fn updates_keep_what_the_app_does_not_own() {
     assert_eq!(c["fields"].as_array().unwrap().len(), 1, "the custom field stays");
     drop(s);
     assert_eq!(b.pull().unwrap().notes[0].data.body, "# Card PIN\nnew text");
+
+    // Saving from a new session, before any pull, keeps them too.
+    let rev = server.state().ciphers[&id]["revisionDate"].as_str().unwrap().to_owned();
+    let mut fresh = backend(&server);
+    data.body = "# Card PIN\nnewer text".into();
+    fresh.save_note(Some(&id), Some(&rev), &data).unwrap();
+    let s = server.state();
+    assert_eq!(s.ciphers[&id]["favorite"], true);
+    assert_eq!(s.ciphers[&id]["fields"].as_array().unwrap().len(), 1, "the custom field stays");
 }
 
 #[test]

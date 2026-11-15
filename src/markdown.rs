@@ -225,13 +225,31 @@ fn close_all(out: &mut String, cur: &mut Style) {
     switch(out, cur, &Style::default());
     if let Some(url) = link {
         out.push_str("](");
+        // As written, unless it has spaces, angle brackets or unbalanced
+        // parentheses: then in CommonMark's `<…>` form, with `\` escapes.
+        // (No percent-encoding, which a URL holding "%20" wouldn't survive.)
+        let mut depth = 0i32;
+        let mut balanced = true;
         for c in url.chars() {
-            match c {
-                ' ' => out.push_str("%20"),
-                '(' => out.push_str("%28"),
-                ')' => out.push_str("%29"),
-                c => out.push(c),
+            depth += match c {
+                '(' => 1,
+                ')' => -1,
+                _ => 0,
+            };
+            balanced &= depth >= 0;
+        }
+        balanced &= depth == 0;
+        if balanced && !url.contains([' ', '<', '>']) && !url.starts_with('<') {
+            out.push_str(&url);
+        } else {
+            out.push('<');
+            for c in url.chars() {
+                if matches!(c, '<' | '>' | '\\') {
+                    out.push('\\');
+                }
+                out.push(c);
             }
+            out.push('>');
         }
         out.push(')');
     }
@@ -531,6 +549,24 @@ fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
     }
     let mut j = close + 2;
     let mut url = String::new();
+    if chars.get(j) == Some(&'<') {
+        // `<…>`: anything but a line break, with `\` escapes.
+        j += 1;
+        loop {
+            match *chars.get(j)? {
+                '>' => break,
+                '\\' if chars.get(j + 1).is_some_and(|c| c.is_ascii_punctuation()) => {
+                    url.push(chars[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                '<' => return None,
+                c => url.push(c),
+            }
+            j += 1;
+        }
+        return (chars.get(j + 1) == Some(&')')).then_some((close, url, j + 2));
+    }
     let mut parens = 0;
     loop {
         match *chars.get(j)? {
@@ -543,7 +579,7 @@ fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
         url.push(chars[j]);
         j += 1;
     }
-    let url = url.replace("%20", " ").replace("%28", "(").replace("%29", ")");
+    // Kept as written: a URL may well hold "%20" itself.
     Some((close, url, j + 1))
 }
 
@@ -657,6 +693,25 @@ mod tests {
         round_trip("**bold** *italic* ***both*** ~~gone~~ <u>under</u> `code` [link](https://x.y/a%20b)\n");
         round_trip("**bold *and italic* inside**\n");
         round_trip("[**bold link** text](https://example.com)\n");
+    }
+
+    #[test]
+    fn link_urls_survive_exactly() {
+        for url in [
+            "https://en.wikipedia.org/wiki/Foo_%28bar%29",
+            "https://x.y/a%20b",
+            "https://en.wikipedia.org/wiki/Foo_(bar)",
+            "file:///C:/My Notes/a b.txt",
+            "https://x.y/unbalanced)(",
+            "https://x.y/<odd>\\path",
+            "",
+        ] {
+            let b = Block::styled(Kind::Body, &[("link", st(|s| s.link = Some(Arc::from(url))))]);
+            doc_round_trip(&Doc::new(vec![b]));
+        }
+        // Spaces are written in the <…> form.
+        let b = Block::styled(Kind::Body, &[("l", st(|s| s.link = Some(Arc::from("a b"))))]);
+        assert_eq!(to_markdown(&Doc::new(vec![b])), "[l](<a b>)\n");
     }
 
     #[test]

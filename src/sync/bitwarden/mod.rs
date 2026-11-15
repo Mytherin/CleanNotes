@@ -521,7 +521,17 @@ impl Backend for BitwardenBackend {
         let folder_id = self.ensure_folder(&self.vault_name(&note.folder))?;
         let v = match remote_id {
             Some(id) => {
-                let existing = self.ciphers.get(id).cloned();
+                // The cipher as it is, so its own key, extra fields and
+                // star survive the update, even if no pull cached it yet.
+                let existing = match self.ciphers.get(id).cloned() {
+                    Some(c) => c,
+                    None => match self.client.send(Http::GET, &format!("/ciphers/{id}"), None) {
+                        Ok(c) => c,
+                        Err(e) if status_of(&e) == Some(404) => return Err(Conflict.into()),
+                        Err(e) => return Err(e),
+                    },
+                };
+                let existing = Some(existing);
                 let mut body = self.cipher_body(note, &folder_id, existing.as_ref())?;
                 if let Some(rev) = base_revision {
                     body["lastKnownRevisionDate"] = json!(rev);
