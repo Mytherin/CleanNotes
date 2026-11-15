@@ -35,27 +35,64 @@ use crate::sync::standardnotes::api::{self, Answer, Transport};
 /// How long a request may take before the sync gives up on it.
 const TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The local page requests are made from.
+/// The local page requests are made from. Answers are kept on the page until
+/// collected: wry drops messages sent from `file://` pages (it can't parse
+/// their address as an `http::Uri`), so the app asks for them instead.
 const PAGE: &str = r#"<!doctype html>
 <meta charset="utf-8">
 <title>CleanNotes</title>
 <script>
+window.__cleannotesAnswers = {};
 // As FetchRequestHandler in standardnotes/app: a POST with the client's
 // headers, cookies included.
 window.__cleannotesFetch = async (id, url, headers, body) => {
+  let answer;
   try {
     const r = await fetch(url, { method: 'POST', headers, body, credentials: 'include' });
     const text = await r.text();
     const h = {};
     r.headers.forEach((v, k) => { h[k] = v; });
-    window.ipc.postMessage(JSON.stringify({ id, status: r.status, headers: h, body: text }));
+    answer = { status: r.status, headers: h, body: text };
   } catch (e) {
-    window.ipc.postMessage(JSON.stringify({ id, error: String((e && e.message) || e) }));
+    answer = { error: String((e && e.message) || e) };
   }
+  window.__cleannotesAnswers[id] = answer;
 };
-window.addEventListener('load', () => window.ipc.postMessage(JSON.stringify({ ready: true })));
+// The answers that came in since last asked, as JSON text.
+window.__cleannotesCollect = () => {
+  const a = window.__cleannotesAnswers;
+  window.__cleannotesAnswers = {};
+  return JSON.stringify(a);
+};
 </script>
 "#;
+
+/// How often the page is asked for answers while requests are out.
+const COLLECT_EVERY: Duration = Duration::from_millis(40);
+
+/// Hands answers collected from the page to the requests waiting for them.
+/// `result` is what the collecting script returned, as JSON: a string
+/// holding a JSON object of answers by request id.
+fn deliver(result: &str, waiting: &Waiting) {
+    let Ok(text) = serde_json::from_str::<String>(result) else { return };
+    let Ok(Value::Object(answers)) = serde_json::from_str::<Value>(&text) else { return };
+    for (id, v) in answers {
+        let Ok(id) = id.parse::<u64>() else { continue };
+        let Some(tx) = waiting.lock().unwrap().remove(&id) else { continue };
+        let reply = match v["error"].as_str() {
+            Some(e) => Err(e.to_owned()),
+            None => Ok(Answer {
+                status: v["status"].as_u64().unwrap_or(0) as u16,
+                headers: v["headers"]
+                    .as_object()
+                    .map(|h| h.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_owned())).collect())
+                    .unwrap_or_default(),
+                body: Ok(v["body"].as_str().unwrap_or("").to_owned()),
+            }),
+        };
+        let _ = tx.send(reply);
+    }
+}
 
 /// The script making one request: the official clients' headers, and every
 /// argument a JSON literal, so nothing in a URL, token or body can break out
@@ -70,6 +107,28 @@ fn fetch_script(id: u64, url: &str, bearer: Option<&str>, body: &str) -> String 
         headers["Authorization"] = json!(format!("Bearer {t}"));
     }
     format!("window.__cleannotesFetch({id}, {}, {headers}, {});", json!(url), json!(body))
+}
+
+/// Notes how requests go, with timings, to `webfetch.log` in the data
+/// folder (started afresh each run). Only paths, statuses and times: never
+/// tokens or contents.
+fn log(line: &str) {
+    use std::io::Write;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let t = START.get_or_init(std::time::Instant::now).elapsed();
+    let path = crate::db::data_dir().join("webfetch.log");
+    let first = !LOGGING.swap(true, Ordering::Relaxed);
+    let file = std::fs::OpenOptions::new().create(true).write(true).append(!first).truncate(first).open(path);
+    if let Ok(mut f) = file {
+        let _ = writeln!(f, "{:>8.3}s  {line}", t.as_secs_f64());
+    }
+}
+
+static LOGGING: AtomicBool = AtomicBool::new(false);
+
+/// The path of a URL, for the log.
+fn path_of(url: &str) -> &str {
+    url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..])).unwrap_or(url)
 }
 
 type Reply = std::result::Result<Answer, String>;
@@ -99,8 +158,16 @@ impl Transport for WebFetch {
         self.waiting.lock().unwrap().insert(id, tx);
         self.jobs.lock().unwrap().send(Job { id, script }).map_err(|_| anyhow!("the app is closing"))?;
         self.ctx.request_repaint();
+        let asked = std::time::Instant::now();
+        log(&format!("request {id}: POST {}", path_of(url)));
         let reply = rx.recv_timeout(TIMEOUT);
         self.waiting.lock().unwrap().remove(&id);
+        let took = asked.elapsed().as_secs_f64();
+        match &reply {
+            Ok(Ok(a)) => log(&format!("request {id}: HTTP {} after {took:.3}s{}", a.status, if api::is_browser_check(a) { " (Cloudflare browser check)" } else { "" })),
+            Ok(Err(e)) => log(&format!("request {id}: failed after {took:.3}s: {e}")),
+            Err(_) => log(&format!("request {id}: no answer after {took:.3}s")),
+        }
         match reply {
             Ok(Ok(answer)) => {
                 if api::is_browser_check(&answer) {
@@ -118,6 +185,8 @@ impl Transport for WebFetch {
 /// The WebView, on the window's thread.
 pub struct WebHost {
     webview: wry::WebView,
+    /// Kept for as long as the WebView.
+    _context: wry::WebContext,
     page_url: String,
     jobs: Receiver<Job>,
     queued: Vec<Job>,
@@ -129,6 +198,9 @@ pub struct WebHost {
     /// Give the keyboard back to the app's window once the page has loaded
     /// (WebView2 takes it when it loads a page).
     give_back_focus: bool,
+    /// When the page was last asked for answers.
+    last_collect: std::time::Instant,
+    ctx: egui::Context,
 }
 
 impl WebHost {
@@ -145,40 +217,36 @@ impl WebHost {
         let waiting: Waiting = Arc::new(Mutex::new(HashMap::new()));
         let ready = Arc::new(AtomicBool::new(false));
         let ctx = cc.egui_ctx.clone();
-        let handler = {
-            let (waiting, ready, ctx) = (waiting.clone(), ready.clone(), ctx.clone());
-            move |req: wry::http::Request<String>| {
-                let Ok(v) = serde_json::from_str::<Value>(req.body()) else { return };
-                if v["ready"] == true {
-                    ready.store(true, Ordering::Relaxed);
+        // Ready once the engine says the local page loaded.
+        let on_load = {
+            let (ready, ctx) = (ready.clone(), ctx.clone());
+            move |event: wry::PageLoadEvent, url: String| {
+                let what = if matches!(event, wry::PageLoadEvent::Finished) { "finished" } else { "started" };
+                log(&format!("page load {what}: {}", if url.starts_with("file:") { "the local page" } else { path_of(&url) }));
+                if matches!(event, wry::PageLoadEvent::Finished) && url.starts_with("file:") && !ready.swap(true, Ordering::Relaxed) {
+                    log("page ready (load finished)");
                     ctx.request_repaint();
-                    return;
                 }
-                let Some(id) = v["id"].as_u64() else { return };
-                let Some(tx) = waiting.lock().unwrap().remove(&id) else { return };
-                let reply = match v["error"].as_str() {
-                    Some(e) => Err(e.to_owned()),
-                    None => Ok(Answer {
-                        status: v["status"].as_u64().unwrap_or(0) as u16,
-                        headers: v["headers"]
-                            .as_object()
-                            .map(|h| h.iter().map(|(k, v)| (k.to_lowercase(), v.as_str().unwrap_or("").to_owned())).collect())
-                            .unwrap_or_default(),
-                        body: Ok(v["body"].as_str().unwrap_or("").to_owned()),
-                    }),
-                };
-                let _ = tx.send(reply);
             }
         };
-        let webview = wry::WebViewBuilder::new()
+        log("starting the browser engine");
+        let started = std::time::Instant::now();
+        // The engine's own data (cookies, cache) in the app's data folder, not
+        // next to the exe (which may be somewhere read-only, like Program Files).
+        let mut context = wry::WebContext::new(Some(dir.join("WebView")));
+        let webview = wry::WebViewBuilder::new_with_web_context(&mut context)
+            .with_on_page_load_handler(on_load)
             .with_url(&page_url)
             .with_visible(false)
             // Hidden, it mustn't take the keyboard from the app's window.
             .with_focused(false)
             .with_bounds(wry::Rect { position: LogicalPosition::new(0.0, 0.0).into(), size: LogicalSize::new(1.0, 1.0).into() })
-            .with_ipc_handler(handler)
             .build_as_child(cc)
-            .map_err(|e| anyhow!("starting the browser engine: {e}"))?;
+            .map_err(|e| {
+                log(&format!("the browser engine didn't start: {e}"));
+                anyhow!("starting the browser engine: {e}")
+            })?;
+        log(&format!("browser engine started in {:.3}s (the window waited for this)", started.elapsed().as_secs_f64()));
 
         let (tx, jobs) = mpsc::channel();
         let check_needed = Arc::new(AtomicBool::new(false));
@@ -187,15 +255,49 @@ impl WebHost {
             waiting: waiting.clone(),
             next: AtomicU64::new(1),
             check_needed: check_needed.clone(),
-            ctx,
+            ctx: ctx.clone(),
         });
-        let host = WebHost { webview, page_url, jobs, queued: Vec::new(), waiting, ready, check_needed, checking: false, give_back_focus: true };
+        let host = WebHost {
+            webview,
+            _context: context,
+            page_url,
+            jobs,
+            queued: Vec::new(),
+            waiting,
+            ready,
+            check_needed,
+            checking: false,
+            give_back_focus: true,
+            last_collect: std::time::Instant::now(),
+            ctx,
+        };
         let _ = host.webview.focus_parent();
         Ok((host, fetch))
     }
 
-    /// Hands queued requests to the page (each frame).
+    /// Hands queued requests to the page, and collects its answers (each
+    /// frame; frames keep coming while requests are out).
     pub fn pump(&mut self) {
+        self.send_queued();
+        if self.waiting.lock().unwrap().is_empty() || self.checking {
+            return;
+        }
+        if self.last_collect.elapsed() >= COLLECT_EVERY {
+            self.last_collect = std::time::Instant::now();
+            let waiting = self.waiting.clone();
+            let ctx = self.ctx.clone();
+            let collect = self.webview.evaluate_script_with_callback("window.__cleannotesCollect()", move |result| {
+                deliver(&result, &waiting);
+                ctx.request_repaint();
+            });
+            if let Err(e) = collect {
+                log(&format!("couldn't ask the page for answers: {e}"));
+            }
+        }
+        self.ctx.request_repaint_after(COLLECT_EVERY);
+    }
+
+    fn send_queued(&mut self) {
         self.queued.extend(self.jobs.try_iter());
         if !self.ready.load(Ordering::Relaxed) || self.checking {
             return;
@@ -205,7 +307,9 @@ impl WebHost {
             let _ = self.webview.focus_parent();
         }
         for job in self.queued.drain(..) {
+            log(&format!("request {}: handed to the page", job.id));
             if let Err(e) = self.webview.evaluate_script(&job.script) {
+                log(&format!("request {}: the page wouldn't run it: {e}", job.id));
                 if let Some(tx) = self.waiting.lock().unwrap().remove(&job.id) {
                     let _ = tx.send(Err(e.to_string()));
                 }
@@ -266,6 +370,31 @@ mod tests {
         assert_eq!(v[2]["X-SNJS-Version"], api::SNJS_VERSION);
         assert!(v[2]["X-Application-Version"].as_str().unwrap().starts_with("Desktop-"));
         assert_eq!(v[2]["Content-Type"], "application/json");
+    }
+
+    #[test]
+    fn answers_collected_from_the_page_reach_their_requests() {
+        let waiting: Waiting = Arc::new(Mutex::new(HashMap::new()));
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        waiting.lock().unwrap().insert(1, tx1);
+        waiting.lock().unwrap().insert(2, tx2);
+        // What WebView2 hands the callback: the script's result (a string)
+        // as JSON.
+        let page = json!({
+            "1": {"status": 200, "headers": {"Content-Type": "application/json"}, "body": "{\"ok\":true}"},
+            "2": {"error": "Failed to fetch"},
+            "9": {"status": 200, "headers": {}, "body": ""},
+        });
+        deliver(&json!(page.to_string()).to_string(), &waiting);
+        let a = rx1.try_recv().unwrap().unwrap();
+        assert_eq!((a.status, a.body.unwrap()), (200, "{\"ok\":true}".to_owned()));
+        assert_eq!(a.headers, vec![("content-type".to_owned(), "application/json".to_owned())]);
+        assert_eq!(rx2.try_recv().unwrap().err().unwrap(), "Failed to fetch");
+        assert!(waiting.lock().unwrap().is_empty());
+        // Nothing yet, or junk: nothing happens.
+        deliver(&json!("{}").to_string(), &waiting);
+        deliver("not json", &waiting);
     }
 
     #[test]
