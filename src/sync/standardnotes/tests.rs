@@ -428,6 +428,34 @@ fn expired_sessions_are_refreshed_and_handed_back() {
 }
 
 #[test]
+fn a_renewed_session_is_handed_over_before_the_sync_ends() {
+    use crate::sync::worker::{Reply, Worker};
+    let server = server_with_key();
+    let secret = signed_in(&server);
+    // The session expires before this sync: it's refreshed during it.
+    server.state().expire_tokens();
+    let device = Device::new(&server);
+    let mut w = Worker::spawn(|| {});
+    w.sync(crate::sync::BackendConfig::StandardNotes(config(&server)), Some(secret.clone()), AccountSnapshot::of(&device.store, "sn"));
+    let mut replies = Vec::new();
+    loop {
+        let r = w.rx.recv_timeout(std::time::Duration::from_secs(20)).expect("a reply");
+        let done = matches!(r, Reply::Synced(_));
+        replies.push(r);
+        if done {
+            break;
+        }
+    }
+    let Some(Reply::Renewed { account, secret: renewed }) = replies.first() else { panic!("the new session comes first") };
+    assert_eq!(account, "sn");
+    assert_ne!(renewed, &secret);
+    let Some(Reply::Synced(s)) = replies.last() else { unreachable!() };
+    assert!(s.result.is_ok(), "{:?}", s.result.as_ref().err());
+    // The session handed over works on its own.
+    StandardNotesBackend::open(&config(&server), Some(renewed.clone())).unwrap().pull().unwrap();
+}
+
+#[test]
 fn an_ended_session_needs_signing_in_again() {
     let server = server_with_key();
     let mut b = backend(&server);

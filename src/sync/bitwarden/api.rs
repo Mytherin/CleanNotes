@@ -207,11 +207,13 @@ pub struct Client {
     pub session: Session,
     /// The session changed (new tokens) since last saved.
     pub renewed: bool,
+    /// Told the new secret as soon as the session is renewed.
+    pub on_renewed: Option<crate::sync::OnRenewed>,
 }
 
 impl Client {
     pub fn new(server: &str, session: Session) -> Client {
-        Client { http: http(), urls: Urls::of(server), session, renewed: false }
+        Client { http: http(), urls: Urls::of(server), session, renewed: false, on_renewed: None }
     }
 
     /// A fresh access token.
@@ -249,6 +251,9 @@ impl Client {
             self.session.refresh_token = Some(rt.to_owned());
         }
         self.renewed = true;
+        if let (Some(f), Ok(s)) = (self.on_renewed.as_mut(), serde_json::to_string(&self.session)) {
+            f(s);
+        }
         Ok(())
     }
 

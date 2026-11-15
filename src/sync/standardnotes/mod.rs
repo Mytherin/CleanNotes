@@ -873,4 +873,8 @@ impl Backend for StandardNotesBackend {
         self.client.renewed = false;
         serde_json::to_string(&self.client.session).ok()
     }
+
+    fn on_renewed(&mut self, f: super::OnRenewed) {
+        self.client.on_renewed = Some(f);
+    }
 }

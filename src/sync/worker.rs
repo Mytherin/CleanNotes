@@ -5,9 +5,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 
 use super::engine::{self, AccountSnapshot, Outcome};
-use super::{Backend, BackendConfig, NeedsSignIn};
+use super::{Backend, BackendConfig, NeedsSignIn, OnRenewed};
 
 pub enum Job {
     Sync { config: BackendConfig, secret: Option<String>, snapshot: AccountSnapshot },
@@ -25,9 +26,18 @@ pub struct Synced {
     pub renewed_secret: Option<String>,
 }
 
+/// What the sync thread says back.
+pub enum Reply {
+    /// A sync ended.
+    Synced(Synced),
+    /// An account's backend renewed its credentials mid-sync: save them now
+    /// (a rotated refresh token makes the saved one useless).
+    Renewed { account: String, secret: String },
+}
+
 pub struct Worker {
     tx: Sender<Job>,
-    pub rx: Receiver<Synced>,
+    pub rx: Receiver<Reply>,
     /// Accounts with a sync running or queued.
     pub busy: HashSet<String>,
 }
@@ -39,9 +49,10 @@ struct Open {
 }
 
 impl Worker {
-    pub fn spawn(on_reply: impl Fn() + Send + 'static) -> Worker {
+    pub fn spawn(on_reply: impl Fn() + Send + Sync + 'static) -> Worker {
         let (tx, jobs) = mpsc::channel::<Job>();
         let (replies, rx) = mpsc::channel();
+        let on_reply = Arc::new(on_reply);
         std::thread::Builder::new()
             .name("sync".into())
             .spawn(move || {
@@ -52,8 +63,18 @@ impl Worker {
                             open.remove(&account);
                         }
                         Job::Sync { config, secret, snapshot } => {
-                            let reply = run(&mut open, config, secret, snapshot);
-                            if replies.send(reply).is_err() {
+                            let (r, notify) = (replies.clone(), on_reply.clone());
+                            let account = snapshot.account.clone();
+                            let tell: Notify = Box::new(move || {
+                                let (r, notify, account) = (r.clone(), notify.clone(), account.clone());
+                                Box::new(move |secret: String| {
+                                    if r.send(Reply::Renewed { account: account.clone(), secret }).is_ok() {
+                                        notify();
+                                    }
+                                })
+                            });
+                            let reply = run(&mut open, config, secret, snapshot, tell);
+                            if replies.send(Reply::Synced(reply)).is_err() {
                                 return;
                             }
                             on_reply();
@@ -76,7 +97,10 @@ impl Worker {
     }
 }
 
-fn run(open: &mut HashMap<String, Open>, config: BackendConfig, secret: Option<String>, snapshot: AccountSnapshot) -> Synced {
+/// Makes the callback a newly opened backend reports renewed credentials to.
+type Notify = Box<dyn Fn() -> OnRenewed>;
+
+fn run(open: &mut HashMap<String, Open>, config: BackendConfig, secret: Option<String>, snapshot: AccountSnapshot, tell: Notify) -> Synced {
     let account = snapshot.account.clone();
     let mut reply =
         Synced { account: account.clone(), snapshot, result: Err(String::new()), needs_sign_in: false, renewed_secret: None };
@@ -84,7 +108,8 @@ fn run(open: &mut HashMap<String, Open>, config: BackendConfig, secret: Option<S
     if stale {
         open.remove(&account);
         match super::open(&config, secret.clone()) {
-            Ok(backend) => {
+            Ok(mut backend) => {
+                backend.on_renewed(tell());
                 open.insert(account.clone(), Open { config, secret, backend });
             }
             Err(e) => {

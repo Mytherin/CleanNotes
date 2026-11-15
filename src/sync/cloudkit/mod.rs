@@ -243,6 +243,8 @@ pub struct CloudKitBackend {
     config: Config,
     session: Session,
     renewed: bool,
+    /// Told the new secret as soon as CloudKit rotates the token.
+    on_renewed: Option<super::OnRenewed>,
     zone_ready: bool,
     /// Folders as last listed: remote id → (path, change tag).
     folders: HashMap<String, (Vec<String>, String)>,
@@ -260,7 +262,7 @@ impl CloudKitBackend {
     pub fn open(config: &Config, secret: Option<String>) -> Result<CloudKitBackend> {
         let secret = secret.ok_or_else(|| NeedsSignIn("not signed in".into()))?;
         let session: Session = serde_json::from_str(&secret).map_err(|_| NeedsSignIn("the saved sign-in is unreadable".into()))?;
-        Ok(CloudKitBackend { http: http(), config: config.clone(), session, renewed: false, zone_ready: false, folders: HashMap::new() })
+        Ok(CloudKitBackend { http: http(), config: config.clone(), session, renewed: false, on_renewed: None, zone_ready: false, folders: HashMap::new() })
     }
 
     fn post(&mut self, op: &str, body: &Value) -> Result<Value> {
@@ -271,6 +273,9 @@ impl CloudKitBackend {
                 if let Some(t) = renewed.filter(|t| *t != self.session.web_auth_token) {
                     self.session.web_auth_token = t;
                     self.renewed = true;
+                    if let (Some(f), Ok(s)) = (self.on_renewed.as_mut(), serde_json::to_string(&self.session)) {
+                        f(s);
+                    }
                 }
                 Ok(v)
             }
@@ -512,5 +517,9 @@ impl Backend for CloudKitBackend {
         }
         self.renewed = false;
         serde_json::to_string(&self.session).ok()
+    }
+
+    fn on_renewed(&mut self, f: super::OnRenewed) {
+        self.on_renewed = Some(f);
     }
 }

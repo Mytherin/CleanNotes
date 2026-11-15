@@ -165,7 +165,16 @@ pub trait Backend: Send {
     fn renewed_secret(&mut self) -> Option<String> {
         None
     }
+
+    /// Called with the new secret as soon as the backend renews its
+    /// credentials, mid-sync. A server that rotates refresh tokens has made
+    /// the saved ones useless by then: waiting for the sync to end would
+    /// lose them if the app quit first.
+    fn on_renewed(&mut self, _f: OnRenewed) {}
 }
+
+/// See [`Backend::on_renewed`].
+pub type OnRenewed = Box<dyn FnMut(String) + Send>;
 
 /// Opens an account's backend. `secret` is what the account keeps in the
 /// credential store (its format is the backend's own).

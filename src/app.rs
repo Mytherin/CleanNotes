@@ -13,7 +13,7 @@ use crate::editor::{Command, Editor};
 use crate::model::{Folder, Note, Store, Tombstone};
 use crate::settings::{ListView, Settings, SortBy};
 use crate::sync::engine::{self, AccountSnapshot};
-use crate::sync::worker::{Synced, Worker};
+use crate::sync::worker::{Reply, Synced, Worker};
 use crate::theme::{self, Palette};
 
 mod list;
@@ -884,6 +884,23 @@ impl App {
         }
     }
 
+    /// A running sync renewed its account's credentials: saved right away,
+    /// unless the account was removed or signed in again since the sync
+    /// started (then they belong to a sign-in that's gone).
+    fn handle_renewed(&mut self, account: &str, secret: String) {
+        let current = self.db.secret(account);
+        let ours = self.store.account(account).is_some() && self.sync_secret.get(account).is_some_and(|s| *s == current);
+        if !ours {
+            return;
+        }
+        if let Err(e) = self.db.set_secret(account, Some(&secret)) {
+            eprintln!("saving the renewed sign-in: {e:#}");
+            return;
+        }
+        // Still this sync's sign-in: the end of the sync must see it so.
+        self.sync_secret.insert(account.to_owned(), Some(secret));
+    }
+
     fn handle_synced(&mut self, r: Synced) {
         self.worker.busy.remove(&r.account);
         // Signed in again, or removed, while this sync ran: what it says
@@ -1345,7 +1362,10 @@ impl eframe::App for App {
         theme::apply_style(ctx);
         let p = Palette::get(ctx);
         while let Ok(r) = self.worker.rx.try_recv() {
-            self.handle_synced(r);
+            match r {
+                Reply::Synced(r) => self.handle_synced(r),
+                Reply::Renewed { account, secret } => self.handle_renewed(&account, secret),
+            }
         }
         self.schedule_syncs();
         self.shortcuts(ctx);
@@ -1597,6 +1617,37 @@ mod tests {
         app.handle_synced(r);
         assert_eq!(app.db.secret("sn"), None);
         assert!(!app.needs_sign_in.contains("sn"));
+    }
+
+    #[test]
+    fn credentials_renewed_mid_sync_are_saved_at_once_unless_replaced() {
+        let (mut app, _dir) = app();
+        let mut acc = app.store.accounts[0].clone();
+        acc.id = "sn".into();
+        app.store.accounts.push(acc.clone());
+        app.db.set_secret("sn", Some("s0")).unwrap();
+        app.sync_secret.insert("sn".into(), Some("s0".into()));
+        // Renewed twice during one sync: each saved as it comes.
+        app.handle_renewed("sn", "s1".into());
+        assert_eq!(app.db.secret("sn").as_deref(), Some("s1"));
+        app.handle_renewed("sn", "s2".into());
+        assert_eq!(app.db.secret("sn").as_deref(), Some("s2"));
+        // The sync's end, with the last one, isn't taken for a sign-in
+        // that changed meanwhile.
+        let r = Synced {
+            account: "sn".into(),
+            snapshot: AccountSnapshot::of(&app.store, "sn"),
+            result: Err("offline".into()),
+            needs_sign_in: false,
+            renewed_secret: Some("s2".into()),
+        };
+        app.handle_synced(r);
+        assert_eq!(app.db.secret("sn").as_deref(), Some("s2"));
+        // Signed in again during a sync: its renewals are dropped.
+        app.sync_secret.insert("sn".into(), Some("s2".into()));
+        app.add_account(acc, Some("fresh".into()));
+        app.handle_renewed("sn", "s3".into());
+        assert_eq!(app.db.secret("sn").as_deref(), Some("fresh"));
     }
 
     #[test]
