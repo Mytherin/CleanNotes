@@ -79,6 +79,20 @@ fn sign_in_keeps_the_session_and_master_key_but_not_the_password() {
 }
 
 #[test]
+fn a_cloudflare_browser_check_is_explained_not_shown_as_a_403() {
+    // What api.standardnotes.com's Cloudflare answered on 2026-11-15.
+    let url = crate::sync::test_http::spawn(|_| crate::sync::test_http::Response {
+        status: 403,
+        body: "<!DOCTYPE html><html><head><title>Just a moment...</title></head></html>".into(),
+        content_type: "text/html",
+        headers: vec![("cf-mitigated", "challenge".into())],
+    });
+    let c = Config { server: url, email: EMAIL.into() };
+    let err = sign_in(&c, &password()).unwrap_err().to_string();
+    assert!(err.contains("Cloudflare") && err.contains("isn't about your email or password"), "{err}");
+}
+
+#[test]
 fn wrong_password() {
     let server = FakeServer::start(EMAIL, PASSWORD);
     let err = sign_in(&config(&server), &SignInRequest { password: "nope".into(), mfa_code: None }).unwrap_err();

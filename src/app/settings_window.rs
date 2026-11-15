@@ -341,6 +341,14 @@ impl App {
         }
         let mut name = a.name.clone();
         let mut enabled = a.enabled;
+        if self.db.secret_in_memory_only(id) {
+            wrapped(
+                ui,
+                "The system's credential store isn't available: this sign-in is kept only until CleanNotes quits, so you'll sign in again next time.",
+                p.secondary,
+            );
+            ui.add_space(6.0);
+        }
         egui::Grid::new("account-grid").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
             ui.label("Description:");
             ui.add(egui::TextEdit::singleline(&mut name).desired_width(200.0));

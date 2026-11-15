@@ -87,6 +87,14 @@ pub fn now_ms() -> i64 {
 
 fn read(resp: reqwest::blocking::Response) -> Result<Value> {
     let status = resp.status().as_u16();
+    // Cloudflare, in front of the server, wants a browser check (a page
+    // running JavaScript) before letting the request through: the server
+    // itself never saw it. Not a wrong password.
+    if resp.headers().get("cf-mitigated").and_then(|h| h.to_str().ok()) == Some("challenge") {
+        anyhow::bail!(
+            "Standard Notes' server is behind a Cloudflare browser check that turned this request away before it reached Standard Notes (HTTP {status}). This isn't about your email or password. Try again later; if it keeps happening, Standard Notes is blocking apps other than its own from this network."
+        );
+    }
     let ok = (200..300).contains(&status);
     let text = match resp.text() {
         Ok(t) => t,

@@ -201,7 +201,7 @@ impl App {
     /// An app on a database in `dir`, without a window (for tests).
     #[cfg(test)]
     pub(crate) fn for_test(dir: &std::path::Path) -> Self {
-        let (db, store, settings) = Db::open(dir, Secrets::Database).expect("test database");
+        let (db, store, settings) = Db::open(dir, Secrets::Memory).expect("test database");
         let mut app = App::with(db, store, settings, Worker::spawn(|| {}));
         app.restore_location();
         app
@@ -1266,6 +1266,10 @@ impl App {
         if let Some(s) = &secret {
             if let Err(e) = self.db.set_secret(&account.id, Some(s)) {
                 self.push_notice(format!("Couldn't save the sign-in: {e:#}"));
+            } else if self.db.secret_in_memory_only(&account.id) {
+                self.push_notice(
+                    "The system's credential store isn't available, so this sign-in is kept only until CleanNotes quits (it's never written to disk unencrypted). You'll sign in again next time.".into(),
+                );
             }
         }
         let id = account.id.clone();

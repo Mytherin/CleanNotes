@@ -4,10 +4,12 @@
 //! `CLEANNOTES_DATA`).
 //!
 //! Notes are rows with their Markdown in `body`; accounts, folders and sync
-//! bookkeeping are JSON. Secrets (a Bitwarden session) go to the OS
-//! credential store, or into the database when there is none.
+//! bookkeeping are JSON. Secrets (a sync account's session and keys) go to
+//! the OS credential store, never into the database: where there is no
+//! store, they're kept in memory only, until the app quits.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -30,10 +32,10 @@ pub fn data_dir() -> PathBuf {
 /// Where secrets go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Secrets {
-    /// The OS credential store, falling back to the database.
+    /// The OS credential store, falling back to memory.
     Keyring,
-    /// Only the database (tests).
-    Database,
+    /// Memory only (tests).
+    Memory,
 }
 
 pub struct Db {
@@ -44,6 +46,9 @@ pub struct Db {
     keyring_prefix: String,
     /// What was saved last, to only write what changed.
     saved_meta: Option<String>,
+    /// Secrets the credential store couldn't take (or every secret, with
+    /// [`Secrets::Memory`]): gone when the app quits.
+    in_memory: Mutex<HashMap<String, String>>,
 }
 
 const SCHEMA: &str = "
@@ -102,12 +107,13 @@ impl Db {
             }
             Err(e) => return Err(e.context(format!("opening {}", path.display()))),
         };
-        let keyring_prefix = if std::env::var_os("CLEANNOTES_DATA").is_some() || secrets == Secrets::Database {
+        let keyring_prefix = if std::env::var_os("CLEANNOTES_DATA").is_some() || secrets == Secrets::Memory {
             format!("{}:", dir.display())
         } else {
             String::new()
         };
-        let mut db = Db { conn, secrets, keyring_prefix, saved_meta: None };
+        let mut db = Db { conn, secrets, keyring_prefix, saved_meta: None, in_memory: Mutex::new(HashMap::new()) };
+        db.move_secrets_out()?;
         let (store, settings) = db.load()?;
         Ok((db, store, settings))
     }
@@ -254,6 +260,9 @@ impl Db {
     }
 
     pub fn secret(&self, account: &str) -> Option<String> {
+        if let Some(s) = self.in_memory.lock().unwrap().get(account) {
+            return Some(s.clone());
+        }
         if self.secrets == Secrets::Keyring {
             if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &self.keyring_name(account)) {
                 match entry.get_password() {
@@ -263,33 +272,57 @@ impl Db {
                 }
             }
         }
-        self.conn
-            .query_row("SELECT value FROM secrets WHERE key = ?1", [account], |r| r.get(0))
-            .optional()
-            .ok()
-            .flatten()
+        None
     }
 
-    /// Saves (or with `None`, deletes) an account's secret.
+    /// Saves (or with `None`, deletes) an account's secret: in the OS
+    /// credential store, or, if that can't take it, in memory only. It's
+    /// never written to disk in the clear (it decrypts the account).
     pub fn set_secret(&self, account: &str, secret: Option<&str>) -> Result<()> {
-        let mut in_keyring = false;
+        let mut memory = self.in_memory.lock().unwrap();
+        memory.remove(account);
         if self.secrets == Secrets::Keyring {
-            if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &self.keyring_name(account)) {
-                in_keyring = match secret {
-                    Some(s) => entry.set_password(s).is_ok(),
-                    None => matches!(entry.delete_credential(), Ok(()) | Err(keyring::Error::NoEntry)),
-                };
+            let entry = keyring::Entry::new(KEYRING_SERVICE, &self.keyring_name(account));
+            match (entry, secret) {
+                (Ok(e), Some(s)) if e.set_password(s).is_ok() => return Ok(()),
+                (Ok(e), None) => {
+                    let _ = e.delete_credential();
+                    return Ok(());
+                }
+                (_, None) => return Ok(()),
+                _ => eprintln!("no credential store: the {account} sign-in is kept until CleanNotes quits"),
             }
         }
-        match secret {
-            Some(s) if !in_keyring => {
-                eprintln!("no credential store; keeping the {account} secret in data.db");
-                self.conn.execute("INSERT OR REPLACE INTO secrets (key, value) VALUES (?1, ?2)", params![account, s])?;
-            }
-            _ => {
-                self.conn.execute("DELETE FROM secrets WHERE key = ?1", [account])?;
-            }
+        if let Some(s) = secret {
+            memory.insert(account.to_owned(), s.to_owned());
         }
+        Ok(())
+    }
+
+    /// Whether an account's sign-in is only kept until the app quits (the
+    /// credential store couldn't take it).
+    pub fn secret_in_memory_only(&self, account: &str) -> bool {
+        self.secrets == Secrets::Keyring && self.in_memory.lock().unwrap().contains_key(account)
+    }
+
+    /// Earlier versions kept secrets in the database when the credential
+    /// store failed. They move out (to the store, or to memory) and are
+    /// wiped from the file.
+    fn move_secrets_out(&mut self) -> Result<()> {
+        let rows: Vec<(String, String)> = {
+            let mut st = self.conn.prepare("SELECT key, value FROM secrets")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+            rows
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (account, secret) in &rows {
+            self.set_secret(account, Some(secret))?;
+        }
+        // secure_delete overwrites the rows; the checkpoint clears the log.
+        self.conn.execute("DELETE FROM secrets", [])?;
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     }
 }
@@ -302,7 +335,7 @@ mod tests {
     #[test]
     fn everything_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut db, mut store, mut settings) = Db::open(dir.path(), Secrets::Database).unwrap();
+        let (mut db, mut store, mut settings) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert_eq!(store.accounts.len(), 1);
         let folder = store.default_folder(LOCAL).unwrap().id.clone();
         let mut n = Note::new(LOCAL, &folder, "# Hello\nworld");
@@ -315,7 +348,7 @@ mod tests {
         db.save(&store, &settings, &[id.clone()].into()).unwrap();
         drop(db);
 
-        let (mut db, store2, settings2) = Db::open(dir.path(), Secrets::Database).unwrap();
+        let (mut db, store2, settings2) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert_eq!(settings2.text_size, 19.0);
         assert_eq!(store2.folders.len(), 2);
         let n2 = store2.note(&id).unwrap();
@@ -329,26 +362,51 @@ mod tests {
         store3.notes.clear();
         db.save(&store3, &settings2, &[id.clone()].into()).unwrap();
         drop(db);
-        let (_, store4, _) = Db::open(dir.path(), Secrets::Database).unwrap();
+        let (_, store4, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert!(store4.notes.is_empty());
     }
 
     #[test]
-    fn secrets_fall_back_to_the_database() {
+    fn secrets_never_reach_the_database_file() {
         let dir = tempfile::tempdir().unwrap();
-        let (db, _, _) = Db::open(dir.path(), Secrets::Database).unwrap();
+        let (db, _, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert_eq!(db.secret("a"), None);
         db.set_secret("a", Some("s3cret")).unwrap();
         assert_eq!(db.secret("a").as_deref(), Some("s3cret"));
+        let rows: i64 = db.conn.query_row("SELECT count(*) FROM secrets", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 0);
         db.set_secret("a", None).unwrap();
         assert_eq!(db.secret("a"), None);
+        // Gone when the app quits.
+        db.set_secret("a", Some("s3cret")).unwrap();
+        drop(db);
+        let (db, _, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        assert_eq!(db.secret("a"), None);
+    }
+
+    #[test]
+    fn secrets_left_in_the_file_by_older_versions_are_moved_out_and_wiped() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (db, _, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+            db.conn.execute("INSERT INTO secrets (key, value) VALUES ('acc', 'MASTER-KEY-1234')", []).unwrap();
+        }
+        let (db, _, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        assert_eq!(db.secret("acc").as_deref(), Some("MASTER-KEY-1234"), "still signed in this session");
+        drop(db);
+        // Not in the file any more, not even in freed pages or the log.
+        for name in ["data.db", "data.db-wal"] {
+            if let Ok(bytes) = std::fs::read(dir.path().join(name)) {
+                assert!(!bytes.windows(15).any(|w| w == b"MASTER-KEY-1234"), "found in {name}");
+            }
+        }
     }
 
     #[test]
     fn a_file_that_isnt_a_database_is_moved_aside() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("data.db"), "not a database, just some text ".repeat(200)).unwrap();
-        let (_, store, _) = Db::open(dir.path(), Secrets::Database).unwrap();
+        let (_, store, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert!(store.notes.is_empty());
         let names: Vec<String> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
         assert!(names.iter().any(|n| n.starts_with("data.db.broken-")), "{names:?}");
