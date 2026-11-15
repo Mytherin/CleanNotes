@@ -328,7 +328,7 @@ impl Editor {
             return;
         }
         self.checkpoint(Some(Group::Deleting));
-        let from = if word { self.doc.word_step(c, -1) } else { Pos::new(c.block, c.offset - 1) };
+        let from = if word { self.doc.word_step(c, -1) } else { self.doc.char_step(c, -1) };
         let p = self.doc.delete(from, c);
         self.sel = Selection::caret(p);
     }
@@ -1182,6 +1182,20 @@ mod tests {
         assert_eq!(e.line_step(Pos::new(1, 2), 1, 0.0), Pos::new(2, 0));
         assert_eq!(e.line_step(Pos::new(1, 2), -1, 0.0), Pos::new(0, 0));
         assert_eq!(e.row_edge(Pos::new(2, 1), true), Pos::new(2, 5));
+    }
+
+    #[test]
+    fn backspace_and_delete_take_whole_emoji() {
+        let mut e = Editor::new("n", "ok 👍🏽🇩🇪\n");
+        e.sel = Selection::caret(Pos::new(0, 7));
+        e.backspace(false);
+        assert_eq!(e.doc.blocks[0].text, "ok 👍🏽");
+        e.backspace(false);
+        assert_eq!(e.doc.blocks[0].text, "ok ");
+        let mut e = Editor::new("n", "👍🏽x\n");
+        e.sel = Selection::caret(Pos::new(0, 0));
+        e.delete_forward(false);
+        assert_eq!(e.doc.blocks[0].text, "x");
     }
 
     #[test]

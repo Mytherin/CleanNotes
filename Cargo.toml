@@ -21,6 +21,8 @@ anyhow = "1"
 ttf-parser = "0.25"
 rusqlite = { version = "0.42.0", features = ["bundled", "chrono"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# The caret steps over whole characters as seen (emoji, flags, accents).
+unicode-segmentation = "1.13"
 # Three-way merges of note text when two devices edit the same note.
 diffy = "0.4"
 # Bitwarden's vault encryption.

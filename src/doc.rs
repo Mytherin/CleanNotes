@@ -586,17 +586,19 @@ impl Doc {
     }
 
     /// One character left (`-1`) or right (`1`), across paragraphs.
+    /// One character (as seen: a whole emoji, flag or accented letter)
+    /// back (`dir < 0`) or forward, across paragraph ends.
     pub fn char_step(&self, p: Pos, dir: i32) -> Pos {
         if dir < 0 {
             if p.offset > 0 {
-                Pos::new(p.block, p.offset - 1)
+                Pos::new(p.block, grapheme_step(&self.blocks[p.block].text, p.offset, -1))
             } else if p.block > 0 {
                 Pos::new(p.block - 1, self.blocks[p.block - 1].len())
             } else {
                 p
             }
         } else if p.offset < self.blocks[p.block].len() {
-            Pos::new(p.block, p.offset + 1)
+            Pos::new(p.block, grapheme_step(&self.blocks[p.block].text, p.offset, 1))
         } else if p.block + 1 < self.blocks.len() {
             Pos::new(p.block + 1, 0)
         } else {
@@ -647,9 +649,49 @@ pub fn tags_in(text: &str) -> Vec<String> {
     out
 }
 
+/// The char offset of the next (`dir > 0`) or previous grapheme boundary
+/// from `offset` (a char offset) in `text`.
+fn grapheme_step(text: &str, offset: usize, dir: i32) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut at = 0;
+    let mut prev = 0;
+    for g in text.graphemes(true) {
+        let next = at + g.chars().count();
+        if dir > 0 && next > offset {
+            return next;
+        }
+        if dir < 0 && next >= offset {
+            return if at < offset { at } else { prev };
+        }
+        prev = at;
+        at = next;
+    }
+    if dir > 0 { at } else { prev.min(offset.saturating_sub(1)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_caret_steps_over_whole_characters() {
+        let d = doc(&[(Kind::Body, "a👍🏽b🇩🇪e\u{301}")]);
+        // a | 👍🏽 (2 chars) | b | 🇩🇪 (2 chars) | é (2 chars)
+        let stops: Vec<usize> = std::iter::successors(Some(Pos::new(0, 0)), |&p| {
+            let n = d.char_step(p, 1);
+            (n != p).then_some(n)
+        })
+        .map(|p| p.offset)
+        .collect();
+        assert_eq!(stops, [0, 1, 3, 4, 6, 8]);
+        let back: Vec<usize> = std::iter::successors(Some(Pos::new(0, 8)), |&p| {
+            let n = d.char_step(p, -1);
+            (n != p).then_some(n)
+        })
+        .map(|p| p.offset)
+        .collect();
+        assert_eq!(back, [8, 6, 4, 3, 1, 0]);
+    }
 
     fn doc(lines: &[(Kind, &str)]) -> Doc {
         Doc::new(lines.iter().map(|(k, t)| Block::new(*k, t)).collect())
