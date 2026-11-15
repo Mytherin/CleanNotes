@@ -173,7 +173,14 @@ impl Editor {
         if md == self.markdown_seen {
             return;
         }
-        self.checkpoint(None);
+        // Not an edit here: the note isn't marked changed (which would write
+        // the other device's text back in this app's own Markdown style),
+        // and undo history from before can't be stepped back into, as that
+        // would quietly revert the other device's edit.
+        self.undo.clear();
+        self.redo.clear();
+        self.group = None;
+        self.typing_style = None;
         self.doc = markdown::from_markdown(md);
         self.markdown_seen = md.to_owned();
         self.sel = Selection { anchor: self.doc.clamp(self.sel.anchor), caret: self.doc.clamp(self.sel.caret) };
@@ -1175,6 +1182,20 @@ mod tests {
         assert_eq!(e.line_step(Pos::new(1, 2), 1, 0.0), Pos::new(2, 0));
         assert_eq!(e.line_step(Pos::new(1, 2), -1, 0.0), Pos::new(0, 0));
         assert_eq!(e.row_edge(Pos::new(2, 1), true), Pos::new(2, 5));
+    }
+
+    #[test]
+    fn a_reload_from_a_sync_is_not_an_edit() {
+        let mut e = Editor::new("n", "# Note\nmine\n");
+        e.sel = Selection::caret(Pos::new(1, 4));
+        e.insert_text("!");
+        assert_eq!(e.take_markdown().as_deref(), Some("# Note\nmine!\n"));
+        // Markdown from another device, not in this app's own style.
+        e.reload("# Note\nmine!\n+ theirs\n");
+        assert_eq!(e.take_markdown(), None, "not written back reformatted");
+        e.command(Command::Undo);
+        assert_eq!(e.doc.plain_text(), "Note\nmine!\ntheirs", "undo can't revert the other device's edit");
+        assert_eq!((e.doc.clamp(e.sel.anchor), e.doc.clamp(e.sel.caret)), (e.sel.anchor, e.sel.caret));
     }
 
     #[test]
