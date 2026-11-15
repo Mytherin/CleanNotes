@@ -90,8 +90,24 @@ fn an_email_typed_differently_is_tried_cleaned_up() {
     let server = FakeServer::start(EMAIL, PASSWORD);
     let c = Config { email: " Alice@Example.com ".into(), ..config(&server) };
     assert!(matches!(sign_in(&c, &password()).unwrap(), SignInStep::Done { .. }));
-    // As typed first (a different key identifier, so refused), then cleaned.
-    assert_eq!(server.state().log.len(), 4);
+    // The key comes from the identifier the server has, so the first try
+    // works: login params and login, once each.
+    assert_eq!(server.state().log.len(), 2);
+}
+
+#[test]
+fn a_wrong_two_factor_code_says_so_and_is_tried_once() {
+    let server = FakeServer::start(EMAIL, PASSWORD);
+    server.state().mfa = true;
+    let c = Config { email: "Alice@Example.com".into(), ..config(&server) };
+    let req = SignInRequest { mfa_code: Some("000000".into()), ..password() };
+    let err = sign_in(&c, &req).unwrap_err().to_string();
+    assert!(err.contains("two-factor code"), "{err}");
+    assert_eq!(server.state().log.len(), 1, "not tried again in lowercase (the code is spent)");
+    // Wrong password: the real message, after one retry in lowercase.
+    let req = SignInRequest { password: "nope".into(), mfa_code: Some(MFA_CODE.into()) };
+    let err = sign_in(&c, &req).unwrap_err().to_string();
+    assert!(err.contains("incorrect"), "{err}");
 }
 
 #[test]

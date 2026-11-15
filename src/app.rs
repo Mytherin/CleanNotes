@@ -92,6 +92,10 @@ pub struct App {
     last_edit: Option<Instant>,
     /// When each account last started a sync (this session).
     sync_started: HashMap<String, Instant>,
+    /// The secret each running sync was started with: a reply for a
+    /// sign-in that was replaced (or an account removed) meanwhile mustn't
+    /// save its session over the new one.
+    sync_secret: HashMap<String, Option<String>>,
     pub sync_errors: HashMap<String, String>,
     /// Accounts whose saved sign-in stopped working.
     pub needs_sign_in: HashSet<String>,
@@ -176,6 +180,7 @@ impl App {
             last_purge: Instant::now(),
             last_edit: None,
             sync_started: HashMap::new(),
+            sync_secret: HashMap::new(),
             sync_errors: HashMap::new(),
             needs_sign_in: HashSet::new(),
             notices: Vec::new(),
@@ -845,6 +850,7 @@ impl App {
         let snapshot = AccountSnapshot::of(&self.store, account);
         let secret = self.db.secret(account);
         self.sync_started.insert(account.to_owned(), Instant::now());
+        self.sync_secret.insert(account.to_owned(), secret.clone());
         self.worker.sync(a.backend.clone(), secret, snapshot);
     }
 
@@ -880,13 +886,25 @@ impl App {
 
     fn handle_synced(&mut self, r: Synced) {
         self.worker.busy.remove(&r.account);
-        if let Some(s) = &r.renewed_secret {
-            if let Err(e) = self.db.set_secret(&r.account, Some(s)) {
-                eprintln!("saving the renewed sign-in: {e:#}");
+        // Signed in again, or removed, while this sync ran: what it says
+        // about the old sign-in no longer applies.
+        let started_with = self.sync_secret.remove(&r.account);
+        let exists = self.store.account(&r.account).is_some();
+        let replaced = exists && started_with.is_some_and(|s| s != self.db.secret(&r.account));
+        if exists && !replaced {
+            if let Some(s) = &r.renewed_secret {
+                if let Err(e) = self.db.set_secret(&r.account, Some(s)) {
+                    eprintln!("saving the renewed sign-in: {e:#}");
+                }
+            }
+            if r.needs_sign_in {
+                self.needs_sign_in.insert(r.account.clone());
             }
         }
-        if r.needs_sign_in {
-            self.needs_sign_in.insert(r.account.clone());
+        if replaced {
+            // The new sign-in's own sync couldn't start while this one ran:
+            // due right away. (This one's outcome is still applied.)
+            self.sync_started.remove(&r.account);
         }
         let out = match r.result {
             Ok(out) => out,
@@ -1547,6 +1565,38 @@ mod tests {
         app.search = "note 3".into();
         app.retain_visible(None);
         assert_eq!(app.selected_ids(), app.visible_notes());
+    }
+
+    #[test]
+    fn a_sync_from_before_signing_in_again_doesnt_undo_it() {
+        let (mut app, _dir) = app();
+        let mut acc = app.store.accounts[0].clone();
+        acc.id = "sn".into();
+        let stale = |app: &App| Synced {
+            account: "sn".into(),
+            snapshot: AccountSnapshot::of(&app.store, "sn"),
+            result: Err("the password was changed".into()),
+            needs_sign_in: true,
+            renewed_secret: Some("old session, renewed".into()),
+        };
+        // A sync starts with the old sign-in…
+        app.store.accounts.push(acc.clone());
+        app.db.set_secret("sn", Some("old session")).unwrap();
+        app.sync_secret.insert("sn".into(), Some("old session".into()));
+        // …the user signs in again meanwhile…
+        app.add_account(acc, Some("new session".into()));
+        // …and the old sync's reply arrives.
+        let r = stale(&app);
+        app.handle_synced(r);
+        assert_eq!(app.db.secret("sn").as_deref(), Some("new session"));
+        assert!(!app.needs_sign_in.contains("sn"));
+        // Removed while syncing: its secret isn't written back.
+        app.sync_secret.insert("sn".into(), Some("new session".into()));
+        app.remove_account("sn");
+        let r = stale(&app);
+        app.handle_synced(r);
+        assert_eq!(app.db.secret("sn"), None);
+        assert!(!app.needs_sign_in.contains("sn"));
     }
 
     #[test]

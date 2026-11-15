@@ -279,7 +279,8 @@ fn route(s: &mut State, req: &Request) -> (u16, Value) {
                 }
             }
             s.challenge = body["code_challenge"].as_str().map(str::to_owned);
-            (200, json!({"identifier": email, "pw_nonce": s.pw_nonce, "version": "004", "origination": "registration", "created": "1700000000000"}))
+            // The identifier as registered, whatever case was typed.
+            (200, json!({"identifier": s.email, "pw_nonce": s.pw_nonce, "version": "004", "origination": "registration", "created": "1700000000000"}))
         }
         "/v2/login" => {
             let verifier = body["code_verifier"].as_str().unwrap_or("");

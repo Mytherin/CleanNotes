@@ -112,7 +112,8 @@ fn read(resp: reqwest::blocking::Response) -> Result<Value> {
         .and_then(|e| e.get("message"))
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| if body.is_string() { body.as_str().unwrap().to_owned() } else { format!("HTTP {status}") });
+        // Not the body of a web page (a proxy's error page) as the message.
+        .unwrap_or_else(|| format!("the server answered HTTP {status}"));
     let tag = err.and_then(|e| e.get("tag")).and_then(Value::as_str).map(str::to_owned);
     Err(HttpError { status, message, tag, body }.into())
 }
@@ -163,7 +164,9 @@ impl Client {
             Ok(v) => v,
             Err(e) => {
                 if let Some(h) = e.downcast_ref::<HttpError>() {
-                    if (400..500).contains(&h.status) {
+                    // A refused refresh means signing in again; being told
+                    // to slow down (or a timeout) doesn't.
+                    if (400..500).contains(&h.status) && !matches!(h.status, 408 | 425 | 429) {
                         return Err(NeedsSignIn(h.message.clone()).into());
                     }
                 }

@@ -149,9 +149,12 @@ enum Sheet {
 
 /// A sign-in running in the background.
 enum Pending {
-    Bitwarden(Receiver<Result<SignInStep, String>>),
-    CloudKit(Receiver<Result<String, String>>),
-    StandardNotes(Receiver<Result<standardnotes::SignInStep, String>>),
+    // Each with the config the sign-in used: the account is saved with that,
+    // not with the form as it is by the time the reply comes (an edited
+    // server URL would get this session's tokens).
+    Bitwarden(Receiver<(bitwarden::Config, Result<SignInStep, String>)>),
+    CloudKit(Receiver<(cloudkit::Config, Result<String, String>)>),
+    StandardNotes(Receiver<(standardnotes::Config, Result<standardnotes::SignInStep, String>)>),
 }
 
 #[derive(Default)]
@@ -476,12 +479,11 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
         match pending {
             Pending::Bitwarden(rx) => {
-                let Ok(r) = rx.try_recv() else { return };
+                let Ok((config, r)) = rx.try_recv() else { return };
                 self.settings_ui.pending = None;
                 let Some(Sheet::Bitwarden(form)) = &mut self.settings_ui.sheet else { return };
                 match r {
                     Ok(SignInStep::Done { secret }) => {
-                        let config = form.config();
                         let (id, name) = match &form.again {
                             Some(id) => (id.clone(), form.name.clone()),
                             None => (new_id(), if form.name.trim().is_empty() { "Bitwarden".to_owned() } else { form.name.trim().to_owned() }),
@@ -517,12 +519,11 @@ impl App {
                 }
             }
             Pending::StandardNotes(rx) => {
-                let Ok(r) = rx.try_recv() else { return };
+                let Ok((config, r)) = rx.try_recv() else { return };
                 self.settings_ui.pending = None;
                 let Some(Sheet::StandardNotes(form)) = &mut self.settings_ui.sheet else { return };
                 match r {
                     Ok(standardnotes::SignInStep::Done { secret }) => {
-                        let config = form.config();
                         let (id, name) = match &form.again {
                             Some(id) => (id.clone(), form.name.clone()),
                             None => (new_id(), if form.name.trim().is_empty() { "Standard Notes".to_owned() } else { form.name.trim().to_owned() }),
@@ -540,12 +541,11 @@ impl App {
                 }
             }
             Pending::CloudKit(rx) => {
-                let Ok(r) = rx.try_recv() else { return };
+                let Ok((config, r)) = rx.try_recv() else { return };
                 self.settings_ui.pending = None;
                 let Some(Sheet::CloudKit(form)) = &self.settings_ui.sheet else { return };
                 match r {
                     Ok(secret) => {
-                        let config = ck_config(form);
                         let (id, name) = match &form.again {
                             Some(id) => (id.clone(), form.name.clone()),
                             None => (new_id(), if form.name.trim().is_empty() { "iCloud (CloudKit)".to_owned() } else { form.name.trim().to_owned() }),
@@ -737,7 +737,9 @@ impl App {
                     ui.label(RichText::new(if f.again.is_some() { "Sign in to Standard Notes again" } else { "Add a Standard Notes account" }).font(theme::bold_font(14.0)));
                     ui.add_space(8.0);
                     let fixed = f.again.is_some();
-                    egui::Grid::new("sn").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                    // Fixed while signing in: the account is saved with what
+                    // the sign-in used.
+                    ui.add_enabled_ui(!busy, |ui| egui::Grid::new("sn").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
                         if !fixed {
                             ui.label("Description:");
                             ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Standard Notes").desired_width(240.0));
@@ -765,7 +767,7 @@ impl App {
                             ui.add(egui::TextEdit::singleline(&mut f.code).hint_text("from your authenticator app").desired_width(160.0));
                             ui.end_row();
                         }
-                    });
+                    }));
                     ui.add_space(4.0);
                     wrapped(
                         ui,
@@ -807,7 +809,8 @@ impl App {
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(bitwarden::sign_in(&config, &req).map_err(|e| format!("{e:#}")));
+                let r = bitwarden::sign_in(&config, &req).map_err(|e| format!("{e:#}"));
+                let _ = tx.send((config, r));
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::Bitwarden(rx));
@@ -817,7 +820,8 @@ impl App {
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(standardnotes::sign_in(&config, &req).map_err(|e| format!("{e:#}")));
+                let r = standardnotes::sign_in(&config, &req).map_err(|e| format!("{e:#}"));
+                let _ = tx.send((config, r));
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::StandardNotes(rx));
@@ -827,7 +831,8 @@ impl App {
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(cloudkit::sign_in(&config).map_err(|e| format!("{e:#}")));
+                let r = cloudkit::sign_in(&config).map_err(|e| format!("{e:#}"));
+                let _ = tx.send((config, r));
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::CloudKit(rx));

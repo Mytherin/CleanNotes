@@ -86,12 +86,24 @@ pub enum SignInStep {
 pub fn sign_in(config: &Config, req: &SignInRequest) -> Result<SignInStep> {
     let email = config.email.trim();
     match sign_in_as(config, email, req) {
-        Err(e) if email.to_lowercase() != email && !matches!(api::tag_of(&e), Some("mfa-required" | "mfa-invalid")) => {
-            sign_in_as(config, &email.to_lowercase(), req)
-        }
+        // Only for wrong credentials: not a two-factor problem (which would
+        // spend the code twice and hide the real message), nor a network one.
+        Err(e) if email.to_lowercase() != email && e.is::<BadCredentials>() => sign_in_as(config, &email.to_lowercase(), req),
         r => r,
     }
 }
+
+/// The server refused the email and password.
+#[derive(Debug)]
+struct BadCredentials;
+
+impl std::fmt::Display for BadCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The email address or password is incorrect.")
+    }
+}
+
+impl std::error::Error for BadCredentials {}
 
 fn sign_in_as(config: &Config, email: &str, req: &SignInRequest) -> Result<SignInStep> {
     let http = api::http();
@@ -123,13 +135,17 @@ fn sign_in_as(config: &Config, email: &str, req: &SignInRequest) -> Result<SignI
         );
     }
     let nonce = field("pw_nonce").context("the server sent no key params")?;
-    let root = crypto::root_key(&req.password, email, nonce)?;
+    // The key is salted with the identifier as the account was registered
+    // (as the official client does), which may differ in case from what
+    // was typed.
+    let identifier = field("identifier").filter(|i| !i.is_empty()).unwrap_or(email).to_owned();
+    let root = crypto::root_key(&req.password, &identifier, nonce)?;
     let body = json!({ "email": email, "password": root.server_password, "ephemeral": false, "code_verifier": verifier });
     let v = match api::post(&http, &config.server, "/v2/login", body) {
         Ok(v) => v,
         Err(e) => {
             if matches!(api::status_of(&e), Some(401 | 403)) || api::tag_of(&e) == Some("invalid-auth") {
-                bail!("The email address or password is incorrect.");
+                return Err(BadCredentials.into());
             }
             return Err(e);
         }
@@ -143,7 +159,7 @@ fn sign_in_as(config: &Config, email: &str, req: &SignInRequest) -> Result<SignI
         refresh_expiration,
         user_uuid: p.get("user").and_then(|u| u.get("uuid")).and_then(Value::as_str).map(str::to_owned),
         master_key: root.master_key,
-        key_params: key_params_json(email, &params, p.get("key_params")),
+        key_params: key_params_json(&identifier, &params, p.get("key_params")),
     };
     Ok(SignInStep::Done { secret: serde_json::to_string(&session)? })
 }
