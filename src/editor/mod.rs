@@ -870,7 +870,10 @@ impl Editor {
             y += h + 1.0;
         }
         let content = Rect::from_min_max(full.min, Pos2::new(full.right(), (y + 120.0).max(full.bottom())));
-        let resp = ui.allocate_rect(content, Sense::click_and_drag());
+        // The interaction goes under the editor's own id, so keyboard focus
+        // given to that id sticks.
+        ui.allocate_rect(content, Sense::hover());
+        let resp = ui.interact(content, id, Sense::click_and_drag());
 
         // Code block backgrounds, then selection, then text.
         let mut run_start: Option<Rect> = None;

@@ -271,8 +271,7 @@ impl App {
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.0), Sense::hover());
         ui.painter().text(Pos2::new(rect.left() + 14.0, rect.center().y + 2.0), Align2::LEFT_CENTER, "Tags", theme::bold_font(11.5), p.secondary);
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(12.0);
+        egui::Frame::none().inner_margin(egui::Margin { left: 12.0, right: 8.0, top: 0.0, bottom: 0.0 }).show(ui, |ui| ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
             for t in tags {
                 let loc = Location::Tag(t.clone());
@@ -289,7 +288,7 @@ impl App {
                     self.focus = Pane::Sidebar;
                 }
             }
-        });
+        }));
     }
 }
 
