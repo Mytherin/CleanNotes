@@ -19,6 +19,8 @@ pub mod engine;
 pub mod merge;
 pub mod sqlite;
 pub mod worker;
+#[cfg(test)]
+pub mod test_http;
 
 /// Which backend an account syncs with, and its settings (secrets are kept
 /// in the OS credential store, not here).
