@@ -99,7 +99,15 @@ impl App {
 
         let header = note_header_time(note.modified);
         let highlight = self.search.clone();
-        let opts = Options { text_size: self.lib.settings.text_size, sort_checked: self.lib.settings.sort_checked, read_only, highlight: &highlight };
+        let can_attach = self.can_attach();
+        let opts = Options {
+            text_size: self.lib.settings.text_size,
+            sort_checked: self.lib.settings.sort_checked,
+            read_only,
+            highlight: &highlight,
+            images: &self.images,
+            can_attach,
+        };
         let Some(editor) = &mut self.editor else { return };
         let mut out = None;
         egui::ScrollArea::vertical()
@@ -118,6 +126,15 @@ impl App {
             }
             if out.blocked_edit {
                 self.push_notice("Deleted notes can't be edited. To edit this note, recover it first.".into());
+            }
+            if let Some(path) = out.open_image {
+                let _ = open::that(path);
+            }
+            if out.attach_image {
+                self.choose_images();
+            }
+            if out.paste_image {
+                self.paste_image();
             }
         }
         self.link_sheet(ui.ctx(), p);
@@ -189,6 +206,10 @@ impl App {
                         }
                     }
                     ui.separator();
+                    if ui.add_enabled(self.can_attach(), egui::Button::new("Attach Image…")).clicked() {
+                        ui.memory_mut(|m| m.close_popup());
+                        self.choose_images();
+                    }
                     if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
                         if let Some(e) = &mut self.editor {
                             e.find.open = true;

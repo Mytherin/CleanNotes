@@ -74,6 +74,9 @@ pub struct Style {
     /// for it).
     pub code: bool,
     pub link: Option<Arc<str>>,
+    /// An image: the character is [`crate::attachments::OBJECT`], shown as
+    /// the attachment of this name.
+    pub image: Option<Arc<str>>,
 }
 
 /// A character attribute that can be switched on and off.
@@ -449,7 +452,57 @@ impl Doc {
         if p.offset == 0 || p.offset == b.len() {
             s.link = None;
         }
+        // Typing next to an image is text.
+        s.image = None;
         s
+    }
+
+    /// Inserts an image at `p`. It gets a paragraph of its own (the text
+    /// after `p` moves below it; in a table, it goes below the table), and
+    /// the caret goes to the paragraph after it, as in Apple Notes. Returns
+    /// the new caret.
+    pub fn insert_image(&mut self, p: Pos, name: &str) -> Pos {
+        let style = Style { image: Some(Arc::from(name)), ..Style::default() };
+        let obj = crate::attachments::OBJECT.to_string();
+        let mut p = p;
+        if let Some((r, _)) = self.table_of(p.block) {
+            // (There's always a paragraph after a table.)
+            if r.end >= self.blocks.len() {
+                self.blocks.push(Block::default());
+            }
+            p = Pos::new(r.end, 0);
+        }
+        if p.offset > 0 {
+            p = self.split(p);
+        }
+        let rest = !self.blocks[p.block].is_empty();
+        if rest {
+            self.split(p);
+            p = Pos::new(p.block, 0);
+        }
+        let b = &mut self.blocks[p.block];
+        // Headings and code blocks can't hold an image: it's body text.
+        if matches!(b.kind, Kind::Title | Kind::Heading | Kind::Subheading | Kind::Monospaced) {
+            b.kind = Kind::Body;
+        }
+        b.insert(0, &obj, &style);
+        if !rest {
+            self.blocks.insert(p.block + 1, Block::default());
+        }
+        Pos::new(p.block + 1, 0)
+    }
+
+    /// The attachments the document shows, in order, each once.
+    pub fn images(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for s in self.blocks.iter().flat_map(|b| &b.styles) {
+            if let Some(n) = &s.image {
+                if !out.iter().any(|x| **x == **n) {
+                    out.push(n.to_string());
+                }
+            }
+        }
+        out
     }
 
     /// Deletes `[start, end)`, joining the first and last paragraph. The first
@@ -1164,6 +1217,31 @@ mod tests {
         assert_eq!(d.word_step(Pos::new(0, 16), -1), Pos::new(0, 11));
         assert_eq!(d.word_step(Pos::new(0, 0), 1), Pos::new(0, 5));
         assert_eq!(d.word_step(Pos::new(0, 5), 1), Pos::new(0, 10));
+    }
+
+    #[test]
+    fn images_get_a_paragraph_of_their_own() {
+        let mut d = doc(&[(Kind::Title, "Trip"), (Kind::Body, "before after")]);
+        let p = d.insert_image(Pos::new(1, 7), "x.png");
+        assert_eq!(p, Pos::new(3, 0));
+        let o = crate::attachments::OBJECT.to_string();
+        assert_eq!(texts(&d)[1..], [(Kind::Body, "before ".into()), (Kind::Body, o.clone()), (Kind::Body, "after".into())]);
+        assert_eq!(d.blocks[2].styles[0].image.as_deref(), Some("x.png"));
+        // At the end of a note: an empty paragraph to go on in.
+        let mut d = doc(&[(Kind::Title, "Trip")]);
+        let p = d.insert_image(Pos::new(0, 4), "y.png");
+        assert_eq!(texts(&d), [(Kind::Title, "Trip".into()), (Kind::Body, o.clone()), (Kind::Body, String::new())]);
+        assert_eq!(p, Pos::new(2, 0));
+        // Typing after an image isn't an image.
+        assert_eq!(d.style_at(Pos::new(1, 1)).image, None);
+        assert_eq!(d.images(), vec!["y.png"]);
+        // In a table: below it.
+        let mut d = doc(&[(Kind::Body, "")]);
+        d.insert_table(Pos::new(0, 0), 1, 2);
+        let p = d.insert_image(Pos::new(1, 0), "z.png");
+        assert!(d.blocks[0].text.is_empty() && d.blocks[1].text.is_empty());
+        assert_eq!(d.blocks[2].text, o);
+        assert_eq!(p, Pos::new(3, 0));
     }
 
     #[test]

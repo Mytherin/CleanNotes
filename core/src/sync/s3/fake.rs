@@ -16,7 +16,7 @@ pub const SECRET_KEY: &str = "secret/key+123";
 
 #[derive(Clone, Debug)]
 pub struct Obj {
-    pub body: String,
+    pub body: Vec<u8>,
     pub etag: String,
     pub modified: DateTime<Utc>,
 }
@@ -63,7 +63,14 @@ impl FakeS3 {
     pub fn put(&self, key: &str, body: &str) {
         let mut s = self.state();
         let etag = s.next_etag();
-        s.objects.insert(key.to_owned(), Obj { body: body.to_owned(), etag, modified: Utc::now() });
+        s.objects.insert(key.to_owned(), Obj { body: body.as_bytes().to_vec(), etag, modified: Utc::now() });
+    }
+}
+
+impl Obj {
+    /// The object as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
     }
 }
 
@@ -79,14 +86,14 @@ fn xml_escape(s: &str) -> String {
 }
 
 fn error(status: u16, code: &str) -> Response {
-    Response { status, body: format!("<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>"), content_type: "application/xml", headers: vec![] }
+    Response { status, body: format!("<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>").into_bytes(), content_type: "application/xml", headers: vec![] }
 }
 
 fn signature_ok(req: &Request) -> bool {
     let h = |n: &str| req.headers.get(n).cloned().unwrap_or_default();
     let Ok(t) = NaiveDateTime::parse_from_str(&h("x-amz-date"), "%Y%m%dT%H%M%SZ") else { return false };
     let payload = h("x-amz-content-sha256");
-    if payload != sigv4::sha256_hex(req.body.as_bytes()) {
+    if payload != sigv4::sha256_hex(&req.body) {
         return false;
     }
     let query: Vec<(String, String)> = req.query.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -116,7 +123,7 @@ fn route(s: &mut State, req: &Request) -> Response {
     }
     let found = |o: &Obj, body: bool| Response {
         status: 200,
-        body: if body { o.body.clone() } else { String::new() },
+        body: if body { o.body.clone() } else { Vec::new() },
         content_type: "text/plain",
         headers: vec![("ETag", o.etag.clone()), ("Last-Modified", o.modified.to_rfc2822())],
     };
@@ -148,9 +155,9 @@ fn route(s: &mut State, req: &Request) -> Response {
             xml.push_str("</ListBucketResult>");
             if let Some((k, body)) = s.after_list.take() {
                 let etag = s.next_etag();
-                s.objects.insert(k, Obj { body, etag, modified: Utc::now() });
+                s.objects.insert(k, Obj { body: body.into_bytes(), etag, modified: Utc::now() });
             }
-            Response { status: 200, body: xml, content_type: "application/xml", headers: vec![] }
+            Response { status: 200, body: xml.into_bytes(), content_type: "application/xml", headers: vec![] }
         }
         "GET" if s.forbidden.contains(&key) => error(403, "AccessDenied"),
         "GET" => match s.objects.get(&key) {
@@ -159,7 +166,7 @@ fn route(s: &mut State, req: &Request) -> Response {
         },
         "HEAD" => match s.objects.get(&key) {
             Some(o) => found(o, false),
-            None => Response { status: 404, body: String::new(), content_type: "text/plain", headers: vec![] },
+            None => Response { status: 404, body: Vec::new(), content_type: "text/plain", headers: vec![] },
         },
         "PUT" => {
             let existing = s.objects.get(&key);
@@ -180,7 +187,7 @@ fn route(s: &mut State, req: &Request) -> Response {
             }
             let etag = s.next_etag();
             s.objects.insert(key, Obj { body: req.body.clone(), etag: etag.clone(), modified: Utc::now() });
-            Response { status: 200, body: String::new(), content_type: "text/plain", headers: vec![("ETag", etag)] }
+            Response { status: 200, body: Vec::new(), content_type: "text/plain", headers: vec![("ETag", etag)] }
         }
         "DELETE" => {
             if s.refuse_deletes {
@@ -195,7 +202,7 @@ fn route(s: &mut State, req: &Request) -> Response {
                 }
             }
             s.objects.remove(&key);
-            Response { status: 204, body: String::new(), content_type: "text/plain", headers: vec![] }
+            Response { status: 204, body: Vec::new(), content_type: "text/plain", headers: vec![] }
         }
         _ => error(405, "MethodNotAllowed"),
     }

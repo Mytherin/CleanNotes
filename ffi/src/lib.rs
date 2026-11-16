@@ -215,6 +215,9 @@ pub struct Ticked {
     pub changed: bool,
     /// Unlocked notes locked again after a while without use.
     pub auto_locked: bool,
+    /// A sync brought pictures: an open note showing ones that were missing
+    /// should show itself again.
+    pub attachments: bool,
     /// Messages to show.
     pub notices: Vec<String>,
 }
@@ -341,7 +344,20 @@ impl NotesCore {
     pub fn tick(&self) -> Ticked {
         let mut lib = self.lib();
         let t = lib.tick();
-        Ticked { changed: t.changed, auto_locked: t.auto_locked, notices: lib.take_notices() }
+        Ticked { changed: t.changed, auto_locked: t.auto_locked, attachments: t.attachments, notices: lib.take_notices() }
+    }
+
+    /// Saves a picture (a PNG, JPEG, GIF, WebP, BMP or HEIC file's bytes) to
+    /// attach to a note. Returns its name, for
+    /// [`EditorCommand::InsertImage`].
+    pub fn add_image(&self, data: Vec<u8>) -> Result<String, CoreError> {
+        self.lib().add_image(&data).map_err(|e| failed(format!("{e:#}")))
+    }
+
+    /// Where an attachment's file is, if this device has it yet (a synced
+    /// note's pictures may still be on their way).
+    pub fn attachment_path(&self, name: String) -> Option<String> {
+        self.lib().attachment_path(&name).map(|p| p.to_string_lossy().into_owned())
     }
 
     /// Saves everything now (going to the background, quitting).
@@ -793,6 +809,9 @@ pub struct TextRun {
     pub link: Option<String>,
     /// A #tag.
     pub tag: bool,
+    /// A picture: the run is one attachment character (U+FFFC), shown as
+    /// the attachment of this name ([`NotesCore::attachment_path`]).
+    pub image: Option<String>,
 }
 
 /// A paragraph to lay out.
@@ -853,6 +872,9 @@ pub enum EditorCommand {
     Undo,
     Redo,
     SelectAll,
+    /// Puts a picture (saved with [`NotesCore::add_image`]) at the caret,
+    /// on a line of its own.
+    InsertImage { name: String },
 }
 
 #[derive(uniffi::Object)]
@@ -974,6 +996,7 @@ impl NoteEditor {
             EditorCommand::Undo => Command::Undo,
             EditorCommand::Redo => Command::Redo,
             EditorCommand::SelectAll => Command::SelectAll,
+            EditorCommand::InsertImage { name } => Command::InsertImage(name),
         };
         self.ed().command(c);
     }
@@ -1063,6 +1086,7 @@ fn paragraph(b: &doc::Block, number: u32) -> Paragraph {
     for (i, c) in chars.iter().enumerate() {
         let s = b.styles.get(i).cloned().unwrap_or_default();
         let link = s.link.as_deref().map(str::to_owned).or_else(|| auto[i].clone());
+        let image = s.image.as_deref().map(str::to_owned);
         let run = TextRun {
             text: String::new(),
             bold: s.bold,
@@ -1072,9 +1096,11 @@ fn paragraph(b: &doc::Block, number: u32) -> Paragraph {
             code: s.code,
             link,
             tag: tag[i],
+            image: image.clone(),
         };
         match runs.last_mut() {
-            Some(last) if TextRun { text: String::new(), ..last.clone() } == run => last.text.push(*c),
+            // A picture is a run of its own (one attachment character).
+            Some(last) if image.is_none() && TextRun { text: String::new(), ..last.clone() } == run => last.text.push(*c),
             _ => runs.push(TextRun { text: c.to_string(), ..run }),
         }
     }
@@ -1261,6 +1287,32 @@ mod tests {
         assert!(core.leave_note(m.id));
         let ov = core.overview();
         assert_eq!(ov.accounts[0].folders[0].count, 1);
+    }
+
+    #[test]
+    fn pictures_through_the_bindings() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.lib().default_folder_id(LOCAL) };
+        let n = core.new_note(home);
+        let e = core.new_note_editor(n.id.clone());
+        e.replace(0, 0, "Trip".into());
+        assert!(core.add_image(b"not a picture".to_vec()).is_err());
+        let name = core.add_image(b"\x89PNG\r\n\x1a\nphoto".to_vec()).unwrap();
+        e.command(EditorCommand::InsertImage { name: name.clone() });
+        let s = e.state();
+        // One attachment character, a run of its own, one UTF-16 unit.
+        let run = &s.paragraphs[1].runs[0];
+        assert_eq!((run.text.as_str(), run.image.as_deref()), ("\u{FFFC}", Some(name.as_str())));
+        assert_eq!((s.selection_start, s.selection_end), (7, 7));
+        assert_eq!(e.paragraph_start(2), 7);
+        assert!(core.save_editor(e.clone()));
+        assert_eq!(core.markdown(n.id.clone()).unwrap(), format!("# Trip\n![](attachments/{name})\n"));
+        let path = core.attachment_path(name.clone()).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG\r\n\x1a\nphoto");
+        assert_eq!(core.attachment_path("../x.png".into()), None);
+        // Backspace after it takes it out, as typed.
+        e.replace(5, 6, String::new());
+        assert!(e.state().paragraphs.iter().all(|p| p.runs.iter().all(|r| r.image.is_none())));
     }
 
     #[test]

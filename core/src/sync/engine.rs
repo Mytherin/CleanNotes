@@ -18,11 +18,16 @@
 //!    - deleted there but edited here: ours is put back (an edit beats a
 //!      delete); deleted there and not edited here: deleted here.
 //! 4. Upload what changed here, each update based on the revision last
-//!    seen. If one is refused because it changed in the meantime, pull and
-//!    reconcile again (at most a few rounds).
+//!    seen, and each note's new images just before it. If one is refused
+//!    because it changed in the meantime, pull and reconcile again (at most
+//!    a few rounds).
 //! 5. Delete folders deleted here.
+//! 6. Download the images notes show that this device doesn't have. (A
+//!    sync with only that to do still runs: see
+//!    [`AccountSnapshot::missing_attachments`].)
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -31,6 +36,7 @@ use super::merge::{merge_text, merge_value};
 use super::{Backend, Conflict, RemoteNote, Snapshot};
 #[cfg(test)]
 use super::NoteData;
+use crate::attachments;
 use crate::model::{new_id, Folder, Note, NoteSync, Store, Tombstone};
 
 const MAX_ROUNDS: usize = 4;
@@ -43,9 +49,25 @@ pub struct AccountSnapshot {
     pub folders: Vec<Folder>,
     pub notes: Vec<Note>,
     pub tombstones: Vec<Tombstone>,
+    /// The folder this device keeps attachments in (see
+    /// [`crate::attachments`]). `None`: attachments aren't synced.
+    pub attachments: Option<PathBuf>,
 }
 
 impl AccountSnapshot {
+    /// With the attachments in `dir` synced too.
+    pub fn with_attachments(mut self, dir: &Path) -> AccountSnapshot {
+        self.attachments = Some(dir.to_owned());
+        self
+    }
+
+    /// Images the account's notes show that this device doesn't have yet:
+    /// a sync then pulls, even if nothing else changed, to fetch them.
+    pub fn missing_attachments(&self) -> bool {
+        let Some(dir) = &self.attachments else { return false };
+        self.notes.iter().any(|n| attachments::refs_in(&n.body).iter().any(|a| !attachments::exists(dir, a)))
+    }
+
     pub fn of(store: &Store, account: &str) -> AccountSnapshot {
         AccountSnapshot {
             account: account.to_owned(),
@@ -53,6 +75,7 @@ impl AccountSnapshot {
             folders: store.folders.iter().filter(|f| f.account == account).cloned().collect(),
             notes: store.notes.iter().filter(|n| n.account == account).cloned().collect(),
             tombstones: store.tombstones.iter().filter(|t| t.account == account).cloned().collect(),
+            attachments: None,
         }
     }
 
@@ -95,11 +118,13 @@ pub struct Outcome {
     /// Why the sync stopped early, if it did. What was done until then is in
     /// the outcome.
     pub error: Option<String>,
+    /// Attachments downloaded (pictures that can now be shown).
+    pub attachments_fetched: usize,
 }
 
 pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime<Utc>) -> Result<Outcome> {
     let mut out = Outcome { account: snap.account.clone(), ..Outcome::default() };
-    if !snap.has_local_changes() && snap.cursor.is_some() {
+    if !snap.has_local_changes() && snap.cursor.is_some() && !snap.missing_attachments() {
         let cursor = backend.cursor()?;
         if cursor.is_some() && cursor == snap.cursor {
             out.unchanged = true;
@@ -159,7 +184,7 @@ fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime
         let cursor_before = backend.cursor()?;
         let remote = backend.pull()?;
         reconcile(&mut w, account, remote, &deleting, now, &mut out.notices);
-        match push_notes(backend, &mut w) {
+        match push_notes(backend, &mut w, snap.attachments.as_deref()) {
             Ok((false, false)) => {
                 // Only the cursor from before the pull is known to be
                 // covered: one read now could include another device's
@@ -202,6 +227,15 @@ fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime
         // reason as above.)
     } else {
         out.cursor = None;
+    }
+    // Pictures the notes show that this device doesn't have yet.
+    if let (None, Some(dir)) = (&out.error, &snap.attachments) {
+        let (n, err) = fetch_attachments(backend, dir, &w.notes);
+        out.attachments_fetched = n;
+        if let Some(e) = err {
+            out.error = Some(e);
+            out.cursor = None;
+        }
     }
     out.folders = w.folders;
     out.notes = w.notes;
@@ -481,11 +515,55 @@ fn take_remote(n: &mut Note, r: &RemoteNote, folder: String) {
     };
 }
 
-/// Uploads changed notes. Returns whether any was refused because it had
-/// changed on the backend (another round is needed).
-/// Uploads changed notes. Returns (whether some were refused as conflicts,
-/// whether anything was written).
-fn push_notes(backend: &mut dyn Backend, w: &mut Store) -> Result<(bool, bool)> {
+/// Uploads the images a note shows that the backend doesn't have, so they're
+/// there before the note is (another device never sees a note whose
+/// pictures it can't get). Images this device doesn't have either are
+/// skipped: whoever added them uploads them.
+fn push_attachments(backend: &mut dyn Backend, dir: &Path, body: &str) -> Result<()> {
+    for name in attachments::refs_in(body) {
+        if backend.has_attachment(&name)? {
+            continue;
+        }
+        let Ok(data) = std::fs::read(attachments::path(dir, &name)) else { continue };
+        if !attachments::verify(&name, &data) {
+            continue; // damaged here; not spread
+        }
+        backend.put_attachment(&name, &data)?;
+    }
+    Ok(())
+}
+
+/// Downloads the images `notes` show that `dir` doesn't have and the backend
+/// does, checking each is what its name says. Returns how many arrived, and
+/// the error that stopped it, if one did.
+fn fetch_attachments(backend: &mut dyn Backend, dir: &Path, notes: &[Note]) -> (usize, Option<String>) {
+    let mut wanted: Vec<String> = Vec::new();
+    for n in notes {
+        for a in attachments::refs_in(&n.body) {
+            if !wanted.contains(&a) && !attachments::exists(dir, &a) {
+                wanted.push(a);
+            }
+        }
+    }
+    let mut fetched = 0;
+    for name in wanted {
+        let r = backend.has_attachment(&name).and_then(|has| if has { backend.get_attachment(&name) } else { Ok(None) });
+        match r {
+            // A damaged one is left out (and tried again next time).
+            Ok(Some(data)) if attachments::verify(&name, &data) => match attachments::write(dir, &name, &data) {
+                Ok(()) => fetched += 1,
+                Err(e) => return (fetched, Some(format!("{e:#}"))),
+            },
+            Ok(_) => {}
+            Err(e) => return (fetched, Some(format!("downloading a picture: {e:#}"))),
+        }
+    }
+    (fetched, None)
+}
+
+/// Uploads changed notes (each note's new images first). Returns (whether
+/// some were refused as conflicts, whether anything was written).
+fn push_notes(backend: &mut dyn Backend, w: &mut Store, dir: Option<&Path>) -> Result<(bool, bool)> {
     let mut conflicts = false;
     let mut wrote = false;
     for i in 0..w.notes.len() {
@@ -499,6 +577,10 @@ fn push_notes(backend: &mut dyn Backend, w: &mut Store) -> Result<(bool, bool)> 
             w.notes[i].sync.dirty = false;
             continue;
         }
+        if let Some(dir) = dir {
+            push_attachments(backend, dir, &data.body)?;
+        }
+        let n = &w.notes[i];
         match backend.save_note(n.sync.remote_id.as_deref(), n.sync.revision.as_deref(), &data) {
             Ok((remote_id, revision)) => {
                 let n = &mut w.notes[i];

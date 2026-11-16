@@ -38,6 +38,8 @@ final class NotesStore: ObservableObject {
         self.core = opened ?? NotesStore.fallbackCore(listener: listener)
         self.startupError = opened == nil ? failure : nil
         listener.store = self
+        let core = self.core
+        NoteImages.shared.path = { name in core.attachmentPath(name: name) }
     }
 
     /// Application Support/CleanNotes.
@@ -81,7 +83,8 @@ final class NotesStore: ObservableObject {
     func tick() {
         saveEditor()
         let t = core.tick()
-        if t.changed || t.autoLocked {
+        if t.changed || t.autoLocked || t.attachments {
+            // (Pictures arriving: the open note shows them.)
             changed()
             for f in onSyncChange.values { f() }
         }

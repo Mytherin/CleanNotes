@@ -46,6 +46,15 @@ pub enum Command {
     /// A table's first row (or column) can be a header.
     ToggleHeaderRow,
     ToggleHeaderColumn,
+    /// Puts an image (an attachment's name, saved already) at the caret,
+    /// in place of the selection.
+    InsertImage(String),
+}
+
+/// Text from outside (typed, pasted from another app) can't hold images:
+/// a stray object character would show as one without a picture.
+fn without_objects(text: &str) -> String {
+    text.replace(crate::attachments::OBJECT, "")
 }
 
 /// Find in note.
@@ -282,7 +291,7 @@ impl Editing {
 
     /// Typing (one character or an IME's commit) over the selection.
     pub fn insert_text(&mut self, text: &str) {
-        let text: String = text.chars().filter(|&c| c == '\n' || c == '\t' || !c.is_control()).collect();
+        let text: String = without_objects(text).chars().filter(|&c| c == '\n' || c == '\t' || !c.is_control()).collect();
         if text.is_empty() {
             return;
         }
@@ -415,7 +424,7 @@ impl Editing {
         self.sel = Selection { anchor: start, caret: end };
         let style = self.typing_style();
         let at = self.delete_selection();
-        let end = self.doc.insert(at, &text.replace("\r\n", "\n"), &style);
+        let end = self.doc.insert(at, &without_objects(&text.replace("\r\n", "\n")), &style);
         self.sel = Selection::caret(end);
     }
 
@@ -493,6 +502,15 @@ impl Editing {
                 self.checkpoint(None);
                 let at = self.delete_selection();
                 let p = self.doc.insert_table(at, 3, 3);
+                self.sel = Selection::caret(p);
+            }
+            Command::InsertImage(name) => {
+                if !crate::attachments::is_name(&name) {
+                    return;
+                }
+                self.checkpoint(None);
+                let at = self.delete_selection();
+                let p = self.doc.insert_image(at, &name);
                 self.sel = Selection::caret(p);
             }
             Command::AddRowAbove
@@ -640,6 +658,10 @@ impl Editing {
                 self.sel = Selection::caret(end);
                 return;
             }
+        }
+        let text = without_objects(&text);
+        if text.is_empty() && self.sel.is_empty() {
+            return;
         }
         self.checkpoint(None);
         let style = self.doc.style_at(self.sel.start());
@@ -862,6 +884,37 @@ mod tests {
         // Text from elsewhere comes in as plain text.
         e.paste("*x*");
         assert!(e.take_markdown().unwrap().ends_with("task\\*x\\*\n"));
+    }
+
+    #[test]
+    fn inserting_copying_and_undoing_images() {
+        let name = crate::attachments::name_for(b"pic", "png");
+        let mut e = Editing::new("n", "# Trip\nday one\n");
+        e.set_caret(Pos::new(1, 3), false);
+        e.command(Command::InsertImage(name.clone()));
+        assert_eq!(e.take_markdown().unwrap(), format!("# Trip\nday\n![](attachments/{name})\n one\n"));
+        assert_eq!(e.sel.caret, Pos::new(3, 0));
+        // Typing goes on as text.
+        e.insert_text("x");
+        assert_eq!(e.doc.blocks[3].styles[0].image, None);
+        // Copied and pasted inside the app, the image comes along.
+        e.set_selection(Pos::new(2, 0), Pos::new(2, 1));
+        let plain = e.copy().unwrap();
+        e.set_caret(e.doc.end(), false);
+        e.paste(&plain);
+        assert_eq!(e.doc.images(), vec![name.clone()]);
+        assert_eq!(e.doc.blocks.iter().flat_map(|b| &b.styles).filter(|s| s.image.is_some()).count(), 2);
+        // From another app, the object character is dropped.
+        e.paste("a\u{FFFC}b");
+        assert!(e.doc.blocks.last().unwrap().text.ends_with("ab"));
+        // Undo takes the image back out.
+        for _ in 0..4 {
+            e.command(Command::Undo);
+        }
+        assert_eq!(e.doc.plain_text(), "Trip\nday one");
+        // A name that isn't an attachment's does nothing.
+        e.command(Command::InsertImage("../../x.png".into()));
+        assert!(e.doc.images().is_empty());
     }
 
     #[test]

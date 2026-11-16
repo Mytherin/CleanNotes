@@ -1,5 +1,8 @@
+import ImageIO
+import PhotosUI
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 // The note editor: a UITextView whose text is the shared editing engine's
 // document (the same one the desktop editor drives). Every edit goes to the
@@ -39,6 +42,74 @@ final class ParagraphMark: NSObject {
     }
 }
 
+/// Pictures in notes: loaded once (no bigger than the screen needs), by
+/// attachment name. A picture not on the phone yet isn't remembered, so it
+/// shows once a sync brings it.
+final class NoteImages {
+    static let shared = NoteImages()
+    private let cache = NSCache<NSString, UIImage>()
+    /// Where an attachment's file is (the core knows), if it's here.
+    var path: (String) -> String? = { _ in nil }
+
+    func image(_ name: String) -> UIImage? {
+        if let i = cache.object(forKey: name as NSString) { return i }
+        guard let p = path(name), let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: p) as CFURL, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: 2048,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else { return nil }
+        let img = UIImage(cgImage: cg)
+        cache.setObject(img, forKey: name as NSString)
+        return img
+    }
+
+    /// A box shown while a picture is on its way.
+    static func placeholder(width: CGFloat) -> UIImage {
+        let size = CGSize(width: width, height: 150)
+        return UIGraphicsImageRenderer(size: size).image { _ in
+            let path = UIBezierPath(roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5), cornerRadius: 8)
+            UIColor.secondarySystemFill.setFill()
+            path.fill()
+            UIColor.separator.setStroke()
+            path.stroke()
+            let text = "Picture not here yet" as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: UIFont.preferredFont(forTextStyle: .footnote), .foregroundColor: UIColor.secondaryLabel]
+            let t = text.size(withAttributes: attrs)
+            text.draw(at: CGPoint(x: (size.width - t.width) / 2, y: (size.height - t.height) / 2), withAttributes: attrs)
+        }
+    }
+
+    /// A picture's bytes as they're best kept: PNG and GIF as they are;
+    /// photos (HEIC, JPEG) drawn upright, at most 3000 pixels, as JPEG, so
+    /// every device shows them (the desktop app can't read HEIC).
+    static func portable(_ data: Data) -> Data {
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) || data.starts(with: Array("GIF8".utf8)) {
+            return data
+        }
+        guard let img = UIImage(data: data) else { return data }
+        let px = CGSize(width: img.size.width * img.scale, height: img.size.height * img.scale)
+        let k = min(1, 3000 / max(px.width, px.height, 1))
+        let size = CGSize(width: (px.width * k).rounded(), height: (px.height * k).rounded())
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let upright = UIGraphicsImageRenderer(size: size, format: format).image { _ in
+            img.draw(in: CGRect(origin: .zero, size: size))
+        }
+        return upright.jpegData(compressionQuality: 0.85) ?? data
+    }
+}
+
+/// How wide pictures may be shown, and the screen's scale.
+struct ImageLayout {
+    var width: CGFloat
+    var scale: CGFloat
+
+    static let standard = ImageLayout(width: 300, scale: 2)
+}
+
 /// Turns the engine's paragraphs into attributed text.
 enum NoteTextRenderer {
     /// Body text size on the iPhone for the settings' text size (the
@@ -53,26 +124,53 @@ enum NoteTextRenderer {
     }
     static func quoteWidth(_ body: CGFloat) -> CGFloat { body }
 
-    static func attributed(_ paragraphs: [Paragraph], textSize: Float) -> NSAttributedString {
+    static func attributed(_ paragraphs: [Paragraph], textSize: Float, images: ImageLayout = .standard) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for (i, p) in paragraphs.enumerated() {
-            out.append(attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count))
+            out.append(attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count, images: images))
         }
         return out
     }
 
     /// One paragraph, with its line break if another follows.
-    static func attributed(_ p: Paragraph, textSize: Float, terminated: Bool) -> NSAttributedString {
+    static func attributed(_ p: Paragraph, textSize: Float, terminated: Bool, images: ImageLayout = .standard) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let mark = ParagraphMark(p)
         let para = paragraphStyle(p, textSize: textSize)
         for run in p.runs {
-            out.append(NSAttributedString(string: run.text, attributes: attributes(p, run: run, textSize: textSize, mark: mark, para: para)))
+            let attrs = attributes(p, run: run, textSize: textSize, mark: mark, para: para)
+            if let name = run.image {
+                // One attachment character, as in the engine's text.
+                let picture = NSMutableAttributedString(attachment: attachment(name, layout: images))
+                picture.addAttributes(attrs, range: NSRange(location: 0, length: picture.length))
+                out.append(picture)
+            } else {
+                out.append(NSAttributedString(string: run.text, attributes: attrs))
+            }
         }
         if terminated {
             out.append(NSAttributedString(string: "\n", attributes: attributes(p, run: nil, textSize: textSize, mark: mark, para: para)))
         }
         return out
+    }
+
+    /// A picture, as wide as it is (in points) but no wider than the text.
+    static func attachment(_ name: String, layout: ImageLayout) -> NSTextAttachment {
+        let a = NSTextAttachment()
+        let width = max(layout.width, 60)
+        if let img = NoteImages.shared.image(name), img.size.width > 0 {
+            var size = CGSize(width: img.size.width / max(layout.scale, 1), height: img.size.height / max(layout.scale, 1))
+            if size.width > width {
+                size = CGSize(width: width, height: size.height * width / size.width)
+            }
+            a.image = img
+            a.bounds = CGRect(origin: .zero, size: size)
+        } else {
+            let w = min(width, 260)
+            a.image = NoteImages.placeholder(width: w)
+            a.bounds = CGRect(x: 0, y: 0, width: w, height: 150)
+        }
+        return a
     }
 
     static func paragraphStyle(_ p: Paragraph, textSize: Float) -> NSParagraphStyle {
@@ -147,7 +245,7 @@ enum NoteTextRenderer {
 
     /// What typing at the caret should look like.
     static func typingAttributes(_ p: Paragraph, formatting f: Formatting, textSize: Float) -> [NSAttributedString.Key: Any] {
-        let run = TextRun(text: "", bold: f.bold, italic: f.italic, underline: f.underline, strike: f.strike, code: f.code, link: f.link, tag: false)
+        let run = TextRun(text: "", bold: f.bold, italic: f.italic, underline: f.underline, strike: f.strike, code: f.code, link: f.link, tag: false, image: nil)
         return attributes(p, run: run, textSize: textSize)
     }
 }
@@ -303,9 +401,25 @@ final class NoteTextView: UITextView {
 
     override var undoManager: UndoManager? { engineUndo }
 
+    /// The width pictures were last fitted to.
+    private var laidOutWidth: CGFloat = 0
+
     override func layoutSubviews() {
         super.layoutSubviews()
         dateLabel.frame = CGRect(x: 0, y: 6, width: bounds.width, height: 18)
+        // Pictures fit the text's width: shown again when it changes (the
+        // first layout, turning the phone).
+        if abs(bounds.width - laidOutWidth) > 0.5 {
+            laidOutWidth = bounds.width
+            coordinator?.widthChanged()
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) && UIPasteboard.general.hasImages && !UIPasteboard.general.hasStrings {
+            return !(coordinator?.readOnly ?? true)
+        }
+        return super.canPerformAction(action, withSender: sender)
     }
 
     override func copy(_ sender: Any?) {
@@ -325,7 +439,17 @@ final class NoteTextView: UITextView {
     override func paste(_ sender: Any?) {
         guard let c = coordinator else { return super.paste(sender) }
         if c.readOnly { c.blockedEdit(); return }
-        guard let text = UIPasteboard.general.string else { return }
+        let pb = UIPasteboard.general
+        if !pb.hasStrings && pb.hasImages {
+            // A picture: attached.
+            let data = pb.data(forPasteboardType: UTType.png.identifier)
+                ?? pb.data(forPasteboardType: UTType.jpeg.identifier)
+                ?? pb.data(forPasteboardType: UTType.heic.identifier)
+                ?? pb.image?.pngData()
+            if let data { c.attachImage(data) }
+            return
+        }
+        guard let text = pb.string else { return }
         c.editor.paste(text: text)
         c.render()
         c.edited()
@@ -421,7 +545,7 @@ struct NoteEditorView: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, PHPickerViewControllerDelegate {
         let editor: NoteEditor
         let store: NotesStore
         let bridge: EditorBridge
@@ -453,7 +577,7 @@ struct NoteEditorView: UIViewRepresentable {
             let state = editor.state()
             rendering = true
             tv.notesLayout.textSize = textSize
-            let text = NoteTextRenderer.attributed(state.paragraphs, textSize: textSize)
+            let text = NoteTextRenderer.attributed(state.paragraphs, textSize: textSize, images: imageLayout())
             tv.storage.beginEditing()
             tv.storage.setAttributedString(text)
             tv.storage.endEditing()
@@ -464,6 +588,69 @@ struct NoteEditorView: UIViewRepresentable {
             rendering = false
             refreshFormatting()
             tv.setNeedsDisplay()
+        }
+
+        /// How wide pictures may be: the text's width.
+        private func imageLayout() -> ImageLayout {
+            guard let tv = textView else { return .standard }
+            let w = tv.bounds.width - tv.textContainerInset.left - tv.textContainerInset.right - 2 * tv.textContainer.lineFragmentPadding - 2
+            return ImageLayout(width: w > 0 ? w : ImageLayout.standard.width, scale: tv.traitCollection.displayScale)
+        }
+
+        /// The text view's width changed: pictures are fitted again.
+        func widthChanged() {
+            if rendering { return }
+            if editor.state().paragraphs.contains(where: { p in p.runs.contains { $0.image != nil } }) {
+                render()
+            }
+        }
+
+        // ---- Pictures ----
+
+        /// Puts a picture (an image file's bytes) at the caret.
+        func attachImage(_ data: Data) {
+            if readOnly {
+                blockedEdit()
+                return
+            }
+            if store.core.isLocked(id: editor.noteId()) {
+                store.show("Images can't be added to locked notes.")
+                return
+            }
+            guard let name = try? store.core.addImage(data: NoteImages.portable(data)) else {
+                store.show("That picture can't be added.")
+                return
+            }
+            command(.insertImage(name: name))
+        }
+
+        @objc fileprivate func photoTapped() {
+            if readOnly {
+                blockedEdit()
+                return
+            }
+            if store.core.isLocked(id: editor.noteId()) {
+                store.show("Images can't be added to locked notes.")
+                return
+            }
+            var config = PHPickerConfiguration()
+            config.filter = .images
+            config.selectionLimit = 0
+            let picker = PHPickerViewController(configuration: config)
+            picker.delegate = self
+            guard var top = textView?.window?.rootViewController else { return }
+            while let next = top.presentedViewController { top = next }
+            top.present(picker, animated: true)
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+            for r in results where r.itemProvider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                r.itemProvider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
+                    guard let data else { return }
+                    DispatchQueue.main.async { self?.attachImage(data) }
+                }
+            }
         }
 
         private func updateTrailingMark(_ paragraphs: [Paragraph]) {
@@ -483,7 +670,7 @@ struct NoteEditorView: UIViewRepresentable {
             guard let p = editor.paragraph(index: index) else { return }
             let start = Int(editor.paragraphStart(index: index))
             let last = index + 1 >= editor.paragraphCount()
-            let styled = NoteTextRenderer.attributed(p, textSize: textSize, terminated: !last)
+            let styled = NoteTextRenderer.attributed(p, textSize: textSize, terminated: !last, images: imageLayout())
             let range = NSRange(location: start, length: styled.length)
             guard NSMaxRange(range) <= tv.storage.length,
                   (tv.storage.string as NSString).substring(with: range) == styled.string else {
@@ -679,6 +866,7 @@ struct NoteEditorView: UIViewRepresentable {
                 item("checklist", "Checklist", #selector(checklistTapped)), flex(),
                 item("decrease.indent", "Outdent", #selector(outdentTapped)), flex(),
                 item("increase.indent", "Indent", #selector(indentTapped)), flex(),
+                item("photo", "Add Photo", #selector(photoTapped)), flex(),
                 item("link", "Link", #selector(linkTapped)), flex(),
                 item("xmark.circle", "Done", #selector(doneTapped)),
             ]

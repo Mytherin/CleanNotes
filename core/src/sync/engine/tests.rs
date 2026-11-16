@@ -11,6 +11,8 @@ const ACC: &str = "acc";
 struct Device {
     store: Store,
     backend: SqliteBackend,
+    /// Where the device keeps attachments.
+    att: tempfile::TempDir,
 }
 
 impl Device {
@@ -25,11 +27,11 @@ impl Device {
             last_sync: None,
         });
         store.ensure_local();
-        Device { store, backend: SqliteBackend::open(&Config { path: path.into() }).unwrap() }
+        Device { store, backend: SqliteBackend::open(&Config { path: path.into() }).unwrap(), att: tempfile::tempdir().unwrap() }
     }
 
     fn sync(&mut self) -> Vec<String> {
-        let snap = AccountSnapshot::of(&self.store, ACC);
+        let snap = AccountSnapshot::of(&self.store, ACC).with_attachments(self.att.path());
         let out = sync_account(&mut self.backend, &snap, Utc::now()).unwrap();
         assert_eq!(out.error, None);
         apply(&mut self.store, &snap, out)
@@ -385,6 +387,35 @@ fn a_note_moved_to_another_account_during_a_sync_leaves_it() {
     assert!(laptop.bodies().is_empty());
 }
 
+#[test]
+fn pictures_go_up_once_and_damaged_ones_never_come_down() {
+    use crate::attachments;
+    let (_d, mut laptop, mut phone) = pair();
+    let pic = b"\x89PNG\r\n\x1a\nimage".to_vec();
+    let name = attachments::save(laptop.att.path(), &pic).unwrap();
+    // A picture the laptop doesn't have either: skipped, not an error.
+    let lost = attachments::name_for(b"\x89PNG\r\n\x1a\nlost", "png");
+    laptop.add(&format!("# Pics\n![](attachments/{name})\n![](attachments/{lost})\n"));
+    laptop.sync();
+    assert!(laptop.backend.has_attachment(&name).unwrap());
+    assert!(!laptop.backend.has_attachment(&lost).unwrap());
+    phone.sync();
+    assert_eq!(std::fs::read(attachments::path(phone.att.path(), &name)).unwrap(), pic);
+    assert!(!attachments::exists(phone.att.path(), &lost));
+
+    // A picture damaged on the backend isn't taken.
+    let bad = b"\x89PNG\r\n\x1a\nother".to_vec();
+    let bad_name = attachments::save(laptop.att.path(), &bad).unwrap();
+    laptop.add(&format!("![](attachments/{bad_name})\n"));
+    laptop.sync();
+    let conn = rusqlite::Connection::open(_d.path().join("shared.db")).unwrap();
+    conn.execute("UPDATE attachments SET data = x'00' WHERE name = ?1", [&bad_name]).unwrap();
+    phone.sync();
+    assert!(!attachments::exists(phone.att.path(), &bad_name));
+    // Nor are names that aren't attachments' read or written.
+    assert_eq!(std::fs::read_dir(phone.att.path()).unwrap().count(), 1);
+}
+
 /// A backend where another device writes right after each pull, until the
 /// hook runs out.
 struct Racy<'a> {
@@ -417,6 +448,15 @@ impl Backend for Racy<'_> {
     }
     fn delete_note(&mut self, remote_id: &str, base: Option<&str>) -> anyhow::Result<()> {
         self.inner.delete_note(remote_id, base)
+    }
+    fn has_attachment(&mut self, name: &str) -> anyhow::Result<bool> {
+        self.inner.has_attachment(name)
+    }
+    fn put_attachment(&mut self, name: &str, data: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_attachment(name, data)
+    }
+    fn get_attachment(&mut self, name: &str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.inner.get_attachment(name)
     }
 }
 

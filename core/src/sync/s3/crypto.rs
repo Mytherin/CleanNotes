@@ -10,6 +10,11 @@
 //!   as `CleanNotes-encrypted-1\n` + base64(nonce ‖ ciphertext). The
 //!   object's name (relative to the folder) is authenticated with it, so
 //!   encrypted files can't be swapped for one another.
+//! - Attachments (pictures) are sealed the same way but kept as bytes:
+//!   `CleanNotes-encrypted-bin-1\n` + nonce ‖ ciphertext. Their object names
+//!   are an HMAC of the attachment's name under the key
+//!   ([`attachment_object`]), so the names (hashes of the pictures) don't
+//!   give away which known pictures are there.
 
 use anyhow::{anyhow, bail, Result};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -108,6 +113,44 @@ pub fn is_sealed(text: &str) -> bool {
     text.starts_with(MAGIC)
 }
 
+/// How a binary object (an attachment) starts when encrypted: then the
+/// nonce and the ciphertext, as bytes (no base64: pictures are large).
+pub const MAGIC_BYTES: &[u8] = b"CleanNotes-encrypted-bin-1\n";
+
+pub fn seal_bytes(key: &[u8; 32], name: &str, plain: &[u8]) -> Vec<u8> {
+    let mut nonce = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let ct = XChaCha20Poly1305::new(Key::from_slice(key))
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: &aad(name) })
+        .expect("encryption doesn't fail");
+    let mut out = MAGIC_BYTES.to_vec();
+    out.extend_from_slice(&nonce);
+    out.extend(ct);
+    out
+}
+
+/// The plaintext of [`seal_bytes`]' output, or `None` if it can't be
+/// decrypted with `key` under `name`.
+pub fn open_bytes(key: &[u8; 32], name: &str, data: &[u8]) -> Option<Vec<u8>> {
+    let all = data.strip_prefix(MAGIC_BYTES)?;
+    if all.len() < 24 {
+        return None;
+    }
+    let (nonce, ct) = all.split_at(24);
+    XChaCha20Poly1305::new(Key::from_slice(key)).decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: &aad(name) }).ok()
+}
+
+/// The name an attachment is stored under in an encrypted folder: keyed,
+/// so the listing doesn't tell which pictures (of known content) are there.
+pub fn attachment_object(key: &[u8; 32], name: &str) -> String {
+    use hmac::{Hmac, Mac};
+    let mut m = <Hmac<sha2::Sha256> as Mac>::new_from_slice(key).expect("any key length");
+    m.update(b"cleannotes-attachment:");
+    m.update(name.as_bytes());
+    let tag: String = m.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{tag}.bin")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +167,19 @@ mod tests {
         assert_eq!(open(&[7; 32], "notes/a.md", &sealed), None);
         assert_eq!(open(&key, "notes/a.md", "plain"), None);
         assert_eq!(open(&key, "notes/a.md", &format!("{MAGIC}!!")), None);
+    }
+
+    #[test]
+    fn binary_objects() {
+        let key = [3u8; 32];
+        let pic = b"\x89PNG\r\n\x1a\n\0\xff binary";
+        let sealed = seal_bytes(&key, "attachments/x.bin", pic);
+        assert!(sealed.starts_with(MAGIC_BYTES) && !sealed.windows(6).any(|w| w == b"binary"));
+        assert_eq!(open_bytes(&key, "attachments/x.bin", &sealed).as_deref(), Some(&pic[..]));
+        assert_eq!(open_bytes(&key, "attachments/y.bin", &sealed), None);
+        assert_eq!(open_bytes(&[4; 32], "attachments/x.bin", &sealed), None);
+        let a = attachment_object(&key, "abc.png");
+        assert_ne!(a, attachment_object(&[4; 32], "abc.png"));
+        assert!(a.ends_with(".bin") && !a.contains("abc"));
     }
 }

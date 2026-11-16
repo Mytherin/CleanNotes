@@ -1,6 +1,7 @@
 //! Syncing accounts with where their notes are kept.
 //!
-//! A backend ([`Backend`]) only stores folders and notes and lists them back;
+//! A backend ([`Backend`]) only stores folders, notes and attachments (the
+//! images notes show, see [`crate::attachments`]) and lists them back;
 //! how it writes them down is its own business (the S3 backend writes each
 //! note as a Markdown file with YAML front matter, the SQLite backend as
 //! rows in tables). Everything else (what to upload, conflicts, merging two
@@ -155,6 +156,18 @@ pub trait Backend: Send {
     /// a note that changed since (edited elsewhere) is left alone and
     /// [`Conflict`] returned: an edit beats a delete.
     fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> anyhow::Result<()>;
+
+    /// Whether the backend keeps the attachment (see [`crate::attachments`]),
+    /// as of the last [`Backend::pull`] or uploaded since. Cheap: the
+    /// engine asks it for every image of every note it uploads.
+    fn has_attachment(&mut self, name: &str) -> anyhow::Result<bool>;
+
+    /// Stores an attachment. Attachments never change (they're named by
+    /// their content), so storing one that's there already succeeds.
+    fn put_attachment(&mut self, name: &str, data: &[u8]) -> anyhow::Result<()>;
+
+    /// An attachment's bytes, `None` if the backend doesn't have it.
+    fn get_attachment(&mut self, name: &str) -> anyhow::Result<Option<Vec<u8>>>;
 
     /// The notes and folders this device has synced, as (remote id,
     /// revision, the note or folder path at that revision), from the saved

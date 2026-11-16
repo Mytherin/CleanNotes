@@ -16,7 +16,8 @@ use eframe::egui::{self, Key, RichText};
 
 use super::settings_window::{combo, sheet_buttons};
 use super::{modal, App, Location};
-use crate::enex::{self, Importer, Resource};
+use crate::enex::{self, Importer, Resource, Saved};
+use cleannotes_core::attachments;
 use crate::model::Note;
 use crate::theme::{self, Palette};
 
@@ -67,9 +68,13 @@ fn enex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Saves an attachment as `<hash>.<extension>` in `dir` (once: the same
-/// file attached twice is kept once), and gives its URL.
-fn save_attachment(dir: &Path, r: &Resource) -> Result<String> {
+/// Saves an attachment in `dir`: a picture as the note's own attachment
+/// (shown in it, and synced), another file as `<md5>.<extension>` (once:
+/// the same file attached twice is kept once), linked by its URL.
+fn save_attachment(dir: &Path, r: &Resource) -> Result<Saved> {
+    if attachments::image_ext(&r.data).is_some() && r.data.len() <= attachments::MAX_BYTES {
+        return Ok(Saved::Image(attachments::save(dir, &r.data)?));
+    }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{}.{}", r.hash, r.extension()));
     if !path.exists() {
@@ -79,7 +84,7 @@ fn save_attachment(dir: &Path, r: &Resource) -> Result<String> {
         std::fs::write(&part, &r.data).with_context(|| format!("writing {}", path.display()))?;
         std::fs::rename(&part, &path).with_context(|| format!("writing {}", path.display()))?;
     }
-    Ok(enex::file_url(&path))
+    Ok(Saved::File(enex::file_url(&path)))
 }
 
 pub fn split_paths(s: &str) -> Vec<PathBuf> {
@@ -101,7 +106,7 @@ impl App {
             bail!("That account no longer exists.");
         }
         let files = enex_files(paths)?;
-        let attachments_dir = self.lib.db.dir().join("Attachments");
+        let attachments_dir = self.lib.attachments_dir();
         let mut save = |r: &Resource| save_attachment(&attachments_dir, r);
         // Every file is read before any note is added: a file that can't be
         // read adds nothing.
@@ -211,10 +216,15 @@ impl App {
         }
     }
 
-    /// `.enex` files dropped on the window open the Import sheet.
+    /// `.enex` files dropped on the window open the Import sheet; pictures
+    /// are attached to the open note.
     pub(super) fn dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        let enex: Vec<PathBuf> = dropped.into_iter().filter(|p| p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("enex"))).collect();
+        let (pictures, rest): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| p.is_file() && super::attach::is_image_path(p));
+        if !pictures.is_empty() {
+            self.attach_files(&pictures);
+        }
+        let enex: Vec<PathBuf> = rest.into_iter().filter(|p| p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("enex"))).collect();
         if !enex.is_empty() {
             self.settings_ui.open = false;
             self.open_import(&enex);

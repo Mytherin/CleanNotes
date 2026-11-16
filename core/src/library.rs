@@ -9,7 +9,7 @@
 //! [`Library::set_body`], so a sync never works from an outdated note.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
@@ -103,6 +103,9 @@ pub struct Ticked {
     /// Unlocked notes locked again after a while without use: password
     /// sheets left open should close, and locked notes' editors too.
     pub auto_locked: bool,
+    /// A sync brought pictures notes show: images shown as missing should
+    /// be loaded again.
+    pub attachments: bool,
 }
 
 /// Notes moved to Recently Deleted together, and how things were before.
@@ -153,6 +156,8 @@ pub struct Library {
     undo_deletes: Vec<Deletion>,
     redo_deletes: Vec<Deletion>,
     lock: LockKeys,
+    /// A sync downloaded attachments since the last [`Library::tick`].
+    attachments_arrived: bool,
 }
 
 impl Library {
@@ -185,6 +190,7 @@ impl Library {
             undo_deletes: Vec::new(),
             redo_deletes: Vec::new(),
             lock: LockKeys::default(),
+            attachments_arrived: false,
         }
     }
 
@@ -863,7 +869,28 @@ impl Library {
             t.auto_locked = true;
         }
         self.save(false);
+        t.attachments = std::mem::take(&mut self.attachments_arrived);
         t
+    }
+
+    // ---- Attachments -------------------------------------------------------------
+
+    /// The folder attachments are kept in (see [`crate::attachments`]).
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.db.dir().join(crate::attachments::DIR)
+    }
+
+    /// Saves an image (its file's bytes) to attach to a note: returns its
+    /// name, for [`crate::editing::Command::InsertImage`].
+    pub fn add_image(&self, data: &[u8]) -> anyhow::Result<String> {
+        crate::attachments::save(&self.attachments_dir(), data)
+    }
+
+    /// Where an attachment's file is, if this device has it (a synced
+    /// note's pictures may still be on their way).
+    pub fn attachment_path(&self, name: &str) -> Option<PathBuf> {
+        let dir = self.attachments_dir();
+        crate::attachments::exists(&dir, name).then(|| crate::attachments::path(&dir, name))
     }
 
     /// Syncs an account now (the user asked to).
@@ -887,7 +914,7 @@ impl Library {
         if !a.synced() || !a.enabled || self.worker.busy.contains(account) {
             return;
         }
-        let snapshot = AccountSnapshot::of(&self.store, account);
+        let snapshot = AccountSnapshot::of(&self.store, account).with_attachments(&self.attachments_dir());
         let secret = self.db.secret(account);
         self.sync_started.insert(account.to_owned(), Instant::now());
         self.sync_secret.insert(account.to_owned(), secret.clone());
@@ -995,6 +1022,7 @@ impl Library {
             }
         }
         let unchanged = out.unchanged;
+        self.attachments_arrived |= out.attachments_fetched > 0;
         let notices = engine::apply(&mut self.store, &r.snapshot, out);
         self.notices.extend(notices);
         if unchanged {
@@ -1128,6 +1156,12 @@ impl Library {
     /// "Lock Note" (with the open editor's changes copied in first).
     pub fn lock_note(&mut self, id: &str) -> LockNote {
         if self.is_locked(id) {
+            return LockNote::Locked;
+        }
+        // Pictures aren't encrypted with the note (and a locked note's
+        // pictures couldn't be synced): such a note isn't locked.
+        if self.plain_body_now(id).is_some_and(|t| !crate::attachments::refs_in(&t).is_empty()) {
+            self.push_notice("Notes with images can't be locked.".into());
             return LockNote::Locked;
         }
         if self.settings.lock_check.is_none() {
@@ -1429,6 +1463,23 @@ mod tests {
         lib.trash_notes(&[a.clone()], &Location::All);
         lib.delete_forever(&[a]);
         assert_eq!(lib.undo_delete(), None);
+    }
+
+    #[test]
+    fn images_are_saved_once_and_their_notes_not_locked() {
+        let (mut lib, _d) = lib();
+        let name = lib.add_image(b"\x89PNG\r\n\x1a\npicture").unwrap();
+        assert_eq!(lib.add_image(b"\x89PNG\r\n\x1a\npicture").unwrap(), name);
+        assert!(lib.add_image(b"not a picture").is_err());
+        assert_eq!(std::fs::read(lib.attachment_path(&name).unwrap()).unwrap(), b"\x89PNG\r\n\x1a\npicture");
+        assert_eq!(lib.attachment_path(&crate::attachments::name_for(b"x", "png")), None);
+        let home = lib.default_folder_id(LOCAL);
+        let id = add(&mut lib, &home, &format!("# Trip\n![](attachments/{name})\n"));
+        lib.set_password("pw", "").unwrap();
+        lib.take_notices();
+        assert_eq!(lib.lock_note(&id), LockNote::Locked);
+        assert!(!lib.is_locked(&id));
+        assert_eq!(lib.take_notices(), vec!["Notes with images can't be locked.".to_owned()]);
     }
 
     #[test]

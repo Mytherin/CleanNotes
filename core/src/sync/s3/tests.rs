@@ -43,8 +43,8 @@ fn notes_are_markdown_files_in_the_folder() {
     assert_eq!(rid, "n1");
     let obj = server.state().objects.get(&format!("{PREFIX}/notes/n1.md")).cloned().unwrap();
     assert_eq!(obj.etag, rev);
-    assert!(obj.body.starts_with("---\nid: n1\nfolder: [Notes, Recipes]\n"));
-    assert!(obj.body.ends_with("---\n# Pancakes\nflour\n"));
+    assert!(obj.text().starts_with("---\nid: n1\nfolder: [Notes, Recipes]\n"));
+    assert!(obj.text().ends_with("---\n# Pancakes\nflour\n"));
     // `head` is rewritten once the sync's writes are done.
     assert!(!server.state().objects.contains_key(&format!("{PREFIX}/head")));
     b.finish().unwrap();
@@ -67,7 +67,7 @@ fn outdated_saves_and_deletes_are_conflicts() {
     assert!(e.is::<Conflict>());
     b.delete_note(&rid, Some(&rev2)).unwrap();
     // A tombstone stays, and the note is gone from the snapshot.
-    assert!(server.state().objects[&format!("{PREFIX}/notes/n1.md")].body.contains("gone:"));
+    assert!(server.state().objects[&format!("{PREFIX}/notes/n1.md")].text().contains("gone:"));
     assert!(backend(&server).pull().unwrap().notes.is_empty());
     // Deleting it again, or one that never existed, is fine.
     b.delete_note(&rid, Some(&rev2)).unwrap();
@@ -97,7 +97,7 @@ fn creates_never_overwrite() {
     server.put(&format!("{PREFIX}/notes/n2.md"), "---\nid: other\n---\nhand made");
     let (rid, _) = b.save_note(None, None, &note("n2", &["Notes"], "mine")).unwrap();
     assert!(rid.starts_with("n2-"));
-    assert_eq!(server.state().objects[&format!("{PREFIX}/notes/n2.md")].body, "---\nid: other\n---\nhand made");
+    assert_eq!(server.state().objects[&format!("{PREFIX}/notes/n2.md")].text(), "---\nid: other\n---\nhand made");
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn old_tombstones_go_but_never_a_note_brought_back_meanwhile() {
     let tomb = |s: &FakeS3| {
         let mut st = s.state();
         let etag = format!("\"tomb{}\"", st.objects.len());
-        st.objects.insert(key.clone(), Obj { body: format::tombstone("n1", old), etag, modified: old });
+        st.objects.insert(key.clone(), Obj { body: format::tombstone("n1", old).into_bytes(), etag, modified: old });
     };
     // Unchanged since listed: cleaned up.
     tomb(&server);
@@ -215,7 +215,7 @@ fn old_tombstones_go_but_never_a_note_brought_back_meanwhile() {
     server.state().refuse_deletes = false;
     server.state().after_list = Some((key.clone(), format::write(&note("n1", &["Notes"], "back"))));
     b.pull().unwrap();
-    assert!(server.state().objects[&key].body.ends_with("back"), "the revived note survives");
+    assert!(server.state().objects[&key].text().ends_with("back"), "the revived note survives");
     assert_eq!(backend(&server).pull().unwrap().notes[0].data.body, "back");
 }
 
@@ -234,7 +234,7 @@ fn wrong_region_names_the_right_one() {
     let e = S3Error { status: 301, code: "PermanentRedirect".into(), message: String::new(), region: Some("eu-west-1".into()) };
     assert!(e.to_string().contains("eu-west-1"), "{e}");
     let body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>the region 'us-east-1' is wrong; expecting 'eu-west-1'</Message><Region>eu-west-1</Region></Error>";
-    let r = Resp { status: 400, etag: None, last_modified: None, region: None, body: body.into() };
+    let r = Resp { status: 400, etag: None, last_modified: None, region: None, body: body.into(), data: body.as_bytes().to_vec() };
     assert!(format!("{:#}", r.error()).contains("eu-west-1"));
 }
 
@@ -286,6 +286,8 @@ fn xml_entities() {
 struct Device {
     store: Store,
     backend: S3Backend,
+    /// Where the device keeps attachments.
+    att: tempfile::TempDir,
 }
 
 impl Device {
@@ -300,11 +302,11 @@ impl Device {
             last_sync: None,
         });
         store.ensure_local();
-        Device { store, backend: backend(server) }
+        Device { store, backend: backend(server), att: tempfile::tempdir().unwrap() }
     }
 
     fn sync(&mut self) -> Vec<String> {
-        let snap = AccountSnapshot::of(&self.store, "s3");
+        let snap = AccountSnapshot::of(&self.store, "s3").with_attachments(self.att.path());
         let out = sync_account(&mut self.backend, &snap, Utc::now()).unwrap();
         assert_eq!(out.error, None);
         let cursor = out.cursor.clone();
@@ -573,8 +575,8 @@ fn encrypted_folders() {
     // Nothing readable in the bucket.
     for (k, o) in server.state().objects.iter() {
         if k.contains("/notes/") || k.contains("/folders/") {
-            assert!(o.body.starts_with(crypto::MAGIC), "{k}");
-            assert!(!o.body.contains("Secret") && !o.body.contains("domination"), "{k}");
+            assert!(o.text().starts_with(crypto::MAGIC), "{k}");
+            assert!(!o.text().contains("Secret") && !o.text().contains("domination"), "{k}");
         }
     }
     // Another device with the passphrase reads it all.
@@ -663,5 +665,61 @@ fn real_s3_encrypted() {
     }
     if let Err(e) = result {
         std::panic::resume_unwind(e);
+    }
+}
+
+#[test]
+fn pictures_travel_with_their_notes() {
+    use crate::attachments;
+    for encrypted in [false, true] {
+        let server = FakeS3::start();
+        let mut laptop = Device::new(&server);
+        let mut phone = Device::new(&server);
+        if encrypted {
+            for d in [&mut laptop, &mut phone] {
+                let (cfg, secret) = check(&config(&server), &keys(), Some("pw")).unwrap();
+                d.backend = S3Backend::open(&cfg, Some(secret)).unwrap();
+            }
+        }
+        // Not valid UTF-8: it must arrive byte for byte.
+        let pic = b"\x89PNG\r\n\x1a\n\x00\xff\xfe binary picture".to_vec();
+        let name = attachments::save(laptop.att.path(), &pic).unwrap();
+        let folder = laptop.store.default_folder("s3").unwrap().id.clone();
+        laptop.store.notes.push(Note::new("s3", &folder, &format!("# Trip\n![](attachments/{name})\n")));
+        server.state().log.clear();
+        laptop.sync();
+
+        // The picture went up before the note that shows it.
+        let log = server.state().log.clone();
+        let put = |what: &str| log.iter().position(|l| l.starts_with("PUT ") && l.contains(what)).unwrap();
+        assert!(put("/attachments/") < put("/notes/"), "{log:?}");
+        {
+            let st = server.state();
+            let (key, obj) = st.objects.iter().find(|(k, _)| k.contains("/attachments/")).unwrap();
+            if encrypted {
+                // Sealed, and under a name that doesn't give the picture away.
+                assert!(!key.contains(&name[..64]), "{key}");
+                assert!(obj.body.starts_with(crypto::MAGIC_BYTES) && obj.body != pic);
+            } else {
+                assert_eq!(key, &format!("{PREFIX}/attachments/{name}"));
+                assert_eq!(obj.body, pic);
+            }
+        }
+
+        phone.sync();
+        assert_eq!(std::fs::read(attachments::path(phone.att.path(), &name)).unwrap(), pic, "encrypted: {encrypted}");
+
+        // Uploaded once, downloaded once.
+        server.state().log.clear();
+        laptop.sync();
+        phone.sync();
+        let log = server.state().log.clone();
+        assert!(log.iter().all(|l| !l.contains("/attachments/")), "{log:?}");
+
+        // A picture missing here is fetched again, even with nothing else
+        // changed.
+        std::fs::remove_file(attachments::path(phone.att.path(), &name)).unwrap();
+        phone.sync();
+        assert!(attachments::exists(phone.att.path(), &name));
     }
 }

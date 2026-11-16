@@ -8,6 +8,7 @@ The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like i
 - **Three panes like Apple Notes:** folders (per account, nested, with note counts), the notes list (title, time and first line, in sections: Pinned, Today, Yesterday, Previous 7 Days, Previous 30 Days, months, years), and the note. A **gallery view** shows notes as thumbnails (double-click opens one).
 - **The macOS 26 look:** the sidebar floats as a rounded panel with the selected folder as a yellow pill; the list has a header with the folder's name and note count and a round "…" menu (list or gallery, sort, group by date, note counts), with large date sections; the toolbar has round glass buttons (New Note, "…" note menu, Search, which opens into a field) and a capsule with Aa, checklist and link.
 - **Rich text editor** with Apple Notes' paragraph styles: Title, Heading, Subheading, Body, Monospaced, bulleted (•), dashed (–) and numbered lists, checklists, and block quotes; bold, italic, underline, strikethrough and links. Lists indent and outdent (Tab / Shift+Tab), list items move up and down, and checked items can sort to the bottom. Typing `- `, `* `, `1. ` or `[] ` at the start of a line starts a list. Plain URLs and `#tags` are highlighted; links open on click.
+- **Images:** "Attach Image…" in the note's "…" menu or the editor's right-click menu, dropping picture files on the window, or pasting a picture (Ctrl+V) puts it in the note on a line of its own, as large as it is but no wider than the text. Double-click a picture to open it in the system's viewer. Pictures (PNG, JPEG, GIF, WebP, BMP; HEIC is kept but shown as a box) are copied into the data folder, named by their content, and sync with the note (see [Sync](#sync)). Locked notes can't have pictures, and notes with pictures can't be locked, since the pictures wouldn't be encrypted with the note.
 - **The Aa menu** (B I U S on top, paragraph styles shown in their own style below), checklist and link buttons in the toolbar, the note's "…" menu (pin, find, move, duplicate, copy as Markdown, delete), and a right-click menu in the editor.
 - **Find in note** (Ctrl+F, with match count and next/previous) and **search all notes** from the toolbar (every word must match; matches are highlighted in the note).
 - **Folders:** new (Ctrl+Shift+N or the New Folder button at the top of the sidebar), rename (double-click), delete (notes go to Recently Deleted), subfolders, drag notes onto a folder, or "Move to" from a note's menu, also into another account.
@@ -17,7 +18,7 @@ The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like i
 - **Tags:** `#words` in notes become tags in the sidebar; a new note made in a tag carries it.
 - **Pinning, duplicating** (Ctrl+D), **copy as Markdown**, and a clipboard that keeps formatting within the app.
 - **Settings** (⚙ or Ctrl+,), laid out like Apple Notes': default account, sort notes by (date edited, date created, title), new notes start with (Title, Heading, Subheading, Body), sort checked items (manually or automatically), default text size, group notes by date, show note count, and how often synced accounts check for changes. **Accounts** adds (+) and removes (−) sync accounts.
-- **Import from Evernote:** Settings → General → "Import from Evernote…" (or drop `.enex` files on the window) adds the notes of Evernote export files, also those made from Apple Notes, to an account of your choice, keeping their dates and formatting (headings, lists, checklists, monospaced text, tables, links). Each notebook (the file's name) becomes a folder, and its tags become #tags; in exports where every note has exactly one tag, as in those made from Apple Notes, that tag is the note's folder. The app can't show images, so attachments are saved in the data folder's `Attachments` folder and linked from the note where they were. Importing a file again skips the notes already imported.
+- **Import from Evernote:** Settings → General → "Import from Evernote…" (or drop `.enex` files on the window) adds the notes of Evernote export files, also those made from Apple Notes, to an account of your choice, keeping their dates and formatting (headings, lists, checklists, monospaced text, tables, links). Each notebook (the file's name) becomes a folder, and its tags become #tags; in exports where every note has exactly one tag, as in those made from Apple Notes, that tag is the note's folder. Pictures become the note's own images, where they were; other attachments (PDFs, audio, …) are saved in the data folder's `Attachments` folder and linked from the note. Importing a file again skips the notes already imported.
 - Empty new notes are thrown away when you leave them, as in Apple Notes.
 - Follows the system's light and dark mode and uses the platform's fonts (Segoe UI and Consolas on Windows, San Francisco and Menlo on macOS, DejaVu on Linux).
 
@@ -61,7 +62,7 @@ Run `build-rust.sh` once before `xcodegen`, since the project includes the gener
 
 - **Folders:** each account's folders with note counts (nested, collapsible accounts), Recently Deleted, tags, and All Notes once there are several folders. New Folder and the compose button are in the bottom toolbar. Swipe a folder to delete it, or touch and hold to rename it or add a subfolder. Search there looks through every note.
 - **Notes list:** large title, date sections (Pinned, Today, Yesterday, Previous 7 Days, …), each note's title, time, first line and (in mixed lists) folder. Swipe right to pin. Swipe left to delete or move. Touch and hold for a preview and a menu (pin, lock, share, move, duplicate, delete). The "…" menu switches to the gallery view, selects several notes (Move, Delete, Recover All in Recently Deleted), and sets sort and grouping. The bottom toolbar shows the note count and the compose button. Pull down to sync; **shake to undo** deleting notes.
-- **Note:** the date on top, then the rich text with the same paragraph styles as the desktop: titles, headings, lists, checklists you tick by tapping the circle, quotes and monospaced. While typing, undo, redo and Done are in the navigation bar, and the keyboard bar has Aa, checklist, indent and link. **Aa** replaces the keyboard with the format panel (styles, B I U S, lists, indents). The usual iOS editing works: autocorrect, dictation, the edit menu, ⌘B/⌘I/⌘U and ⌘Z on a keyboard, and shake to undo typing. "…" has Find in Note (the system find bar), Move, Pin, Lock and Delete. Recently Deleted notes can be read and recovered but not edited. Swipe from the left edge to go back.
+- **Note:** the date on top, then the rich text with the same paragraph styles as the desktop: titles, headings, lists, checklists you tick by tapping the circle, quotes and monospaced. While typing, undo, redo and Done are in the navigation bar, and the keyboard bar has Aa, checklist, indent, **photo** (the system photo picker; photos are saved upright as JPEG so every device can show them) and link. Pasting a picture attaches it too, and pictures synced from other devices show as they arrive. **Aa** replaces the keyboard with the format panel (styles, B I U S, lists, indents). The usual iOS editing works: autocorrect, dictation, the edit menu, ⌘B/⌘I/⌘U and ⌘Z on a keyboard, and shake to undo typing. "…" has Find in Note (the system find bar), Move, Pin, Lock and Delete. Recently Deleted notes can be read and recovered but not edited. Swipe from the left edge to go back.
 - **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, and the accounts: **Add S3 Account** checks the bucket as the desktop does (optionally with an encryption key), and **Change Access Key** gives an account new keys. SQLite syncing is only in the desktop app, since a database file needs a shared folder.
 
 ### How the text view uses the shared editor
@@ -119,6 +120,7 @@ The editor works on a rich-text document, but notes are stored as Markdown, one 
 | Block quote | `> ` |
 | Bold, italic, strikethrough, underline | `**…**`, `*…*`, `~~…~~`, `<u>…</u>` |
 | Link | `[text](url)` |
+| Image | `![](attachments/<sha256>.<ext>)` |
 
 Characters that would read as markup are escaped. Markdown written elsewhere is read leniently (`+` bullets, `_italic_`, `__bold__`, deeper headings, `1)`, any indentation). See `src/markdown.rs`.
 
@@ -136,6 +138,7 @@ Notes go into a folder of your choice in an S3 bucket, as Markdown files any too
 <folder>/head                  rewritten with every change, so other devices notice cheaply
 <folder>/notes/<id>.md         a note: YAML front matter (id, folder, dates, pin, tags), then its Markdown
 <folder>/folders/<id>.json     a folder: its path, e.g. ["Work","2026"]
+<folder>/attachments/<name>    a picture a note shows, named by its SHA-256 (as in the note's Markdown)
 ```
 
 1. In the AWS console, create a bucket (keep "Block all public access" on; turning on versioning keeps old versions of notes as a backup).
@@ -144,7 +147,9 @@ Notes go into a folder of your choice in an S3 bucket, as Markdown files any too
 
 An object's ETag is its revision: updates are written with `If-Match` and new notes with `If-None-Match: *`, so S3 refuses a save based on an outdated copy and the sync engine merges instead. A note deleted for good leaves a small tombstone file (cleaned up after 30 days), so a delete loses to an edit made elsewhere. When nothing changed, a sync is a single `HEAD` request on `head`; otherwise the folder is listed and only changed notes are downloaded, several at once. Everything is listed at least every 15 minutes. A `.md` file without front matter put into `notes/` by hand shows up as a note.
 
-**Encryption (optional):** enter an **encryption key** (a passphrase) when adding the account, and notes and folders are encrypted on your computer before upload, so S3 and anyone with access to the bucket see only ciphertext. The key is made from the passphrase with Argon2id (64 MiB, 3 passes); its random salt and a check value are in `<folder>/encryption.json`, so every device with the same passphrase gets the same key, and a wrong one is refused. Each file is XChaCha20-Poly1305 with a random nonce, bound to its file name. Only the key is saved, in the credential store, never the passphrase. Other devices must enter the same key; one without it sees the notes as unreadable and leaves them alone. If the passphrase is lost, the notes can't be recovered. Notes already in a folder before encryption is turned on stay readable and are encrypted the next time they're saved. Without an encryption key, notes are stored as plain Markdown (locked notes stay encrypted either way).
+**Pictures** are uploaded (with `If-None-Match: *`: one already there is the same picture) just before the note that shows them, so another device never gets a note without its pictures. They're downloaded after the notes, only those this device doesn't have, and kept only if their content matches their name. A note whose pictures haven't arrived shows a box in their place, and syncs keep fetching them, even when nothing else changed.
+
+**Encryption (optional):** enter an **encryption key** (a passphrase) when adding the account, and notes and folders are encrypted on your computer before upload, so S3 and anyone with access to the bucket see only ciphertext. The key is made from the passphrase with Argon2id (64 MiB, 3 passes); its random salt and a check value are in `<folder>/encryption.json`, so every device with the same passphrase gets the same key, and a wrong one is refused. Each file is XChaCha20-Poly1305 with a random nonce, bound to its file name. Pictures are encrypted the same way (as bytes), under names that are an HMAC of their content hash, so the bucket's listing doesn't reveal which (known) pictures are there. Only the key is saved, in the credential store, never the passphrase. Other devices must enter the same key; one without it sees the notes as unreadable and leaves them alone. If the passphrase is lost, the notes can't be recovered. Notes already in a folder before encryption is turned on stay readable and are encrypted the next time they're saved. Without an encryption key, notes are stored as plain Markdown (locked notes stay encrypted either way).
 
 Requests are signed with AWS Signature V4 by the app itself (`core/src/sync/s3/`), on the same blocking HTTP client as the other backends.
 
@@ -157,26 +162,28 @@ folders(id, parent_id, name)
 notes(id, folder_id, title, body, created, modified, pinned, deleted, revision)
 tags(note_id, tag)
 meta(key, value)
+attachments(name, data)
 ```
 
-`body` is the note's Markdown; `title` and `tags` are kept up to date for other tools. Several computers can share the file, on a network drive or in a folder synced by Dropbox, OneDrive and the like (as long as they don't write at the same moment).
+`body` is the note's Markdown; `title` and `tags` are kept up to date for other tools. `attachments` holds the pictures notes show, by name. Several computers can share the file, on a network drive or in a folder synced by Dropbox, OneDrive and the like (as long as they don't write at the same moment).
 
 ### How sync works
 
-All backends go through one sync engine (`src/sync/engine.rs`) on a background thread (`src/sync/worker.rs`). A backend only stores and lists folders and notes (`Backend` in `src/sync/mod.rs`):
+All backends go through one sync engine (`src/sync/engine.rs`) on a background thread (`src/sync/worker.rs`). A backend only stores and lists folders, notes and pictures (`Backend` in `src/sync/mod.rs`):
 
 - Changes are uploaded a few seconds after you stop typing; changes from elsewhere are fetched on launch and every few minutes (Settings → General → Check for changes), or right away with **Sync Now** in an account's right-click menu. When nothing changed on either side, a sync only asks the backend for a change marker.
 - **Conflicts:** every upload says which version it was based on. If a note changed on both sides, the edits are merged paragraph by paragraph (pins, folders and deletion field by field). If both sides changed the same paragraph, your version stays in the note and the other becomes a separate note next to it, so nothing is lost.
 - **An edit beats a delete:** a note deleted elsewhere but edited here is put back.
 - A note edited while a sync is running keeps the edit, merged with what the sync brought in.
 - A create whose reply was lost isn't duplicated: notes are matched up by their id.
+- **Pictures** go up before the note that shows them and come down after it. They're named by their content, so they never conflict, and a damaged download is never kept.
 - If a saved sign-in stops working, the account shows a warning in the sidebar and **Sign In Again…** in Settings.
 
 To add a backend: implement `Backend`, add a `BackendConfig` variant, and open it in `sync::open`.
 
 ## Data
 
-Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (an S3 access key and encryption key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
+Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Pictures are files in the `Attachments` folder next to it, named `<sha256>.<ext>`. Sign-ins (an S3 access key and encryption key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
 
 ## Code layout
 
@@ -190,6 +197,7 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `core/src/editing.rs` | The editing engine: typing, Return and Backspace in lists, auto-lists, paragraph and character styles, undo grouping, find, clipboard, edits as a system text view reports them |
 | `core/src/doc.rs` | The rich-text document and all editing operations; links, tags and font sizes |
 | `core/src/markdown.rs` | Markdown ↔ document, titles and snippets |
+| `core/src/attachments.rs` | Pictures attached to notes: content-addressed files, their names and references |
 | `core/src/model.rs` | Accounts, folders, notes, and the in-memory store |
 | `core/src/db.rs` | Local SQLite storage and the credential store |
 | `core/src/settings.rs`, `core/src/dates.rs` | Preferences and their defaults; how dates are shown |
@@ -214,7 +222,8 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `src/app/settings_window.rs` | Settings: General and Accounts, with the sign-in sheets |
 | `src/app/import.rs`, `src/enex.rs` | Importing Evernote exports (`.enex`) |
 | `src/editor/mod.rs` | The editor on the editing engine: keys, pointer, caret, selection, context menu |
-| `src/editor/layout.rs` | Laying out and painting paragraphs, list markers, checkboxes |
+| `src/editor/layout.rs` | Laying out and painting paragraphs, list markers, checkboxes, pictures |
+| `src/editor/images.rs`, `src/app/attach.rs` | Pictures as textures (decoded off the UI thread); attaching them (dialog, drop, paste) |
 | `src/theme.rs`, `src/fonts.rs`, `src/icons.rs`, `src/app_icon.rs` | Colors, fonts, drawn icons, the app icon (`write_ios_icon` makes the iPhone's) |
 
 **`ffi/` (cleannotes-ffi)** is the core for Swift: `NotesCore` (the library), `NoteEditor` (the editing engine, in UTF-16 positions) and sign-in, as UniFFI records and enums. **`ios/`** is the iPhone app: `CleanNotes/*.swift` (screens, the text view), `project.yml` (XcodeGen) and `build-rust.sh`.
@@ -225,11 +234,12 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 
 - **Document and Markdown:** every paragraph and character style round-trips; escaping; Markdown from elsewhere; editing operations (Return in lists, Backspace at a bullet, pasting, numbering, moving items); the editor's undo grouping, auto-lists, find, links and checklist sorting.
 - **Sync engine** (`core/src/sync/engine/tests.rs`): two "devices" with their own stores share one SQLite backend: merges, clashing edits kept as two notes, edit beats delete, Recently Deleted and pins, folder moves, renames and deletes, edits during a sync, lost replies, offline changes on both sides.
-- **S3** (`core/src/sync/s3/tests.rs`) against a fake S3 that checks Signature V4 and honours conditional writes: Markdown objects, conflicts, tombstones (and never deleting a note brought back over one), hand-written and unreadable files, paged listings, downloading only what changed, folder renames moving their notes, encryption, the bucket check, and two devices syncing.
+- **S3** (`core/src/sync/s3/tests.rs`) against a fake S3 that checks Signature V4 and honours conditional writes: Markdown objects, conflicts, tombstones (and never deleting a note brought back over one), hand-written and unreadable files, paged listings, downloading only what changed, folder renames moving their notes, encryption, the bucket check, two devices syncing, and pictures travelling with their notes (byte for byte, uploaded before the note, sealed and renamed when encrypted, fetched again when missing).
 - **SQLite backend, local storage, model** unit tests; the **library** (list sections, new notes, deletion undo, folders, sign-ins replaced mid-sync) and the **bindings** (UTF-16 positions, which edits the text view may make itself, notes and locking through `NotesCore`).
 
 ## Ideas for next steps
 
-- Tables, images and attachments, locked notes, sharing
+- Tables, attachments other than pictures (PDFs, audio), pictures in locked notes, sharing
+- Removing pictures no note shows any more (locally and from the backends)
 - Smart folders, Quick Notes, multi-select in the list, print and export
 - A menu bar on Windows and Linux

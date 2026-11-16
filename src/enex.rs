@@ -21,11 +21,12 @@
 //! | a paragraph all in `<tt>` / `<pre>` / a monospaced font | Monospaced |
 //! | `<table>` | a table |
 //! | `<b>`, `<i>`, `<u>`, `<s>`, `<a href>` | bold, italic, underline, strikethrough, a link |
-//! | `<en-media>` (an attachment) | a link to the attachment, saved as a file |
+//! | `<en-media>`, a picture | the picture, on a line of its own |
+//! | `<en-media>`, another file | a link to the attachment, saved as a file |
 //!
-//! Colours, fonts and sizes are dropped. The app can't show images, so
-//! attachments are saved as files (see [`Importer::save`]) and linked from
-//! the note where they were.
+//! Colours, fonts and sizes are dropped. Pictures become the note's own
+//! (synced) attachments; other files are saved beside the notes and linked
+//! from where they were (see [`Importer::save`]).
 
 use std::sync::Arc;
 
@@ -423,7 +424,9 @@ struct Converter<'a> {
     /// The paragraph started with a to-do box (checked or not).
     todo: Option<bool>,
     /// The link for an attachment, by its hash.
-    media: &'a mut dyn FnMut(&str) -> Option<(String, String)>,
+    media: &'a mut dyn FnMut(&str) -> Option<(String, Saved)>,
+    /// A picture was just put in: the text after it starts without spaces.
+    after_image: bool,
 }
 
 fn is_block(name: &str) -> bool {
@@ -458,6 +461,7 @@ impl Converter<'_> {
             italic: self.has(&["i", "em"]),
             underline: self.has(&["u", "ins"]),
             strike: self.has(&["s", "strike", "del"]),
+            image: None,
             code: self.has(&["tt", "code", "kbd", "samp", "pre"]) || self.stack.iter().any(|e| e.mono),
             link: self.stack.iter().rev().find_map(|e| e.link.clone()),
         }
@@ -468,7 +472,10 @@ impl Converter<'_> {
         if s.contains('\n') && s.trim().is_empty() {
             return;
         }
-        let s: String = s.chars().filter(|&c| c != '\r').map(|c| if c == '\n' || c == '\u{a0}' { ' ' } else { c }).collect();
+        let mut s: String = s.chars().filter(|&c| c != '\r').map(|c| if c == '\n' || c == '\u{a0}' { ' ' } else { c }).collect();
+        if std::mem::take(&mut self.after_image) && self.cur.is_empty() && !self.in_cell() {
+            s = s.trim_start().to_owned();
+        }
         if s.is_empty() || self.table_depth > 0 && self.table.as_ref().is_some_and(|t| t.cell.is_none()) {
             return;
         }
@@ -605,8 +612,22 @@ impl Converter<'_> {
             }
             "en-media" => {
                 let hash = attr(&attrs, "hash").unwrap_or("").to_ascii_lowercase();
-                if let Some((label, url)) = (self.media)(&hash) {
-                    self.link_text(&label, &url);
+                match (self.media)(&hash) {
+                    Some((label, Saved::File(url))) => self.link_text(&label, &url),
+                    // (Table cells can't hold pictures: its name, there.)
+                    Some((label, Saved::Image(_))) if self.in_cell() => self.text(&label),
+                    Some((_, Saved::Image(name))) => {
+                        // A picture goes on a line of its own (the spaces
+                        // around it with it).
+                        while self.cur.text.ends_with(' ') {
+                            self.cur.text.pop();
+                            self.cur.styles.pop();
+                        }
+                        self.end_paragraph(false);
+                        self.blocks.push(image_block(&name));
+                        self.after_image = true;
+                    }
+                    None => {}
                 }
                 return;
             }
@@ -731,8 +752,8 @@ fn trim_newlines(b: &mut Block) {
 
 /// A note's ENML as paragraphs. `media` gives the link (its text and URL)
 /// for an attachment's hash.
-fn enml_blocks(enml: &str, media: &mut dyn FnMut(&str) -> Option<(String, String)>) -> Vec<Block> {
-    let mut c = Converter { blocks: Vec::new(), cur: Block::default(), stack: Vec::new(), table: None, table_depth: 0, todo: None, media };
+fn enml_blocks(enml: &str, media: &mut dyn FnMut(&str) -> Option<(String, Saved)>) -> Vec<Block> {
+    let mut c = Converter { blocks: Vec::new(), cur: Block::default(), stack: Vec::new(), table: None, table_depth: 0, todo: None, media, after_image: false };
     let mut in_note = !enml.contains("<en-note");
     for t in Lexer::new(enml) {
         match t {
@@ -767,7 +788,7 @@ pub struct ImportedNote {
 /// Reads export files; `save` keeps an attachment somewhere and returns
 /// the URL of the copy, which the note links to.
 pub struct Importer<'a> {
-    pub save: &'a mut dyn FnMut(&Resource) -> Result<String>,
+    pub save: &'a mut dyn FnMut(&Resource) -> Result<Saved>,
 }
 
 impl Importer<'_> {
@@ -784,10 +805,10 @@ impl Importer<'_> {
             let folder = if tags_are_folders { n.tags[0].clone() } else { notebook.to_owned() };
             let folder = folder.trim().replace('/', "∕");
             let folder = if folder.is_empty() { crate::model::DEFAULT_FOLDER.to_owned() } else { folder };
-            let mut saved: Vec<Option<(String, String)>> = vec![None; n.resources.len()];
+            let mut saved: Vec<Option<(String, Saved)>> = vec![None; n.resources.len()];
             let mut used = vec![false; n.resources.len()];
             let mut error = None;
-            let mut media = |hash: &str| -> Option<(String, String)> {
+            let mut media = |hash: &str| -> Option<(String, Saved)> {
                 let i = n.resources.iter().position(|r| r.hash == hash)?;
                 used[i] = true;
                 link_for(&n.resources[i], &mut saved[i], self.save, &mut error)
@@ -796,8 +817,12 @@ impl Importer<'_> {
             // Attachments the text doesn't show go at the end.
             for i in 0..n.resources.len() {
                 if !used[i] {
-                    if let Some((label, url)) = link_for(&n.resources[i], &mut saved[i], self.save, &mut error) {
-                        blocks.push(Block::styled(Kind::Body, &[(&label, Style { link: Some(Arc::from(url.as_str())), ..Style::default() })]));
+                    match link_for(&n.resources[i], &mut saved[i], self.save, &mut error) {
+                        Some((label, Saved::File(url))) => {
+                            blocks.push(Block::styled(Kind::Body, &[(&label, Style { link: Some(Arc::from(url.as_str())), ..Style::default() })]));
+                        }
+                        Some((_, Saved::Image(name))) => blocks.push(image_block(&name)),
+                        None => {}
                     }
                 }
             }
@@ -823,12 +848,28 @@ impl Importer<'_> {
     }
 }
 
+/// What [`Importer::save`] made of an attachment.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Saved {
+    /// A picture, kept as an attachment of this name (see
+    /// [`cleannotes_core::attachments`]): shown in the note.
+    Image(String),
+    /// Another file, saved at this URL: linked from the note.
+    File(String),
+}
+
+/// A paragraph that's one picture.
+fn image_block(name: &str) -> Block {
+    let style = Style { image: Some(Arc::from(name)), ..Style::default() };
+    Block::styled(Kind::Body, &[(&cleannotes_core::attachments::OBJECT.to_string(), style)])
+}
+
 fn link_for(
     r: &Resource,
-    saved: &mut Option<(String, String)>,
-    save: &mut dyn FnMut(&Resource) -> Result<String>,
+    saved: &mut Option<(String, Saved)>,
+    save: &mut dyn FnMut(&Resource) -> Result<Saved>,
     error: &mut Option<anyhow::Error>,
-) -> Option<(String, String)> {
+) -> Option<(String, Saved)> {
     if saved.is_none() && error.is_none() {
         match save(r) {
             Ok(url) => *saved = Some((r.name(), url)),
@@ -905,7 +946,7 @@ mod tests {
     }
 
     fn import(xml: &str) -> Vec<ImportedNote> {
-        let mut save = |r: &Resource| Ok(format!("file:///att/{}.{}", r.hash, r.extension()));
+        let mut save = |r: &Resource| Ok(Saved::File(format!("file:///att/{}.{}", r.hash, r.extension())));
         Importer { save: &mut save }.read(xml, "Notebook").unwrap()
     }
 
@@ -1019,6 +1060,17 @@ mod tests {
             notes[0].body,
             format!("# Pics\nsee\n[p1832-1.jpg](file:///att/{hash}.jpg)\n[Attachment.pdf](file:///att/{pdf_hash}.pdf)\n")
         );
+
+        // Kept as a picture: shown on a line of its own, where it was.
+        let n = format!(
+            "<note><title>Pics</title><content><![CDATA[<en-note><div>before <en-media type=\"image/jpeg\" hash=\"{hash}\"></en-media> after</div></en-note>]]></content>\
+             <tag>Cats</tag>\
+             <resource><data encoding=\"base64\">{b64}</data><mime>image/jpeg</mime></resource></note>"
+        );
+        let name = cleannotes_core::attachments::name_for(data, "jpg");
+        let mut save = |r: &Resource| Ok(if r.mime.starts_with("image/") { Saved::Image(name.clone()) } else { Saved::File(String::new()) });
+        let notes = Importer { save: &mut save }.read(&export(&[n]), "Notebook").unwrap();
+        assert_eq!(notes[0].body, format!("# Pics\nbefore\n![](attachments/{name})\nafter\n"));
     }
 
     #[test]
@@ -1039,7 +1091,7 @@ mod tests {
 
     #[test]
     fn not_an_export() {
-        let mut save = |_: &Resource| Ok(String::new());
+        let mut save = |_: &Resource| Ok(Saved::File(String::new()));
         assert!(Importer { save: &mut save }.read("<html></html>", "x").is_err());
     }
 
@@ -1070,7 +1122,7 @@ mod tests {
         let mut count = std::collections::BTreeMap::<String, usize>::new();
         for f in files {
             let xml = std::fs::read_to_string(&f).unwrap();
-            let mut save = |r: &Resource| Ok(format!("file:///att/{}.{}", r.hash, r.extension()));
+            let mut save = |r: &Resource| Ok(Saved::File(format!("file:///att/{}.{}", r.hash, r.extension())));
             let notes = Importer { save: &mut save }.read(&xml, f.file_stem().unwrap().to_str().unwrap()).unwrap();
             for (i, n) in notes.iter().enumerate() {
                 *count.entry(n.folder.clone()).or_default() += 1;
