@@ -111,14 +111,17 @@ pub struct S3Error {
     pub status: u16,
     pub code: String,
     pub message: String,
+    /// The bucket's region, when S3 named it.
+    pub region: Option<String>,
 }
 
 impl std::fmt::Display for S3Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match (self.status, self.code.as_str()) {
-            (301, _) | (_, "PermanentRedirect" | "AuthorizationHeaderMalformed") => {
-                write!(f, "the bucket is in another region than the one entered ({} {})", self.status, self.code)
-            }
+            (301 | 307, _) | (_, "PermanentRedirect" | "TemporaryRedirect" | "AuthorizationHeaderMalformed") => match &self.region {
+                Some(r) => write!(f, "the bucket is in region {r}; enter that as its region"),
+                None => write!(f, "the bucket is in another region than the one entered ({} {})", self.status, self.code),
+            },
             (_, "NoSuchBucket") => f.write_str("there's no bucket with that name"),
             (_, "AccessDenied") => write!(f, "S3 denied access; check the IAM policy allows this bucket and folder ({})", self.message),
             (_, "RequestTimeTooSkewed") => f.write_str("this computer's clock is off; S3 refuses the request"),
@@ -134,6 +137,8 @@ struct Resp {
     status: u16,
     etag: Option<String>,
     last_modified: Option<String>,
+    /// `x-amz-bucket-region`.
+    region: Option<String>,
     body: String,
 }
 
@@ -153,13 +158,17 @@ impl Resp {
         if matches!(code.as_str(), "InvalidAccessKeyId" | "SignatureDoesNotMatch" | "InvalidToken" | "ExpiredToken") {
             return NeedsSignIn(format!("S3 refused the access key ({code})")).into();
         }
-        S3Error { status: self.status, code, message: xml_tag(&self.body, "Message").map(decode).unwrap_or_default() }.into()
+        let region = self.region.clone().or_else(|| xml_tag(&self.body, "Region").map(decode)).filter(|r| !r.is_empty());
+        S3Error { status: self.status, code, message: xml_tag(&self.body, "Message").map(decode).unwrap_or_default(), region }.into()
     }
 }
 
 fn http() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
+        // A redirect (wrong region) is reported, not followed: the request
+        // is signed for its host, and the signature is dropped on the way.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .expect("HTTP client")
@@ -332,14 +341,14 @@ impl S3Backend {
         let resp = req.send().context("contacting S3")?;
         let status = resp.status().as_u16();
         let header = |n: &str| resp.headers().get(n).and_then(|h| h.to_str().ok()).map(str::to_owned);
-        let (etag, last_modified) = (header("etag"), header("last-modified"));
+        let (etag, last_modified, region) = (header("etag"), header("last-modified"), header("x-amz-bucket-region"));
         let ok = (200..300).contains(&status);
         let body = match resp.text() {
             Ok(t) => t,
             Err(e) if ok => return Err(anyhow::Error::new(e).context("reading S3's reply")),
             Err(_) => String::new(),
         };
-        Ok(Resp { status, etag, last_modified, body })
+        Ok(Resp { status, etag, last_modified, region, body })
     }
 
     fn put(&self, key: &str, body: &str, content_type: &str, cond: Cond) -> Result<Resp> {
@@ -543,6 +552,13 @@ pub fn check(config: &Config, keys: &Keys, passphrase: Option<&str>) -> Result<(
     if r.ok() || r2.ok() {
         bail!("this storage service ignores conditional writes (If-Match / If-None-Match), so devices could overwrite each other's edits; it can't be used");
     }
+    // Refused, but not as outdated (e.g. 501: not supported): every save
+    // would fail the same way.
+    for r in [r, r2] {
+        if !matches!(r.status, 409 | 412) {
+            return Err(r.error().context("this storage service doesn't support conditional writes (If-Match / If-None-Match), which syncing needs"));
+        }
+    }
     b.touch()?;
 
     let settings_key = format!("{}{}", config.root(), crypto::SETTINGS);
@@ -595,7 +611,7 @@ impl Backend for S3Backend {
                     Cached::Note(n) => snap.notes.push(RemoteNote { remote_id: stem.to_owned(), revision: etag.clone(), data: n.clone() }),
                     Cached::Gone(t) => {
                         if Utc::now() - *t > chrono::Duration::days(TOMBSTONE_DAYS) {
-                            old_tombstones.push(l.key.clone());
+                            old_tombstones.push((l.key.clone(), etag.clone()));
                         }
                     }
                     _ => snap.unreadable.push(stem.to_owned()),
@@ -607,9 +623,11 @@ impl Backend for S3Backend {
                 }
             }
         }
-        for key in old_tombstones {
-            // Best effort: one left over is cleaned up next time.
-            let _ = self.request("DELETE", &key, &[], None, &[]);
+        for (key, etag) in old_tombstones {
+            // Only if it's still that tombstone: another device may have
+            // just brought the note back over it. (Best effort: one left
+            // over is cleaned up next time.)
+            let _ = self.request("DELETE", &key, &[], None, &[("if-match", etag)]);
         }
         Ok(snap)
     }

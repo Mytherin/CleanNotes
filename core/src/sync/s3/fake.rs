@@ -27,8 +27,15 @@ pub struct State {
     pub page_size: usize,
     /// Behave like a service without conditional writes.
     pub ignore_conditions: bool,
+    /// Behave like a service that refuses conditional writes (501).
+    pub reject_conditions: bool,
+    /// Every DELETE fails (503).
+    pub refuse_deletes: bool,
     /// "METHOD key" (key empty for listings).
     pub log: Vec<String>,
+    /// Written right after the next listing (another device's write
+    /// landing mid-sync): key, body.
+    pub after_list: Option<(String, String)>,
     counter: u64,
 }
 
@@ -39,7 +46,7 @@ pub struct FakeS3 {
 
 impl FakeS3 {
     pub fn start() -> FakeS3 {
-        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, log: vec![], counter: 0 }));
+        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, reject_conditions: false, refuse_deletes: false, log: vec![], after_list: None, counter: 0 }));
         let s = state.clone();
         let url = test_http::spawn(move |req| route(&mut s.lock().unwrap(), req));
         FakeS3 { url, state }
@@ -136,6 +143,10 @@ fn route(s: &mut State, req: &Request) -> Response {
                 xml.push_str(&format!("<NextContinuationToken>{}</NextContinuationToken>", xml_escape(page.last().unwrap().0)));
             }
             xml.push_str("</ListBucketResult>");
+            if let Some((k, body)) = s.after_list.take() {
+                let etag = s.next_etag();
+                s.objects.insert(k, Obj { body, etag, modified: Utc::now() });
+            }
             Response { status: 200, body: xml, content_type: "application/xml", headers: vec![] }
         }
         "GET" => match s.objects.get(&key) {
@@ -148,6 +159,9 @@ fn route(s: &mut State, req: &Request) -> Response {
         },
         "PUT" => {
             let existing = s.objects.get(&key);
+            if s.reject_conditions && (req.headers.contains_key("if-match") || req.headers.contains_key("if-none-match")) {
+                return error(501, "NotImplemented");
+            }
             if !s.ignore_conditions {
                 if req.headers.get("if-none-match").map(String::as_str) == Some("*") && existing.is_some() {
                     return error(412, "PreconditionFailed");
@@ -165,6 +179,17 @@ fn route(s: &mut State, req: &Request) -> Response {
             Response { status: 200, body: String::new(), content_type: "text/plain", headers: vec![("ETag", etag)] }
         }
         "DELETE" => {
+            if s.refuse_deletes {
+                return error(503, "ServiceUnavailable");
+            }
+            // Conditional deletes, as S3 does them.
+            if let (Some(m), false) = (req.headers.get("if-match"), s.ignore_conditions) {
+                match s.objects.get(&key) {
+                    None => return error(404, "NoSuchKey"),
+                    Some(o) if o.etag != *m => return error(412, "PreconditionFailed"),
+                    _ => {}
+                }
+            }
             s.objects.remove(&key);
             Response { status: 204, body: String::new(), content_type: "text/plain", headers: vec![] }
         }

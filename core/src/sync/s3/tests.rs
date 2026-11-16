@@ -188,6 +188,54 @@ fn amazon_urls() {
 }
 
 #[test]
+fn old_tombstones_go_but_never_a_note_brought_back_meanwhile() {
+    let server = FakeS3::start();
+    let key = format!("{PREFIX}/notes/n1.md");
+    let old = Utc::now() - chrono::Duration::days(TOMBSTONE_DAYS + 1);
+    let tomb = |s: &FakeS3| {
+        let mut st = s.state();
+        let etag = format!("\"tomb{}\"", st.objects.len());
+        st.objects.insert(key.clone(), Obj { body: format::tombstone("n1", old), etag, modified: old });
+    };
+    // Unchanged since listed: cleaned up.
+    tomb(&server);
+    assert!(backend(&server).pull().unwrap().notes.is_empty());
+    assert!(!server.state().objects.contains_key(&key));
+
+    // Known from an earlier pull (whose clean-up failed), and brought back
+    // by another device right after this pull's listing: the clean-up
+    // mustn't delete it.
+    tomb(&server);
+    let mut b = backend(&server);
+    server.state().refuse_deletes = true;
+    b.pull().unwrap();
+    server.state().refuse_deletes = false;
+    server.state().after_list = Some((key.clone(), format::write(&note("n1", &["Notes"], "back"))));
+    b.pull().unwrap();
+    assert!(server.state().objects[&key].body.ends_with("back"), "the revived note survives");
+    assert_eq!(backend(&server).pull().unwrap().notes[0].data.body, "back");
+}
+
+#[test]
+fn a_service_that_rejects_conditional_writes_is_refused() {
+    // Not ignored but refused (501): saves would all fail, so the check
+    // says so instead of adding the account.
+    let server = FakeS3::start();
+    server.state().reject_conditions = true;
+    let e = check(&config(&server), &keys()).unwrap_err();
+    assert!(format!("{e:#}").contains("NotImplemented"), "{e:#}");
+}
+
+#[test]
+fn wrong_region_names_the_right_one() {
+    let e = S3Error { status: 301, code: "PermanentRedirect".into(), message: String::new(), region: Some("eu-west-1".into()) };
+    assert!(e.to_string().contains("eu-west-1"), "{e}");
+    let body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>the region 'us-east-1' is wrong; expecting 'eu-west-1'</Message><Region>eu-west-1</Region></Error>";
+    let r = Resp { status: 400, etag: None, last_modified: None, region: None, body: body.into() };
+    assert!(format!("{:#}", r.error()).contains("eu-west-1"));
+}
+
+#[test]
 fn xml_entities() {
     assert_eq!(decode("&quot;abc&quot; &amp; &#65;&#x42; &bogus;"), "\"abc\" & AB &bogus;");
 }
