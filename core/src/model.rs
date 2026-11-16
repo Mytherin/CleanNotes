@@ -2,7 +2,7 @@
 //! [`Store`] of all of them.
 //!
 //! As in Apple Notes, every folder belongs to an account: "On My PC" (only on
-//! this computer) or a synced account (Bitwarden, a shared SQLite database,
+//! this computer) or a synced account (an S3 bucket, a shared SQLite database,
 //! …; see [`crate::sync`]). Each account has a default "Notes" folder, and
 //! deleted notes stay in its Recently Deleted for 30 days.
 
@@ -35,7 +35,7 @@ pub fn new_id() -> String {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
-    /// The name in the sidebar ("Bitwarden", "Shared notes", …).
+    /// The name in the sidebar ("Work notes", "Shared notes", …).
     pub name: String,
     pub backend: BackendConfig,
     /// Switched off in Settings: its notes stay but aren't shown or synced.
@@ -211,6 +211,52 @@ impl Store {
         let mut s = Store::default();
         s.ensure_local();
         s
+    }
+
+    /// Keeps the notes of an account whose kind of sync is no longer
+    /// supported: its folders and notes move into the local account, under
+    /// a folder with the account's name (its default folder, renamed), with
+    /// nothing left to sync. Nothing on the service itself is touched.
+    pub fn retire_account(&mut self, id: &str, name: &str) {
+        self.ensure_local();
+        let top = match self.folders.iter().find(|f| f.account == id && f.default) {
+            Some(f) => f.id.clone(),
+            None => {
+                let f = Folder::new(id, None, name);
+                let fid = f.id.clone();
+                self.folders.push(f);
+                fid
+            }
+        };
+        // A name not already taken at the top of the local account.
+        let taken: Vec<String> = self.folders.iter().filter(|f| f.account == LOCAL && f.parent.is_none()).map(|f| f.name.clone()).collect();
+        let base = if name.trim().is_empty() { "Imported" } else { name.trim() };
+        let mut unique = base.to_owned();
+        let mut n = 2;
+        while taken.contains(&unique) {
+            unique = format!("{base} {n}");
+            n += 1;
+        }
+        for f in self.folders.iter_mut().filter(|f| f.account == id) {
+            f.account = LOCAL.to_owned();
+            f.sync = Default::default();
+            if f.id == top {
+                f.default = false;
+                f.name = unique.clone();
+                f.parent = None;
+            } else if f.parent.is_none() {
+                f.parent = Some(top.clone());
+            }
+        }
+        for n in self.notes.iter_mut().filter(|n| n.account == id) {
+            n.account = LOCAL.to_owned();
+            n.sync = Default::default();
+            if !self.folders.iter().any(|f| f.id == n.folder) {
+                n.folder = top.clone();
+            }
+        }
+        self.tombstones.retain(|t| t.account != id);
+        self.accounts.retain(|a| a.id != id);
     }
 
     /// Makes sure the local account and every account's default folder exist.

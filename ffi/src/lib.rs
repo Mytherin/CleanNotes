@@ -7,8 +7,6 @@
 //!   everything done to them ([`cleannotes_core::library::Library`]).
 //! - [`NoteEditor`]: an open note ([`cleannotes_core::editing::Editing`]),
 //!   with positions in UTF-16 code units as `UITextView` counts them.
-//! - [`sign_in_standard_notes`], [`sign_in_bitwarden`]: signing in to sync
-//!   accounts (blocking: call them off the main thread).
 //!
 //! Only what Swift needs to see crosses over: plain records and enums, made
 //! from the core's own types here.
@@ -20,9 +18,8 @@ use cleannotes_core::db::Secrets;
 use cleannotes_core::doc::{self, Attr, Doc, Kind, Pos};
 use cleannotes_core::editing::{Command, Editing};
 use cleannotes_core::library::{self, BodySet, Library, Location};
-use cleannotes_core::model::{new_id, LOCAL};
+use cleannotes_core::model::LOCAL;
 use cleannotes_core::settings::{SortBy, StartWith, TEXT_SIZES};
-use cleannotes_core::sync::{bitwarden, standardnotes, BackendConfig};
 use cleannotes_core::{dates, lock};
 
 uniffi::setup_scaffolding!();
@@ -131,7 +128,7 @@ pub struct FolderItem {
 pub struct AccountItem {
     pub id: String,
     pub name: String,
-    /// "Local", "Bitwarden", "Standard Notes", "SQLite", "CloudKit".
+    /// "Local", "SQLite", "S3".
     pub kind: String,
     pub synced: bool,
     pub syncing: bool,
@@ -141,9 +138,6 @@ pub struct AccountItem {
     /// Its folders, depth first.
     pub folders: Vec<FolderItem>,
     pub deleted_count: u32,
-    /// The sign-in email of a synced account.
-    pub email: Option<String>,
-    pub server: Option<String>,
 }
 
 /// Everything the folders screen shows.
@@ -340,11 +334,6 @@ impl NotesCore {
                         has_children: lib.store.folders.iter().any(|c| c.parent.as_deref() == Some(f.id.as_str())),
                     })
                     .collect();
-                let (email, server) = match &a.backend {
-                    BackendConfig::Bitwarden(c) => (Some(c.email.clone()), Some(c.server.clone())),
-                    BackendConfig::StandardNotes(c) => (Some(c.email.clone()), Some(c.server.clone())),
-                    _ => (None, None),
-                };
                 AccountItem {
                     id: a.id.clone(),
                     name: a.name.clone(),
@@ -355,8 +344,6 @@ impl NotesCore {
                     needs_sign_in: lib.needs_sign_in.contains(&a.id),
                     folders,
                     deleted_count: lib.deleted_count(&a.id) as u32,
-                    email,
-                    server,
                 }
             })
             .collect();
@@ -664,31 +651,6 @@ impl NotesCore {
     pub fn remove_account(&self, id: String) {
         self.lib().remove_account(&id);
     }
-
-    /// Adds (or, with `again`, signs in again to) a Standard Notes account
-    /// after [`sign_in_standard_notes`]. Returns its id.
-    pub fn add_standard_notes_account(&self, again: Option<String>, name: String, server: String, email: String, secret: String) -> String {
-        let config = standardnotes::Config { server: server_or(&server, standardnotes::DEFAULT_SERVER), email: email.trim().to_owned() };
-        self.add(again, name, "Standard Notes", BackendConfig::StandardNotes(config), secret)
-    }
-
-    /// Adds (or signs in again to) a Bitwarden account after
-    /// [`sign_in_bitwarden`]. Returns its id.
-    pub fn add_bitwarden_account(&self, again: Option<String>, name: String, server: String, email: String, folder: String, secret: String) -> String {
-        let config = bitwarden_config(&server, &email, &folder);
-        self.add(again, name, "Bitwarden", BackendConfig::Bitwarden(config), secret)
-    }
-}
-
-impl NotesCore {
-    fn add(&self, again: Option<String>, name: String, default_name: &str, backend: BackendConfig, secret: String) -> String {
-        let mut lib = self.lib();
-        let id = again.unwrap_or_else(new_id);
-        let name = if name.trim().is_empty() { default_name.to_owned() } else { name.trim().to_owned() };
-        let account = lib.account_for(&id, name, backend);
-        lib.add_account(account, Some(secret));
-        id
-    }
 }
 
 fn item(r: library::NoteRow) -> NoteItem {
@@ -702,20 +664,6 @@ fn item(r: library::NoteRow) -> NoteItem {
         locked: r.locked,
         deleted: r.deleted,
     }
-}
-
-fn server_or(server: &str, default: &str) -> String {
-    let s = server.trim().trim_end_matches('/');
-    if s.is_empty() {
-        default.to_owned()
-    } else {
-        s.to_owned()
-    }
-}
-
-fn bitwarden_config(server: &str, email: &str, folder: &str) -> bitwarden::Config {
-    let folder = if folder.trim().is_empty() { bitwarden::DEFAULT_FOLDER.to_owned() } else { folder.trim().to_owned() };
-    bitwarden::Config { server: server_or(server, bitwarden::DEFAULT_SERVER), email: email.trim().to_owned(), folder }
 }
 
 /// The local account's id (notes on this iPhone only).
@@ -740,86 +688,6 @@ pub fn font_size(style: ParagraphStyle, body: f32) -> f32 {
 #[uniffi::export]
 pub fn is_locked_markdown(md: String) -> bool {
     lock::is_locked(&md)
-}
-
-// ---- Signing in -----------------------------------------------------------------
-
-/// How a sign-in went.
-#[derive(Clone, Debug, PartialEq, uniffi::Enum)]
-pub enum SignInResult {
-    /// Signed in: pass the secret to `add_…_account` (it goes to the
-    /// keychain).
-    Done { secret: String },
-    /// Standard Notes: ask for the authenticator code and sign in again.
-    NeedsCode,
-    /// Bitwarden two-step login: ask for the code (from the authenticator
-    /// app, or the email just sent) and sign in again.
-    NeedsTwoFactor { authenticator: bool, email: bool },
-    /// Bitwarden emailed a code to confirm this device.
-    NeedsNewDeviceCode,
-}
-
-/// Signs in to Standard Notes (blocking: call it off the main thread).
-#[uniffi::export]
-pub fn sign_in_standard_notes(server: String, email: String, password: String, code: Option<String>) -> Result<SignInResult, CoreError> {
-    let config = standardnotes::Config { server: server_or(&server, standardnotes::DEFAULT_SERVER), email: email.trim().to_owned() };
-    let req = standardnotes::SignInRequest { password, mfa_code: code.filter(|c| !c.trim().is_empty()).map(|c| c.trim().to_owned()) };
-    match standardnotes::sign_in(&config, &req).map_err(|e| failed(format!("{e:#}")))? {
-        standardnotes::SignInStep::Done { secret } => Ok(SignInResult::Done { secret }),
-        standardnotes::SignInStep::NeedsMfaCode => Ok(SignInResult::NeedsCode),
-    }
-}
-
-/// Signs in to Bitwarden (blocking: call it off the main thread). With an
-/// API key, both its client id and secret are given. `code` answers a
-/// two-step login (`email_code`: it's the emailed one), `new_device_code` a
-/// new-device check.
-#[uniffi::export]
-#[allow(clippy::too_many_arguments)]
-pub fn sign_in_bitwarden(
-    server: String,
-    email: String,
-    password: String,
-    folder: String,
-    api_client_id: Option<String>,
-    api_client_secret: Option<String>,
-    code: Option<String>,
-    email_code: bool,
-    remember: bool,
-    new_device_code: Option<String>,
-) -> Result<SignInResult, CoreError> {
-    use bitwarden::{Method, SignInRequest, SignInStep, TwoFactorCode, TwoFactorKind};
-    let config = bitwarden_config(&server, &email, &folder);
-    let method = match (api_client_id, api_client_secret) {
-        (Some(client_id), Some(client_secret)) if !client_id.trim().is_empty() => {
-            Method::ApiKey { client_id: client_id.trim().to_owned(), client_secret: client_secret.trim().to_owned(), password }
-        }
-        _ => Method::Password { password },
-    };
-    let two_factor = code.filter(|c| !c.trim().is_empty()).map(|c| TwoFactorCode {
-        kind: if email_code { TwoFactorKind::Email } else { TwoFactorKind::Authenticator },
-        code: c.trim().to_owned(),
-        remember,
-    });
-    let req = SignInRequest { method, two_factor, new_device_code: new_device_code.filter(|c| !c.trim().is_empty()) };
-    match bitwarden::sign_in(&config, &req).map_err(|e| failed(format!("{e:#}")))? {
-        SignInStep::Done { secret } => Ok(SignInResult::Done { secret }),
-        SignInStep::NeedsNewDeviceCode => Ok(SignInResult::NeedsNewDeviceCode),
-        SignInStep::NeedsTwoFactor { kinds } => {
-            let authenticator = kinds.contains(&TwoFactorKind::Authenticator);
-            let email = kinds.contains(&TwoFactorKind::Email);
-            if !authenticator && !email {
-                return Err(failed(
-                    "This account's two-step login method isn't supported here. Use an API key (Account Settings → Security → Keys), or add an authenticator app or email as a two-step method.",
-                ));
-            }
-            if !authenticator {
-                // Only email: have the code sent.
-                let _ = bitwarden::send_email_code(&config, &req);
-            }
-            Ok(SignInResult::NeedsTwoFactor { authenticator, email })
-        }
-    }
 }
 
 // ---- The note editor ------------------------------------------------------------

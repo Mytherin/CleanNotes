@@ -20,8 +20,6 @@ mod enex;
 mod fonts;
 mod icons;
 mod theme;
-#[cfg(any(windows, target_os = "macos"))]
-mod webfetch;
 
 // The shared core (also the iPhone app's): notes, documents, storage, sync.
 use cleannotes_core::{db, doc, lock, markdown, model, settings, sync};

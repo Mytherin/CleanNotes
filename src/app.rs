@@ -91,10 +91,6 @@ pub struct App {
     tag_cache: Option<(u64, Vec<String>)>,
     /// The notes list's sections, and what they were worked out for.
     sections_cache: Option<(u64, Vec<(String, Vec<String>)>)>,
-    /// The browser engine Standard Notes requests go through (as in its own
-    /// apps), if it could be started.
-    #[cfg(any(windows, target_os = "macos"))]
-    web: Option<crate::webfetch::WebHost>,
 }
 
 impl App {
@@ -125,16 +121,6 @@ impl App {
             lib.seed();
         }
         let mut app = App::with(lib);
-        // Standard Notes requests go through the system's browser engine, as
-        // in Standard Notes' own apps (see webfetch.rs).
-        #[cfg(any(windows, target_os = "macos"))]
-        match crate::webfetch::WebHost::start(cc) {
-            Ok((host, fetch)) => {
-                crate::sync::standardnotes::api::use_browser_engine(fetch);
-                app.web = Some(host);
-            }
-            Err(e) => eprintln!("no browser engine for Standard Notes ({e:#}); using plain HTTP"),
-        }
         app.restore_location();
         Ok(app)
     }
@@ -163,8 +149,6 @@ impl App {
             lock: Default::default(),
             tag_cache: None,
             sections_cache: None,
-            #[cfg(any(windows, target_os = "macos"))]
-            web: None,
         }
     }
 
@@ -910,49 +894,6 @@ impl App {
     }
 }
 
-impl App {
-    /// Passes Standard Notes requests to the browser engine, and if
-    /// Cloudflare asks for its browser check, shows it (as a browser would)
-    /// below a bar saying what it is, until the user is done.
-    #[cfg(any(windows, target_os = "macos"))]
-    fn browser_check(&mut self, ctx: &egui::Context) {
-        let Some(web) = &mut self.web else { return };
-        web.pump();
-        if web.take_changed() {
-            // Told of a change on Standard Notes' server: those accounts
-            // sync now (as soon as they aren't syncing already).
-            use crate::sync::standardnotes::{api, DEFAULT_SERVER};
-            self.lib.sync_soon(|a| matches!(&a.backend, crate::sync::BackendConfig::StandardNotes(c) if api::base(&c.server) == api::base(DEFAULT_SERVER)));
-        }
-        let Some(web) = &mut self.web else { return };
-        if !web.check_needed() && !web.checking() {
-            return;
-        }
-        let mut done = false;
-        let bar = egui::TopBottomPanel::top("browser-check").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(if cfg!(windows) {
-                    "Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it in the window that opened, then click Done."
-                } else {
-                    "Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it below, then click Done."
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    done = ui.button("Done").clicked();
-                });
-            });
-        });
-        // (Closing the check's own window counts as Done.)
-        if done || web.check_window_closed() {
-            web.end_check();
-            // Try again now.
-            self.lib.sync_soon(|_| true);
-            return;
-        }
-        let screen = ctx.screen_rect();
-        web.show_check(egui::Rect::from_min_max(egui::pos2(screen.min.x, bar.response.rect.max.y), screen.max));
-    }
-}
-
 /// Shown instead of the app when the notes database can't be opened. (The
 /// app has no console, so a panic would just mean no window at all.)
 pub struct StartupError(String);
@@ -1015,8 +956,6 @@ impl App {
     fn frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_style(ctx);
         let p = Palette::get(ctx);
-        #[cfg(any(windows, target_os = "macos"))]
-        self.browser_check(ctx);
         self.background(ctx);
         self.shortcuts(ctx);
 

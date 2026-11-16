@@ -17,24 +17,22 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "sync-s
 unicode-segmentation = "1.13"
 # Three-way merges of note text when two devices edit the same note.
 diffy = "0.4"
-# Bitwarden's vault encryption.
+# Locked notes' encryption, and S3 request signing.
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 hmac = "0.12"
 sha2 = "0.10"
-pbkdf2 = "0.12"
 hkdf = "0.12"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
-# Standard Notes' protocol 004 encryption.
+# An encrypted S3 folder's notes.
 chacha20poly1305 = "0.10"
 
-# Desktop only: the default data folder, and opening the browser for
-# CloudKit's sign-in. (On iOS the app passes its own folder in.)
+# Desktop only: the default data folder. (On iOS the app passes its own
+# folder in.)
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 directories = "5"
-open = "5"
 
 [dev-dependencies]
 tempfile = "3"

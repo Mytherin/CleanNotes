@@ -21,8 +21,45 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::sync::bitwarden::frontmatter::{scalar, unquote};
 use crate::sync::NoteData;
+
+/// A YAML scalar, quoted when it would otherwise read as something else.
+fn scalar(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+'))
+        && !s.starts_with(['-', ':'])
+        && !matches!(s, "true" | "false" | "null" | "~" | "yes" | "no");
+    if plain {
+        s.to_owned()
+    } else {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
+/// A YAML scalar's value: unquoted (`"…"` with backslash escapes, or
+/// `'…'`), else as it is.
+fn unquote(v: &str) -> String {
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        let inner = &v[1..v.len() - 1];
+        let mut out = String::new();
+        let mut esc = false;
+        for c in inner.chars() {
+            if esc {
+                out.push(c);
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else if v.len() >= 2 && v.starts_with('\'') && v.ends_with('\'') {
+        v[1..v.len() - 1].replace("''", "'")
+    } else {
+        v.to_owned()
+    }
+}
 
 fn ts(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

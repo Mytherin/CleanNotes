@@ -1,8 +1,8 @@
 //! Syncing accounts with where their notes are kept.
 //!
 //! A backend ([`Backend`]) only stores folders and notes and lists them back;
-//! how it writes them down is its own business (the Bitwarden backend writes
-//! each note as a secure note with YAML front matter, the SQLite backend as
+//! how it writes them down is its own business (the S3 backend writes each
+//! note as a Markdown file with YAML front matter, the SQLite backend as
 //! rows in tables). Everything else (what to upload, conflicts, merging two
 //! devices' edits, edits made while a sync runs) is shared, in
 //! [`engine`], and runs on a background thread ([`worker`]).
@@ -13,13 +13,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub mod bitwarden;
-pub mod cloudkit;
 pub mod engine;
 pub mod merge;
 pub mod s3;
 pub mod sqlite;
-pub mod standardnotes;
 pub mod worker;
 #[cfg(test)]
 pub mod test_http;
@@ -30,13 +27,8 @@ pub mod test_http;
 pub enum BackendConfig {
     /// Not synced ("On My PC").
     Local,
-    Bitwarden(bitwarden::Config),
     /// A SQLite database file, e.g. on a network share or in a synced folder.
     Sqlite(sqlite::Config),
-    /// Records in a CloudKit container's private database.
-    CloudKit(cloudkit::Config),
-    /// Encrypted items in a Standard Notes account.
-    StandardNotes(standardnotes::Config),
     /// Markdown files in a folder of an S3 bucket.
     S3(s3::Config),
 }
@@ -45,10 +37,7 @@ impl BackendConfig {
     pub fn kind_name(&self) -> &'static str {
         match self {
             BackendConfig::Local => "Local",
-            BackendConfig::Bitwarden(_) => "Bitwarden",
             BackendConfig::Sqlite(_) => "SQLite",
-            BackendConfig::CloudKit(_) => "CloudKit",
-            BackendConfig::StandardNotes(_) => "Standard Notes",
             BackendConfig::S3(_) => "S3",
         }
     }
@@ -59,7 +48,7 @@ impl BackendConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NoteData {
     /// The note's id in the app (a UUID). A note a backend didn't get from
-    /// the app (say, one typed into Bitwarden directly) gets one made up
+    /// the app (say, a Markdown file put into the S3 folder by hand) gets one made up
     /// from its remote id.
     pub id: String,
     pub folder: Vec<String>,
@@ -185,10 +174,7 @@ pub type OnRenewed = Box<dyn FnMut(String) + Send>;
 pub fn open(config: &BackendConfig, secret: Option<String>) -> anyhow::Result<Box<dyn Backend>> {
     match config {
         BackendConfig::Local => anyhow::bail!("the local account isn't synced"),
-        BackendConfig::Bitwarden(c) => Ok(Box::new(bitwarden::BitwardenBackend::open(c, secret)?)),
         BackendConfig::Sqlite(c) => Ok(Box::new(sqlite::SqliteBackend::open(c)?)),
-        BackendConfig::CloudKit(c) => Ok(Box::new(cloudkit::CloudKitBackend::open(c, secret)?)),
-        BackendConfig::StandardNotes(c) => Ok(Box::new(standardnotes::StandardNotesBackend::open(c, secret)?)),
         BackendConfig::S3(c) => Ok(Box::new(s3::S3Backend::open(c, secret)?)),
     }
 }

@@ -204,7 +204,7 @@ impl Library {
         let samples: [(&str, &str, chrono::Duration, bool); 6] = [
             (&notes, "# Weekend trip\n## Packing\n- [x] Passport\n- [x] Charger\n- [ ] Rain jacket\n- [ ] Snacks for the train\n## Plan\n1. Train at **9:12** from Central\n2. Check in at the *hotel*\n3. Dinner at [Trattoria Roma](https://example.com)\n\nDon't forget #travel insurance.\n", chrono::Duration::minutes(5), true),
             (&notes, "# Book ideas\n* *The Overstory*, Richard Powers\n* *Piranesi*, Susanna Clarke\n    * also her short stories\n* ~~Dune~~ (read it)\n> A reader lives a thousand lives before he dies.\n", day * 2, false),
-            (&work, "# Standup notes\nShipped the **sync engine**; next up: conflict UI.\n- Bitwarden backend\n- CloudKit backend\n- <u>Release</u> on Friday #work\n", chrono::Duration::hours(3), false),
+            (&work, "# Standup notes\nShipped the **sync engine**; next up: conflict UI.\n- S3 backend\n- SQLite backend\n- <u>Release</u> on Friday #work\n", chrono::Duration::hours(3), false),
             (&work, "# Snippets\n```\ncargo run --release\ncargo test\n```\nRemember to bump the version.\n", day * 12, false),
             (&recipes, "# Pancakes\n### Ingredients\n- [ ] 200 g flour\n- [ ] 2 eggs\n- [ ] 300 ml milk\n### Method\nWhisk everything, rest for 20 minutes, fry in butter. #cooking\n", day * 40, false),
             (&notes, "# Grocery list\nApples, oat milk, coffee beans, basil\n", day * 400, false),
@@ -926,15 +926,7 @@ impl Library {
                 Some(s) if self.sync_errors.contains_key(&id) => s > RETRY_AFTER_ERROR,
                 Some(s) => {
                     let changed = quiet && s > Duration::from_secs(5) && engine::has_local_changes(&self.store, &id);
-                    // Standard Notes' own apps look for changes every 30
-                    // seconds (and are told of them at once, see
-                    // `live_changes`); asking costs one small request.
-                    let every = match self.store.account(&id).map(|a| &a.backend) {
-                        Some(crate::sync::BackendConfig::StandardNotes(_)) => {
-                            Duration::from_secs(30).min(Duration::from_secs(refresh as u64 * 60))
-                        }
-                        _ => Duration::from_secs(refresh as u64 * 60),
-                    };
+                    let every = Duration::from_secs(refresh as u64 * 60);
                     changed || (refresh > 0 && s > every)
                 }
             };

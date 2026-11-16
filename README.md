@@ -1,6 +1,6 @@
 # CleanNotes
 
-A notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, **Amazon S3** (or an S3-compatible service), or a **SQLite database** file.
+A notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Amazon S3** (or an S3-compatible service) or a **SQLite database** file.
 The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCalendar](../CleanCalendar); the [iPhone app](#iphone-app) is SwiftUI and UIKit on the same Rust core.
 
 ## Features
@@ -35,7 +35,7 @@ On Windows, `build.rs` embeds `assets/CleanNotes.ico` and version information in
 
 ## iPhone app
 
-`ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps read and write the same notes and sync with each other through any of the shared backends.
+`ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps keep notes the same way; the iPhone app has no sync accounts of its own yet.
 
 ### Building
 
@@ -54,7 +54,7 @@ Run `build-rust.sh` once before `xcodegen`, since the project includes the gener
 - **Folders:** each account's folders with note counts (nested, collapsible accounts), Recently Deleted, tags, and All Notes once there are several folders. New Folder and the compose button are in the bottom toolbar. Swipe a folder to delete it, or touch and hold to rename it or add a subfolder. Search there looks through every note.
 - **Notes list:** large title, date sections (Pinned, Today, Yesterday, Previous 7 Days, …), each note's title, time, first line and (in mixed lists) folder. Swipe right to pin. Swipe left to delete or move. Touch and hold for a preview and a menu (pin, lock, share, move, duplicate, delete). The "…" menu switches to the gallery view, selects several notes (Move, Delete, Recover All in Recently Deleted), and sets sort and grouping. The bottom toolbar shows the note count and the compose button. Pull down to sync; **shake to undo** deleting notes.
 - **Note:** the date on top, then the rich text with the same paragraph styles as the desktop: titles, headings, lists, checklists you tick by tapping the circle, quotes and monospaced. While typing, undo, redo and Done are in the navigation bar, and the keyboard bar has Aa, checklist, indent and link. **Aa** replaces the keyboard with the format panel (styles, B I U S, lists, indents). The usual iOS editing works: autocorrect, dictation, the edit menu, ⌘B/⌘I/⌘U and ⌘Z on a keyboard, and shake to undo typing. "…" has Find in Note (the system find bar), Move, Pin, Lock and Delete. Recently Deleted notes can be read and recovered but not edited. Swipe from the left edge to go back.
-- **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, plus accounts: **Standard Notes** and **Bitwarden** sign-in (with two-step codes). iCloud (CloudKit) and SQLite syncing are only in the desktop app for now. CloudKit's sign-in needs a browser callback, and a SQLite file needs a shared folder.
+- **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, and the accounts. Syncing (S3 and SQLite) is only in the desktop app for now: on the iPhone, notes are kept on the device.
 
 ### How the text view uses the shared editor
 
@@ -118,57 +118,7 @@ Characters that would read as markup are escaped. Markdown written elsewhere is 
 
 Like Apple Notes, every folder belongs to an **account**: *On My PC* (only on this computer) or a synced one. Add accounts under **Settings → Accounts → +**. Each one shows in the sidebar with its own folders and Recently Deleted.
 
-### Bitwarden
-
-Notes go into your Bitwarden vault (bitwarden.com, bitwarden.eu, or a self-hosted Bitwarden or Vaultwarden server) as **secure notes**, encrypted on your computer before they're sent:
-
-- Each note is a secure note named after the note's title. Its notes field holds the note **Jekyll style**: YAML front matter with the note's metadata, then the Markdown:
-
-  ```text
-  ---
-  id: 6f1c0d3e-…
-  created: 2026-11-15T12:03:00.000Z
-  modified: 2026-11-15T12:30:12.500Z
-  pinned: true
-  tags: [travel]
-  ---
-  # Weekend trip
-  - [ ] Passport
-  ```
-
-  This format belongs to the Bitwarden backend alone (`src/sync/bitwarden/frontmatter.rs`); the rest of the app only sees notes.
-- Notes live in one vault folder (the "Vault folder" setting, `Notes` by default). The app's default *Notes* folder is that vault folder itself, and other app folders are vault folders inside it: app folder `Work/2026` is vault folder `Notes/Work/2026`, which Bitwarden shows nested. Nothing else in the vault is touched.
-- Bitwarden allows 10,000 encrypted characters in an item's notes. Longer notes continue in hidden custom fields (`cleannotes-part-2`, …), and `parts:` in the front matter says how many there are.
-- A secure note you type into that folder in Bitwarden itself (without front matter) shows up as a note too.
-- Notes deleted for good go to Bitwarden's trash. Updating an item keeps what the app doesn't own: its favorite star, master-password re-prompt, other custom fields, password history and its own item key.
-- Sign in with your email and master password (authenticator-app or email codes for two-step login, and Bitwarden's new-device email code, are asked for when needed), or with a **personal API key** (Account Settings → Security → Keys), which skips two-step login and captchas. The master password is never stored: signing in unlocks the vault key, which is kept with the session tokens in the OS credential store.
-
-The app speaks Bitwarden's client protocol itself (`src/sync/bitwarden/`): PBKDF2-SHA256 or Argon2id key derivation, HKDF-stretched master keys, AES-256-CBC + HMAC-SHA256 "type 2" encrypted strings, user and per-item keys, token refresh.
-
-### iCloud (CloudKit)
-
-Notes go into the **private database** of a CloudKit container in your iCloud account, through CloudKit Web Services. This is the app's own data in iCloud; Apple doesn't let other apps read Apple Notes' notes.
-
-You need a container of your own:
-
-1. In the [Apple Developer portal](https://developer.apple.com/account/resources/identifiers/list/cloudContainer) create an iCloud container (e.g. `iCloud.com.yourname.notes`).
-2. In [CloudKit Console](https://icloud.developer.apple.com/) open the container, go to **API Access → Tokens**, create an API token, and set its **Sign in Callback** to **URL Redirect** with `http://127.0.0.1:52789/` (or another port you then enter in the app).
-3. In CleanNotes, **Settings → Accounts → + → iCloud (CloudKit)**: enter the container, environment and API token, and click **Sign In**. Your browser opens Apple's sign-in page; afterwards it returns to the app.
-
-Notes are `Note` records in a custom zone `CleanNotes` (named after the note's id, with its folder path, Markdown body, title, dates, pin and deletion), folders are `Folder` records. In the **Development** environment CloudKit creates these record types on first use; for **Production**, deploy the schema from CloudKit Console first. A record's change tag is its revision, so CloudKit refuses a save based on an outdated copy, and the sync engine merges instead.
-
-### Standard Notes
-
-Notes go into a [Standard Notes](https://standardnotes.com) account (`api.standardnotes.com` or a self-hosted server), end-to-end encrypted on your computer with Standard Notes' protocol 004, so they show up in the Standard Notes apps:
-
-- Each note is a Standard Notes note. Its text is the note's Markdown as it is (new notes use Standard Notes' plain text editor), its title the note's title; pins, dates and the trash (Recently Deleted) map onto Standard Notes' own. Updating a note keeps everything the app doesn't own (other app data, links to other notes and files, the editor, spellcheck, …).
-- A note written in Standard Notes with a title that isn't its first line shows with the title on top as a heading; saving takes it off again.
-- Folders are **tags**, nested as Standard Notes nests them. A note is in the folder of the tag holding it (the deepest, if several do); untagged notes are in *Notes*. Moving a note to another folder takes it out of its other tags.
-- Notes written with another editor (**Super**, rich text, code, spreadsheets, …) and locked notes are shown **read-only**, as plain as their text can be made, under a line saying so. Pinning, moving and deleting them works; changing their text saves the change as a *new* plain note next to the original, which is never overwritten.
-- Notes deleted for good are deleted in Standard Notes too.
-- Sign in with your email and password (and your authenticator code if you use two-factor authentication). The password is never stored: signing in derives your keys, and only the session and the key that unlocks your items keys are kept, in the OS credential store. Only accounts on protocol 004 work (the Standard Notes apps offer to upgrade older ones); items in shared vaults and hardware-key two-factor aren't supported.
-
-The app speaks Standard Notes' client protocol itself (`src/sync/standardnotes/`): Argon2id root keys, XChaCha20-Poly1305 with the client's authenticated data, items keys, PKCE sign-in, session refresh and the paged items sync. Add an account under Settings → Accounts → + → Standard Notes (standardnotes.com or a self-hosted server; two-factor codes are asked for when needed).
+Earlier versions could also sync with Bitwarden, iCloud (CloudKit) and Standard Notes. Those are gone: an account of one of them becomes a folder named after it in *On My PC*, with its folders and notes as they were here, and its saved sign-in is deleted. Nothing on the service itself is touched.
 
 ### Amazon S3
 
@@ -218,7 +168,7 @@ To add a backend: implement `Backend`, add a `BackendConfig` variant, and open i
 
 ## Data
 
-Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (a Bitwarden session, a CloudKit web auth token, a Standard Notes session and key, an S3 access key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
+Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (an S3 access key and encryption key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
 
 ## Code layout
 
@@ -241,9 +191,6 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `core/src/sync/merge.rs` | Three-way merges of note text |
 | `core/src/sync/worker.rs` | The background sync thread |
 | `core/src/sync/sqlite.rs` | The SQLite backend |
-| `core/src/sync/bitwarden/` | The Bitwarden backend: protocol, crypto, front matter |
-| `core/src/sync/cloudkit/` | The CloudKit backend |
-| `core/src/sync/standardnotes/` | The Standard Notes backend: protocol 004 crypto, sign-in, items sync, notes and tags, Super notes (`lexical.rs`) |
 | `core/src/sync/s3/` | The S3 backend: Signature V4, Markdown files, optional encryption |
 
 **`src/` (the desktop app):** what's drawn and selected.
@@ -258,7 +205,6 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `src/app/note_pane.rs` | The note's toolbar, Aa and "…" menus, search, find bar, link sheet |
 | `src/app/settings_window.rs` | Settings: General and Accounts, with the sign-in sheets |
 | `src/app/import.rs`, `src/enex.rs` | Importing Evernote exports (`.enex`) |
-| `src/webfetch.rs` | Standard Notes requests through the system browser engine (Windows, macOS) |
 | `src/editor/mod.rs` | The editor on the editing engine: keys, pointer, caret, selection, context menu |
 | `src/editor/layout.rs` | Laying out and painting paragraphs, list markers, checkboxes |
 | `src/theme.rs`, `src/fonts.rs`, `src/icons.rs`, `src/app_icon.rs` | Colors, fonts, drawn icons, the app icon (`write_ios_icon` makes the iPhone's) |
@@ -271,13 +217,8 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 
 - **Document and Markdown:** every paragraph and character style round-trips; escaping; Markdown from elsewhere; editing operations (Return in lists, Backspace at a bullet, pasting, numbering, moving items); the editor's undo grouping, auto-lists, find, links and checklist sorting.
 - **Sync engine** (`core/src/sync/engine/tests.rs`): two "devices" with their own stores share one SQLite backend: merges, clashing edits kept as two notes, edit beats delete, Recently Deleted and pins, folder moves, renames and deletes, edits during a sync, lost replies, offline changes on both sides.
-- **Bitwarden** (`core/src/sync/bitwarden/tests.rs`) against a fake server (`fake.rs`) that only ever sees encrypted data and enforces revision checks, Bitwarden's length limits and token expiry: password, Argon2id, two-step, new-device and API-key sign-ins; round trips, conflicts, 100 KB notes, items typed into the vault, fields kept on update, folder renames, trash, token refresh, and two devices syncing through the vault. The key derivation and encryption are checked against vectors computed independently in Node.js (`kat.rs`).
-- **CloudKit** (`core/src/sync/cloudkit/tests.rs`) against a fake CloudKit Web Services server: browser sign-in through the loopback callback, records and change tags, conflicts, paging, folder renames, expired sign-ins, and two devices syncing.
+- **S3** (`core/src/sync/s3/tests.rs`) against a fake S3 that checks Signature V4 and honours conditional writes: Markdown objects, conflicts, tombstones (and never deleting a note brought back over one), hand-written and unreadable files, paged listings, downloading only what changed, folder renames moving their notes, encryption, the bucket check, and two devices syncing.
 - **SQLite backend, local storage, model** unit tests; the **library** (list sections, new notes, deletion undo, folders, sign-ins replaced mid-sync) and the **bindings** (UTF-16 positions, which edits the text view may make itself, notes and locking through `NotesCore`).
-
-- **Standard Notes** (`core/src/sync/standardnotes/tests.rs`) against a fake server that only sees protocol 004 strings, checks the PKCE verifier, enforces sync conflicts by timestamp, pages downloads and expires sessions: sign-in (two-factor, email retried in lowercase), items keys, round trips, conflicts, tags as folders, the trash, read-only Super notes, paging and incremental syncs, session refresh, and two devices syncing. The key derivation and encryption are checked against the official client's own test vectors, including an items key from a real account's backup (`kat.rs`).
-
-The Bitwarden, CloudKit and Standard Notes backends have only been tested against those fakes, not against the real services.
 
 ## Ideas for next steps
 

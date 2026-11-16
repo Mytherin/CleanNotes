@@ -118,7 +118,14 @@ impl Db {
         };
         let mut db = Db { conn, dir: dir.to_path_buf(), secrets, keyring_prefix, saved_meta: None, in_memory: Mutex::new(HashMap::new()) };
         db.move_secrets_out()?;
-        let (store, settings) = db.load()?;
+        let (store, settings, retired) = db.load()?;
+        if !retired.is_empty() {
+            // Their sign-ins are of no more use.
+            for id in &retired {
+                let _ = db.set_secret(id, None);
+            }
+            db.save_all(&store, &settings)?;
+        }
         Ok((db, store, settings))
     }
 
@@ -133,13 +140,19 @@ impl Db {
         Ok(conn)
     }
 
-    fn load(&mut self) -> Result<(Store, Settings)> {
+    /// The store and settings, and the ids of accounts whose kind of sync
+    /// is no longer supported (their notes were moved to the local account).
+    fn load(&mut self) -> Result<(Store, Settings, Vec<String>)> {
         let mut store = Store::default();
+        let mut retired: Vec<(String, String)> = Vec::new();
         let json = |s: String| -> Option<serde_json::Value> { serde_json::from_str(&s).ok() };
         {
             let mut st = self.conn.prepare("SELECT data FROM accounts ORDER BY position")?;
             for row in st.query_map([], |r| r.get::<_, String>(0))? {
-                if let Some(a) = json(row?).and_then(|v| serde_json::from_value::<Account>(v).ok()) {
+                let Some(v) = json(row?) else { continue };
+                if let Some(old) = retired_account(&v) {
+                    retired.push(old);
+                } else if let Ok(a) = serde_json::from_value::<Account>(v) {
                     store.accounts.push(a);
                 }
             }
@@ -183,7 +196,10 @@ impl Db {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         store.ensure_local();
-        Ok((store, settings))
+        for (id, name) in &retired {
+            store.retire_account(id, name);
+        }
+        Ok((store, settings, retired.into_iter().map(|(id, _)| id).collect()))
     }
 
     /// Saves the notes in `notes` (deleting those no longer in the store),
@@ -336,6 +352,18 @@ impl Db {
     }
 }
 
+/// Kinds of sync CleanNotes no longer has.
+const RETIRED_BACKENDS: [&str; 3] = ["Bitwarden", "CloudKit", "StandardNotes"];
+
+/// An account saved with a kind of sync that's gone: its id and name.
+fn retired_account(v: &serde_json::Value) -> Option<(String, String)> {
+    let kind = v.get("backend")?.as_object()?.keys().next()?.clone();
+    if !RETIRED_BACKENDS.contains(&kind.as_str()) {
+        return None;
+    }
+    Some((v.get("id")?.as_str()?.to_owned(), v.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_owned()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,6 +401,52 @@ mod tests {
         drop(db);
         let (_, store4, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert!(store4.notes.is_empty());
+    }
+
+    #[test]
+    fn accounts_of_removed_kinds_of_sync_become_local_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut db, mut store, settings) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        // An account saved by an older version, as it was in the file.
+        let sn = "sn1";
+        let mut notes_folder = Folder::default_for(sn);
+        notes_folder.sync.remote_id = Some("r-notes".into());
+        let work = Folder::new(sn, None, "Work");
+        let sub = Folder::new(sn, Some(&work.id), "2026");
+        let mut a = Note::new(sn, &notes_folder.id, "# A\n");
+        a.sync.remote_id = Some("ra".into());
+        let b = Note::new(sn, &sub.id, "# B\n");
+        let (ia, ib, iw, is) = (a.id.clone(), b.id.clone(), work.id.clone(), sub.id.clone());
+        store.folders.extend([notes_folder, work, sub]);
+        store.notes.extend([a, b]);
+        // A folder with its name is at the top of the local account already.
+        store.folders.push(Folder::new(LOCAL, None, "Standard Notes"));
+        db.save_all(&store, &settings).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO accounts (id, position, data) VALUES (?1, 9, ?2)",
+                [sn, r#"{"id":"sn1","name":"Standard Notes","backend":{"StandardNotes":{"server":"https://api.standardnotes.com","email":"a@b.c"}},"enabled":true}"#],
+            )
+            .unwrap();
+        db.set_secret(sn, Some("keys")).unwrap();
+        drop(db);
+
+        let (db, store, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        assert!(store.account(sn).is_none());
+        assert!(store.notes.iter().all(|n| n.account == LOCAL));
+        let path = |id: &str| store.folder_path(&store.note(id).unwrap().folder);
+        assert_eq!(path(&ia), vec!["Standard Notes 2"]);
+        assert_eq!(path(&ib), vec!["Standard Notes 2", "Work", "2026"]);
+        assert!(store.note(&ia).unwrap().sync.remote_id.is_none(), "nothing left to sync");
+        assert!(store.folders.iter().all(|f| f.account == LOCAL && f.sync.remote_id.is_none()));
+        assert_eq!(store.folder(&iw).unwrap().account, LOCAL);
+        assert_eq!(store.folder(&is).unwrap().parent.as_deref(), Some(iw.as_str()));
+        assert_eq!(db.secret(sn), None, "its sign-in is deleted");
+        drop(db);
+        // Saved that way: opening again changes nothing.
+        let (_, again, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        assert_eq!(again.notes.len(), 2);
+        assert_eq!(again.folder_path(&again.note(&ib).unwrap().folder), vec!["Standard Notes 2", "Work", "2026"]);
     }
 
     #[test]

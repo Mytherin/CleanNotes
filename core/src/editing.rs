@@ -43,7 +43,7 @@ pub enum Command {
     DeleteRow,
     DeleteColumn,
     DeleteTable,
-    /// Super notes' tables can have header cells.
+    /// A table's first row (or column) can be a header.
     ToggleHeaderRow,
     ToggleHeaderColumn,
 }
