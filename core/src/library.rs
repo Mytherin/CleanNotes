@@ -55,6 +55,8 @@ pub struct NoteRow {
     pub title: String,
     /// The first line after the title, "No additional text", or "Locked".
     pub snippet: String,
+    /// Nothing after the title (the snippet says "No additional text").
+    pub empty: bool,
     /// "11:32", "Yesterday", "Monday" or a date.
     pub time: String,
     /// The note's folder, when the list shows notes from several.
@@ -403,7 +405,8 @@ impl Library {
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let locked = lock::is_locked(&n.body);
         let snippet = if locked { "Locked".to_owned() } else { markdown::snippet_of(&n.body, 120) };
-        let snippet = if snippet.is_empty() { "No additional text".to_owned() } else { snippet };
+        let empty = snippet.is_empty();
+        let snippet = if empty { "No additional text".to_owned() } else { snippet };
         let when = match n.deleted {
             Some(d) if matches!(loc, Location::Deleted(_)) => d,
             _ if self.settings.sort_by == SortBy::Created => n.created,
@@ -414,6 +417,7 @@ impl Library {
             id: id.to_owned(),
             title,
             snippet,
+            empty,
             time: dates::list_time(when),
             folder,
             pinned: n.pinned,
