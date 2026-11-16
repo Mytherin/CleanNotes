@@ -1127,23 +1127,42 @@ impl Library {
 
     /// "Lock Note" (with the open editor's changes copied in first).
     pub fn lock_note(&mut self, id: &str) -> LockNote {
-        if self.is_locked(id) {
+        self.lock_notes(&[id.to_owned()])
+    }
+
+    /// A note "Lock Note" applies to: there, not deleted, not locked yet.
+    pub fn can_lock(&self, id: &str) -> bool {
+        self.store.note(id).is_some_and(|n| n.deleted.is_none() && !lock::is_locked(&n.body))
+    }
+
+    /// "Lock Notes" with several notes selected: the password is asked for
+    /// once, then every one of them not locked yet (nor deleted) is locked.
+    pub fn lock_notes(&mut self, ids: &[String]) -> LockNote {
+        let ids: Vec<String> = ids.iter().filter(|id| self.can_lock(id)).cloned().collect();
+        if ids.is_empty() {
             return LockNote::Locked;
         }
         if self.settings.lock_check.is_none() {
             return LockNote::ChoosePassword;
         }
         let Some((k, salt)) = self.current_keys() else { return LockNote::EnterPassword };
-        let Some(text) = self.plain_body_now(id) else { return LockNote::Locked };
-        let env = lock::seal(&k, &salt, &text);
-        if let Some(n) = self.store.note_mut(id) {
-            n.body = lock::locked_body(&text, &env);
-            n.touch_keep_date();
+        let mut locked = 0;
+        for id in ids {
+            let Some(text) = self.plain_body_now(&id) else { continue };
+            let env = lock::seal(&k, &salt, &text);
+            if let Some(n) = self.store.note_mut(&id) {
+                n.body = lock::locked_body(&text, &env);
+                n.touch_keep_date();
+            }
+            self.lock.unlocked.insert(id.clone(), text);
+            self.unsaved.insert(id);
+            locked += 1;
         }
-        self.lock.unlocked.insert(id.to_owned(), text);
-        self.unsaved.insert(id.to_owned());
-        self.touch_lock();
-        self.push_notice("Note locked. Choose Lock Now to close locked notes.".into());
+        if locked > 0 {
+            self.touch_lock();
+            let what = if locked == 1 { "Note locked".to_owned() } else { format!("{locked} notes locked") };
+            self.push_notice(format!("{what}. Choose Lock Now to close locked notes."));
+        }
         LockNote::Locked
     }
 

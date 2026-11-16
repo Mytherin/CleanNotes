@@ -23,9 +23,9 @@ pub struct LockUi {
 
 pub enum Sheet {
     /// Choose the password (the first time a note is locked).
-    Set { password: String, verify: String, hint: String, then_lock: Option<String>, error: Option<String> },
+    Set { password: String, verify: String, hint: String, then_lock: Vec<String>, error: Option<String> },
     /// Enter the password to lock a note.
-    Enter { password: String, then_lock: Option<String>, error: Option<String> },
+    Enter { password: String, then_lock: Vec<String>, error: Option<String> },
     /// Settings → Change Password.
     Change { old: String, password: String, verify: String, hint: String, error: Option<String> },
 }
@@ -69,16 +69,29 @@ impl App {
 
     /// "Lock Note": asks for (or to choose) the password first if needed.
     pub fn lock_note(&mut self, id: &str) {
+        self.lock_notes(&[id.to_owned()]);
+    }
+
+    /// "Lock Notes" with several notes selected: the password is asked for
+    /// once, then every one of them not locked yet (nor deleted) is locked.
+    pub fn lock_notes(&mut self, ids: &[String]) {
+        let ids: Vec<String> = ids.iter().filter(|id| self.can_lock(id)).cloned().collect();
+        if ids.is_empty() {
+            return;
+        }
         self.flush_editor();
-        match self.lib.lock_note(id) {
+        match self.lib.lock_notes(&ids) {
             LockNote::Locked => {}
             LockNote::ChoosePassword => {
-                self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Some(id.to_owned()), error: None })
+                self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: ids, error: None })
             }
-            LockNote::EnterPassword => {
-                self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: Some(id.to_owned()), error: None })
-            }
+            LockNote::EnterPassword => self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: ids, error: None }),
         }
+    }
+
+    /// A note that "Lock Note" applies to: there, not deleted, not locked.
+    pub fn can_lock(&self, id: &str) -> bool {
+        self.lib.can_lock(id)
     }
 
     /// "Remove Lock": the note is stored as plain text again.
@@ -246,15 +259,11 @@ impl App {
         match a {
             SheetAction::Set(password, hint, then_lock) => {
                 self.lib.set_password(&password, &hint)?;
-                if let Some(id) = then_lock {
-                    self.lock_note(&id);
-                }
+                self.lock_notes(&then_lock);
             }
             SheetAction::Enter(password, then_lock) => {
                 self.lib.enter_password(&password)?;
-                if let Some(id) = then_lock {
-                    self.lock_note(&id);
-                }
+                self.lock_notes(&then_lock);
             }
             SheetAction::Change(old, password, hint) => {
                 self.flush_editor();
@@ -268,14 +277,14 @@ impl App {
         self.lock.sheet = Some(if self.lib.has_lock_password() {
             Sheet::Change { old: String::new(), password: String::new(), verify: String::new(), hint: self.lib.settings.lock_hint.clone(), error: None }
         } else {
-            Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: None, error: None }
+            Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Vec::new(), error: None }
         });
     }
 }
 
 enum SheetAction {
-    Set(String, String, Option<String>),
-    Enter(String, Option<String>),
+    Set(String, String, Vec<String>),
+    Enter(String, Vec<String>),
     Change(String, String, String),
 }
 
@@ -316,7 +325,7 @@ mod tests {
     fn set_password(app: &mut App, id: &str, pw: &str) {
         app.lock_note(id);
         assert!(matches!(app.lock.sheet, Some(Sheet::Set { .. })), "the first lock asks for a password");
-        app.sheet_action(SheetAction::Set(pw.into(), "the usual".into(), Some(id.to_owned()))).unwrap();
+        app.sheet_action(SheetAction::Set(pw.into(), "the usual".into(), vec![id.to_owned()])).unwrap();
         app.lock.sheet = None;
     }
 
@@ -385,12 +394,53 @@ mod tests {
     }
 
     #[test]
+    fn locking_several_notes_asks_for_the_password_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, a) = app_with_note(dir.path(), "# A\nsecret a\n");
+        let folder = app.lib.default_folder_id(crate::model::LOCAL);
+        let add = |app: &mut App, body: &str| {
+            let n = Note::new(crate::model::LOCAL, &folder, body);
+            let id = n.id.clone();
+            app.lib.store.notes.push(n);
+            id
+        };
+        let b = add(&mut app, "# B\nsecret b\n");
+        let c = add(&mut app, "# C\nsecret c\n");
+        let ids = vec![a.clone(), b.clone(), c.clone()];
+        // The first time: one sheet to choose the password, then all lock.
+        app.lock_notes(&ids);
+        let Some(Sheet::Set { then_lock, .. }) = &app.lock.sheet else { panic!("asks for a password") };
+        assert_eq!(*then_lock, ids);
+        app.sheet_action(SheetAction::Set("pw".into(), String::new(), ids.clone())).unwrap();
+        app.lock.sheet = None;
+        for id in &ids {
+            let body = &app.lib.store.note(id).unwrap().body;
+            assert!(lock::is_locked(body) && !body.contains("secret"), "{body}");
+        }
+        // After Lock Now, a mixed selection: one Enter sheet, and only the
+        // note not locked yet is sealed (the others are left as they are).
+        let d = add(&mut app, "# D\nsecret d\n");
+        let before = app.lib.store.note(&a).unwrap().body.clone();
+        app.lock_now();
+        app.lock_notes(&[a.clone(), d.clone()]);
+        let Some(Sheet::Enter { then_lock, .. }) = &app.lock.sheet else { panic!("asks for the password") };
+        assert_eq!(*then_lock, vec![d.clone()]);
+        app.sheet_action(SheetAction::Enter("pw".into(), vec![d.clone()])).unwrap();
+        assert!(app.is_locked(&d));
+        assert_eq!(app.lib.store.note(&a).unwrap().body, before);
+        // Nothing left to lock: no sheet.
+        app.lock.sheet = None;
+        app.lock_notes(&ids);
+        assert!(app.lock.sheet.is_none());
+    }
+
+    #[test]
     fn auto_lock_fires_when_coming_back_after_a_long_time() {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, id) = app_with_note(dir.path(), "# A\nsecret\n");
         set_password(&mut app, &id, "pw");
         assert!(app.has_unlocked());
-        app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: None, error: None });
+        app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: Vec::new(), error: None });
         app.lib.test_last_lock_use(cleannotes_core::library::AUTO_LOCK + std::time::Duration::from_secs(60));
         // The first frame back carries input (focus, the mouse moving).
         let ctx = egui::Context::default();
