@@ -24,6 +24,14 @@ pub enum Command {
     Outdent,
     MoveUp,
     MoveDown,
+    /// The checklist at the caret: tick every item (Apple Notes' Format →
+    /// More → Check All).
+    CheckAll,
+    UncheckAll,
+    /// Remove the checklist's ticked items.
+    DeleteChecked,
+    /// Ticked items go below the others, keeping their order.
+    MoveCheckedToBottom,
     /// Open the link sheet for the selection (the host's to show; see
     /// [`Editing::link_at_selection`]).
     EditLink,
@@ -466,6 +474,9 @@ impl Editing {
                     self.reveal = true;
                 }
             }
+            Command::CheckAll | Command::UncheckAll | Command::DeleteChecked | Command::MoveCheckedToBottom => {
+                self.checklist_command(&cmd);
+            }
             Command::SetLink(url) => {
                 self.checkpoint(None);
                 let url: Option<std::sync::Arc<str>> = url.filter(|u| !u.trim().is_empty()).map(|u| normalize_url(&u).into());
@@ -573,6 +584,81 @@ impl Editing {
             if sort && !c {
                 self.sort_checklist(block);
             }
+        }
+    }
+
+    /// The checklist (its items in a row) around the caret, if the caret is
+    /// in one.
+    fn checklist_at_caret(&self) -> Option<std::ops::Range<usize>> {
+        let is_item = |b: &Block| matches!(b.kind, Kind::Checklist(_));
+        let block = self.sel.caret.block.min(self.doc.blocks.len() - 1);
+        if !is_item(&self.doc.blocks[block]) {
+            return None;
+        }
+        let mut start = block;
+        while start > 0 && is_item(&self.doc.blocks[start - 1]) {
+            start -= 1;
+        }
+        let mut end = block + 1;
+        while end < self.doc.blocks.len() && is_item(&self.doc.blocks[end]) {
+            end += 1;
+        }
+        Some(start..end)
+    }
+
+    /// Whether the checklist at the caret has a ticked item, and an
+    /// unticked one; `None` outside a checklist.
+    pub fn checklist_state(&self) -> Option<(bool, bool)> {
+        let r = self.checklist_at_caret()?;
+        let items = &self.doc.blocks[r];
+        Some((items.iter().any(|b| b.kind == Kind::Checklist(true)), items.iter().any(|b| b.kind == Kind::Checklist(false))))
+    }
+
+    /// Check All, Uncheck All, Delete Checked, Move Checked to Bottom.
+    fn checklist_command(&mut self, cmd: &Command) {
+        let Some(range) = self.checklist_at_caret() else { return };
+        let (any_checked, any_unchecked) = self.checklist_state().unwrap_or((false, false));
+        let does_something = match cmd {
+            Command::CheckAll => any_unchecked,
+            Command::UncheckAll | Command::DeleteChecked => any_checked,
+            _ => {
+                // Some ticked item has an unticked one after it.
+                let items = &self.doc.blocks[range.clone()];
+                let first_checked = items.iter().position(|b| b.kind == Kind::Checklist(true));
+                first_checked.is_some_and(|i| items[i..].iter().any(|b| b.kind == Kind::Checklist(false)))
+            }
+        };
+        if !does_something {
+            return;
+        }
+        self.checkpoint(None);
+        match cmd {
+            Command::CheckAll | Command::UncheckAll => {
+                let on = *cmd == Command::CheckAll;
+                for b in &mut self.doc.blocks[range] {
+                    b.kind = Kind::Checklist(on);
+                }
+            }
+            Command::DeleteChecked => {
+                let start = range.start;
+                let kept: Vec<Block> =
+                    self.doc.blocks.drain(range).filter(|b| b.kind != Kind::Checklist(true)).collect();
+                let n = kept.len();
+                self.doc.blocks.splice(start..start, kept);
+                if self.doc.blocks.is_empty() {
+                    self.doc.blocks.push(Block::new(Kind::Checklist(false), ""));
+                }
+                // The caret goes to the end of the last item kept, or to the
+                // start of what followed the checklist.
+                let at = if n > 0 {
+                    let b = start + n - 1;
+                    Pos::new(b, self.doc.blocks[b].len())
+                } else {
+                    Pos::new(start.min(self.doc.blocks.len() - 1), 0)
+                };
+                self.sel = Selection::caret(self.doc.clamp(at));
+            }
+            _ => self.sort_checklist(range.start),
         }
     }
 
@@ -731,6 +817,56 @@ pub fn normalize_url(u: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checklist_commands_act_on_the_checklist_at_the_caret() {
+        let md = "Shopping\n- [ ] eggs\n- [x] milk\n- [ ] bread\n- [x] jam\n\nOther\n- [x] done\n";
+        let mut e = Editing::new("n", md);
+        e.sel = Selection::caret(Pos::new(1, 2));
+        assert_eq!(e.checklist_state(), Some((true, true)));
+        e.command(Command::CheckAll);
+        assert!(e.doc.blocks[1..5].iter().all(|b| b.kind == Kind::Checklist(true)));
+        let last = e.doc.blocks.len() - 1;
+        assert_eq!(e.doc.blocks[last].kind, Kind::Checklist(true), "another checklist is left alone");
+        e.command(Command::UncheckAll);
+        assert!(e.doc.blocks[1..5].iter().all(|b| b.kind == Kind::Checklist(false)));
+        assert_eq!(e.doc.blocks[last].kind, Kind::Checklist(true));
+        e.command(Command::Undo);
+        e.command(Command::Undo);
+        assert_eq!(e.doc.blocks[2].kind, Kind::Checklist(true), "undone step by step");
+        assert_eq!(e.doc.blocks[1].kind, Kind::Checklist(false));
+
+        e.command(Command::MoveCheckedToBottom);
+        let texts: Vec<&str> = e.doc.blocks[1..5].iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["eggs", "bread", "milk", "jam"]);
+        let depth = e.undo_depth();
+        e.command(Command::MoveCheckedToBottom);
+        assert_eq!(e.undo_depth(), depth, "already sorted: no undo step");
+
+        e.sel = Selection::caret(Pos::new(4, 1));
+        e.command(Command::DeleteChecked);
+        let texts: Vec<&str> = e.doc.blocks[..3].iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(texts, ["Shopping", "eggs", "bread"]);
+        assert_eq!(e.doc.blocks[last - 2].text, "done", "the other checklist keeps its items");
+        assert_eq!(e.sel.caret, Pos::new(2, 5), "after the last item kept");
+
+        // Outside a checklist nothing happens.
+        e.sel = Selection::caret(Pos::new(0, 0));
+        assert_eq!(e.checklist_state(), None);
+        let depth = e.undo_depth();
+        e.command(Command::CheckAll);
+        assert_eq!(e.undo_depth(), depth);
+    }
+
+    #[test]
+    fn deleting_every_item_of_the_only_checklist_leaves_an_empty_item() {
+        let mut e = Editing::new("n", "- [x] a\n- [x] b\n");
+        e.sel = Selection::caret(Pos::new(0, 0));
+        e.command(Command::DeleteChecked);
+        assert_eq!(e.doc.blocks.len(), 1);
+        assert_eq!(e.doc.blocks[0].kind, Kind::Checklist(false));
+        assert_eq!(e.sel.caret, Pos::new(0, 0));
+    }
 
     #[test]
     fn typing_list_markers_starts_lists() {

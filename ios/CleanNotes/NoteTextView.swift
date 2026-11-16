@@ -145,6 +145,42 @@ enum NoteTextRenderer {
         return a
     }
 
+    /// The note for printing: list markers and checkboxes as text (on screen
+    /// they're drawn in the margin), in light mode's colors.
+    static func printable(_ paragraphs: [Paragraph], textSize: Float) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        for (i, p) in paragraphs.enumerated() {
+            let line = NSMutableAttributedString(attributedString: attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count))
+            let marker: String?
+            switch p.style {
+            case .bulleted: marker = "•"
+            case .dashed: marker = "–"
+            case .numbered: marker = "\(p.number)."
+            case .checklist: marker = p.checked ? "☑" : "☐"
+            default: marker = nil
+            }
+            if let marker, let para = paragraphStyle(p, textSize: textSize).mutableCopy() as? NSMutableParagraphStyle {
+                // The marker hangs to the left of the text, as on screen.
+                para.firstLineHeadIndent = CGFloat(p.indent) * indentStep(bodySize(textSize))
+                para.tabStops = [NSTextTab(textAlignment: .left, location: para.headIndent)]
+                var attrs = attributes(p, run: nil, textSize: textSize)
+                attrs[.paragraphStyle] = para
+                attrs[.foregroundColor] = UIColor.label
+                line.insert(NSAttributedString(string: marker + "\t", attributes: attrs), at: 0)
+                line.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: line.length))
+            }
+            out.append(line)
+        }
+        let light = UITraitCollection(userInterfaceStyle: .light)
+        let all = NSRange(location: 0, length: out.length)
+        out.enumerateAttribute(.foregroundColor, in: all) { value, range, _ in
+            if let color = value as? UIColor {
+                out.addAttribute(.foregroundColor, value: color.resolvedColor(with: light), range: range)
+            }
+        }
+        return out
+    }
+
     /// What typing at the caret should look like.
     static func typingAttributes(_ p: Paragraph, formatting f: Formatting, textSize: Float) -> [NSAttributedString.Key: Any] {
         let run = TextRun(text: "", bold: f.bold, italic: f.italic, underline: f.underline, strike: f.strike, code: f.code, link: f.link, tag: false)
@@ -334,6 +370,80 @@ final class NoteTextView: UITextView {
     override func toggleBoldface(_ sender: Any?) { coordinator?.command(.bold) }
     override func toggleItalics(_ sender: Any?) { coordinator?.command(.italic) }
     override func toggleUnderline(_ sender: Any?) { coordinator?.command(.underline) }
+
+    // ---- Keyboard shortcuts (Apple Notes' on iPad, and the desktop's) ----
+
+    private static let shortcuts: [(title: String, input: String, flags: UIKeyModifierFlags, id: String)] = [
+        ("Title", "t", [.command, .shift], "title"),
+        ("Heading", "h", [.command, .shift], "heading"),
+        ("Subheading", "j", [.command, .shift], "subheading"),
+        ("Body", "b", [.command, .shift], "body"),
+        ("Monospaced", "m", [.command, .shift], "monospaced"),
+        ("Bulleted List", "7", [.command, .shift], "bulleted"),
+        ("Dashed List", "8", [.command, .shift], "dashed"),
+        ("Numbered List", "9", [.command, .shift], "numbered"),
+        ("Checklist", "l", [.command, .shift], "checklist"),
+        ("Mark as Checked", "u", [.command, .shift], "check"),
+        ("Block Quote", "'", [.command], "quote"),
+        ("Indent", "]", [.command], "indent"),
+        ("Outdent", "[", [.command], "outdent"),
+        ("Add Link", "k", [.command], "link"),
+        ("Move Up", UIKeyCommand.inputUpArrow, [.command, .control], "up"),
+        ("Move Down", UIKeyCommand.inputDownArrow, [.command, .control], "down"),
+    ]
+
+    override var keyCommands: [UIKeyCommand]? {
+        guard let c = coordinator, !c.readOnly else { return super.keyCommands }
+        let mine = Self.shortcuts.map { s in
+            UIKeyCommand(title: s.title, action: #selector(shortcut(_:)), input: s.input, modifierFlags: s.flags, propertyList: s.id)
+        }
+        return (super.keyCommands ?? []) + mine
+    }
+
+    @objc private func shortcut(_ sender: UIKeyCommand) {
+        guard let c = coordinator, let id = sender.propertyList as? String else { return }
+        let command: EditorCommand
+        switch id {
+        case "title": command = .setStyle(style: .title)
+        case "heading": command = .setStyle(style: .heading)
+        case "subheading": command = .setStyle(style: .subheading)
+        case "body": command = .setStyle(style: .body)
+        case "monospaced": command = .setStyle(style: .monospaced)
+        case "bulleted": command = .setStyle(style: .bulleted)
+        case "dashed": command = .setStyle(style: .dashed)
+        case "numbered": command = .setStyle(style: .numbered)
+        case "checklist": command = .setStyle(style: .checklist)
+        case "check": command = .toggleChecklist
+        case "quote": command = .setStyle(style: c.formatting?.style == .quote ? .body : .quote)
+        case "indent": command = .indent
+        case "outdent": command = .outdent
+        case "up": command = .moveUp
+        case "down": command = .moveDown
+        case "link":
+            c.onLink()
+            return
+        default: return
+        }
+        c.command(command)
+    }
+}
+
+/// A checklist's actions (Apple Notes' Format → More): for the edit menu.
+enum ChecklistActions {
+    static func menu(_ f: Formatting, run: @escaping (EditorCommand) -> Void) -> UIMenu {
+        func item(_ title: String, _ symbol: String, _ c: EditorCommand, enabled: Bool, destructive: Bool = false) -> UIAction {
+            var attributes: UIMenuElement.Attributes = []
+            if !enabled { attributes.insert(.disabled) }
+            if destructive { attributes.insert(.destructive) }
+            return UIAction(title: title, image: UIImage(systemName: symbol), attributes: attributes) { _ in run(c) }
+        }
+        return UIMenu(title: "Checklist", image: UIImage(systemName: "checklist"), children: [
+            item("Check All", "checkmark.circle", .checkAll, enabled: f.checklistHasUnchecked),
+            item("Uncheck All", "circle", .uncheckAll, enabled: f.checklistHasChecked),
+            item("Move Checked to Bottom", "arrow.down.to.line", .moveCheckedToBottom, enabled: f.checklistHasChecked),
+            item("Delete Checked Items", "trash", .deleteChecked, enabled: f.checklistHasChecked, destructive: true),
+        ])
+    }
 }
 
 /// What the note screen and the format panel see of the editor.
@@ -352,6 +462,21 @@ final class EditorBridge: ObservableObject {
         tv.findInteraction?.presentFindNavigator(showingReplace: false)
     }
     func linkAtSelection() -> String { coordinator?.editor.linkAtSelection() ?? "" }
+
+    /// Prints the note as it looks: list markers and checkboxes included.
+    func printNote(title: String) {
+        guard let c = coordinator else { return }
+        let text = NoteTextRenderer.printable(c.editor.state().paragraphs, textSize: c.textSize)
+        let info = UIPrintInfo(dictionary: nil)
+        info.outputType = .general
+        info.jobName = title
+        let formatter = UISimpleTextPrintFormatter(attributedText: text)
+        formatter.perPageContentInsets = UIEdgeInsets(top: 54, left: 54, bottom: 54, right: 54)
+        let controller = UIPrintInteractionController.shared
+        controller.printInfo = info
+        controller.printFormatter = formatter
+        controller.present(animated: true, completionHandler: nil)
+    }
 }
 
 struct NoteEditorView: UIViewRepresentable {
@@ -588,6 +713,38 @@ struct NoteEditorView: UIViewRepresentable {
             let r = tv.selectedRange
             editor.select(start: UInt32(r.location), end: UInt32(NSMaxRange(r)))
             refreshFormatting()
+        }
+
+        /// The edit menu (touch and hold, or a selection): Format (B I U S),
+        /// Add Link, and for list items Move Up and Down and the checklist's
+        /// actions, after the system's own.
+        func textView(_ tv: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {
+            if readOnly { return nil }
+            let f = formatting
+            let action = { (title: String, symbol: String, on: Bool, c: EditorCommand) -> UIAction in
+                UIAction(title: title, image: UIImage(systemName: symbol), state: on ? .on : .off) { [weak self] _ in
+                    self?.command(c)
+                }
+            }
+            let format = UIMenu(title: "Format", image: UIImage(systemName: "textformat"), children: [
+                action("Bold", "bold", f?.bold == true, .bold),
+                action("Italic", "italic", f?.italic == true, .italic),
+                action("Underline", "underline", f?.underline == true, .underline),
+                action("Strikethrough", "strikethrough", f?.strike == true, .strikethrough),
+            ])
+            let link = UIAction(title: (f?.link ?? "").isEmpty ? "Add Link" : "Edit Link", image: UIImage(systemName: "link")) { [weak self] _ in
+                self?.onLink()
+            }
+            var mine: [UIMenuElement] = [format, link]
+            let lists: [ParagraphStyle] = [.bulleted, .dashed, .numbered, .checklist]
+            if let style = f?.style, lists.contains(style) {
+                mine.append(action("Move Up", "arrow.up", false, .moveUp))
+                mine.append(action("Move Down", "arrow.down", false, .moveDown))
+            }
+            if let f, f.style == .checklist {
+                mine.append(ChecklistActions.menu(f) { [weak self] c in self?.command(c) })
+            }
+            return UIMenu(children: suggestedActions + mine)
         }
 
         func textViewDidBeginEditing(_ tv: UITextView) {
