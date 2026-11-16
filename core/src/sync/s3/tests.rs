@@ -236,6 +236,46 @@ fn wrong_region_names_the_right_one() {
 }
 
 #[test]
+fn a_renamed_folder_keeps_its_notes_on_other_devices() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let work = laptop.store.ensure_folder_at("s3", &["Work".into()]);
+    let sub = laptop.store.ensure_folder_at("s3", &["Work".into(), "2026".into()]);
+    let a = Note::new("s3", &work, "# Plan\n");
+    let b = Note::new("s3", &sub, "# Budget\n");
+    let (ia, ib) = (a.id.clone(), b.id.clone());
+    laptop.store.notes.extend([a, b]);
+    laptop.sync();
+    laptop.store.folder_mut(&work).unwrap().name = "Job".into();
+    laptop.sync();
+
+    // A device that only now syncs finds them in the renamed folders, and
+    // no "Work" comes back.
+    let mut phone = Device::new(&server);
+    phone.sync();
+    let path = |d: &Device, id: &str| d.store.folder_path(&d.store.note(id).unwrap().folder);
+    assert_eq!(path(&phone, &ia), vec!["Job"]);
+    assert_eq!(path(&phone, &ib), vec!["Job", "2026"]);
+    laptop.sync();
+    assert!(laptop.store.folders.iter().filter(|f| f.account == "s3").all(|f| f.name != "Work"), "Work came back");
+    assert_eq!(path(&laptop, &ia), vec!["Job"]);
+}
+
+#[test]
+fn one_object_that_cant_be_read_doesnt_stop_the_sync() {
+    let server = FakeS3::start();
+    let mut b = backend(&server);
+    b.save_note(None, None, &note("ok", &["Notes"], "fine")).unwrap();
+    server.put(&format!("{PREFIX}/notes/locked.md"), "# Locked\n");
+    server.state().forbidden.insert(format!("{PREFIX}/notes/locked.md"));
+    // A key the URL can't carry as it is ("." and ".." are collapsed).
+    server.put(&format!("{PREFIX}/notes/../odd.md"), "# Odd\n");
+    let snap = backend(&server).pull().unwrap();
+    assert_eq!(snap.notes.len(), 1);
+    assert_eq!(snap.unreadable, vec!["locked".to_owned()], "kept, not taken as deleted");
+}
+
+#[test]
 fn xml_entities() {
     assert_eq!(decode("&quot;abc&quot; &amp; &#65;&#x42; &bogus;"), "\"abc\" & AB &bogus;");
 }

@@ -232,6 +232,14 @@ fn http_date(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc2822(s).or_else(|_| DateTime::parse_from_rfc3339(s)).ok().map(|t| t.with_timezone(&Utc))
 }
 
+/// Whether a key (relative to the folder) is a note or folder of ours.
+/// Keys with `.` or `..` segments are left alone: a URL can't carry them
+/// as they are (they'd be collapsed, and the signature then fails).
+fn ours(rel: &str) -> bool {
+    let kind = (rel.starts_with("notes/") && rel.ends_with(".md")) || (rel.starts_with("folders/") && rel.ends_with(".json"));
+    kind && !rel.split('/').any(|s| s == "." || s == "..")
+}
+
 /// A listed object.
 struct Listed {
     key: String,
@@ -446,10 +454,7 @@ impl S3Backend {
         let root = self.config.root();
         let wanted: Vec<&Listed> = listed
             .iter()
-            .filter(|l| {
-                let rel = &l.key[root.len().min(l.key.len())..];
-                (rel.starts_with("notes/") && rel.ends_with(".md")) || (rel.starts_with("folders/") && rel.ends_with(".json"))
-            })
+            .filter(|l| ours(&l.key[root.len().min(l.key.len())..]))
             .filter(|l| self.cache.get(&l.key).map_or(true, |(e, _)| *e != l.etag))
             .collect();
         let next = Mutex::new(0usize);
@@ -472,7 +477,18 @@ impl S3Backend {
         });
         let modified: HashMap<&str, DateTime<Utc>> = listed.iter().map(|l| (l.key.as_str(), l.modified)).collect();
         for (key, r) in results.into_inner().unwrap() {
-            let Some((text, etag, lm)) = r? else {
+            let r = match r {
+                // This one object refused (e.g. encrypted with a key the
+                // user may not use): kept as it is, not taken as deleted,
+                // and the rest still syncs. (A refused access key is an
+                // error for the whole account.)
+                Err(e) if e.downcast_ref::<S3Error>().is_some_and(|s| (400..500).contains(&s.status)) => {
+                    self.cache.insert(key, (String::new(), Cached::Unreadable));
+                    continue;
+                }
+                r => r?,
+            };
+            let Some((text, etag, lm)) = r else {
                 // Gone between listing and downloading: not known to be
                 // deleted, so it's left alone this time.
                 self.cache.insert(key, (String::new(), Cached::Unreadable));
@@ -661,6 +677,38 @@ impl Backend for S3Backend {
             }
             if !r.ok() {
                 return Err(r.error());
+            }
+            changed = true;
+        }
+        // Notes name their folder by path: those under the old one move
+        // along, or a device syncing later would put them in a new folder
+        // with the old name. (Should one be changed meanwhile, the rename
+        // is tried again; doing it twice is harmless.)
+        let renamed = |p: &[String]| -> Option<Vec<String>> {
+            (p.len() >= old.len() && p.starts_with(old)).then(|| new.iter().cloned().chain(p[old.len()..].iter().cloned()).collect())
+        };
+        self.refresh("notes/")?;
+        let moves: Vec<(String, String, NoteData)> = self
+            .cache
+            .iter()
+            .filter_map(|(key, (etag, c))| match c {
+                Cached::Note(n) => renamed(&n.folder).map(|folder| (key.clone(), etag.clone(), NoteData { folder, ..n.clone() })),
+                _ => None,
+            })
+            .collect();
+        for (key, etag, n) in moves {
+            let r = self.put(&key, &format::write(&n), "text/markdown; charset=utf-8", Cond::Match(&etag))?;
+            if r.conflict() {
+                if changed {
+                    self.touch()?;
+                }
+                bail!("a note was changed on another device during the folder rename; will try again");
+            }
+            if !r.ok() {
+                return Err(r.error());
+            }
+            if let Some(e) = r.etag {
+                self.cache.insert(key, (e, Cached::Note(n)));
             }
             changed = true;
         }

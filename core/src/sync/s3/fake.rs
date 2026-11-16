@@ -31,6 +31,9 @@ pub struct State {
     pub reject_conditions: bool,
     /// Every DELETE fails (503).
     pub refuse_deletes: bool,
+    /// Keys whose objects can't be read (403), e.g. encrypted with a key
+    /// the user may not use.
+    pub forbidden: std::collections::HashSet<String>,
     /// "METHOD key" (key empty for listings).
     pub log: Vec<String>,
     /// Written right after the next listing (another device's write
@@ -46,7 +49,7 @@ pub struct FakeS3 {
 
 impl FakeS3 {
     pub fn start() -> FakeS3 {
-        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, reject_conditions: false, refuse_deletes: false, log: vec![], after_list: None, counter: 0 }));
+        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, reject_conditions: false, refuse_deletes: false, forbidden: Default::default(), log: vec![], after_list: None, counter: 0 }));
         let s = state.clone();
         let url = test_http::spawn(move |req| route(&mut s.lock().unwrap(), req));
         FakeS3 { url, state }
@@ -149,6 +152,7 @@ fn route(s: &mut State, req: &Request) -> Response {
             }
             Response { status: 200, body: xml, content_type: "application/xml", headers: vec![] }
         }
+        "GET" if s.forbidden.contains(&key) => error(403, "AccessDenied"),
         "GET" => match s.objects.get(&key) {
             Some(o) => found(o, true),
             None => error(404, "NoSuchKey"),
