@@ -1138,7 +1138,7 @@ impl Library {
         let env = lock::seal(&k, &salt, &text);
         if let Some(n) = self.store.note_mut(id) {
             n.body = lock::locked_body(&text, &env);
-            n.touch();
+            n.touch_keep_date();
         }
         self.lock.unlocked.insert(id.to_owned(), text);
         self.unsaved.insert(id.to_owned());
@@ -1165,7 +1165,7 @@ impl Library {
         let Some(text) = self.lock.unlocked.remove(id) else { return };
         if let Some(n) = self.store.note_mut(id) {
             n.body = text;
-            n.touch();
+            n.touch_keep_date();
         }
         self.unsaved.insert(id.to_owned());
     }
@@ -1224,7 +1224,7 @@ impl Library {
             let sealed = lock::seal(&k, &salt, &text);
             if let Some(n) = self.store.note_mut(&id) {
                 n.body = lock::locked_body(&text, &sealed);
-                n.touch();
+                n.touch_keep_date();
             }
             self.unsaved.insert(id);
             changed += 1;
@@ -1429,6 +1429,31 @@ mod tests {
         lib.trash_notes(&[a.clone()], &Location::All);
         lib.delete_forever(&[a]);
         assert_eq!(lib.undo_delete(), None);
+    }
+
+    #[test]
+    fn locking_a_note_keeps_its_last_modified_date() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let a = add(&mut lib, &home, "# Secret\n");
+        let b = add(&mut lib, &home, "# Other\n");
+        let when = |lib: &Library, id: &str| lib.store.note(id).unwrap().modified;
+        let (wa, wb) = (when(&lib, &a), when(&lib, &b));
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&a), LockNote::Locked);
+        assert_eq!(lib.lock_note(&b), LockNote::Locked);
+        let n = lib.store.note(&a).unwrap();
+        assert!(lock::is_locked(&n.body) && n.sync.dirty);
+        assert_eq!((when(&lib, &a), when(&lib, &b)), (wa, wb));
+        // A new password seals them again: still not a change to the text.
+        assert_eq!(lib.change_password("pw", "pw2", ""), Ok(2));
+        assert_eq!((when(&lib, &a), when(&lib, &b)), (wa, wb));
+        lib.remove_lock(&b);
+        assert!(!lock::is_locked(&lib.store.note(&b).unwrap().body));
+        assert_eq!(when(&lib, &b), wb);
+        // Editing a locked note is a change.
+        assert_eq!(lib.set_body(&a, "# Secret\n\nmore\n"), BodySet::Changed);
+        assert!(when(&lib, &a) > wa);
     }
 
     #[test]

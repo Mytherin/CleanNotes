@@ -167,6 +167,14 @@ impl Note {
         self.sync.dirty = true;
     }
 
+    /// Records a change to how the note is stored that leaves its text as
+    /// it was (locking, removing a lock, a new password): saved and synced,
+    /// but its last-modified date stays.
+    pub fn touch_keep_date(&mut self) {
+        self.version += 1;
+        self.sync.dirty = true;
+    }
+
     pub fn tags(&self) -> Vec<String> {
         let mut out = Vec::new();
         for line in self.body.lines() {
