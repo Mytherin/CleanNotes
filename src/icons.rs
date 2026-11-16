@@ -27,7 +27,12 @@ pub enum Icon {
     FolderPlus,
     /// "…": more actions.
     More,
+    /// A filled padlock: a locked note.
     Lock,
+    /// An outlined padlock: the toolbar's lock button.
+    LockOutline,
+    /// An outlined open padlock: a locked note that's unlocked.
+    LockOpen,
     /// Stacked notes: All Notes.
     Notes,
     /// A grid: insert a table.
@@ -191,6 +196,24 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             pts.extend(arc);
             pts.push(at(3.6, -1.0));
             line(p, &pts, Stroke::new(s.width * 1.3, color));
+        }
+        Icon::LockOutline | Icon::LockOpen => {
+            // Open: the body moves left and the shackle swings out to the
+            // right, its right end free (as SF Symbols' lock.open).
+            let open = icon == Icon::LockOpen;
+            let (bx, sx) = if open { (-2.0, 1.5) } else { (0.0, 0.0) };
+            let body = Rect::from_min_max(at(bx - 5.5, -1.0), at(bx + 5.5, 7.0));
+            p.rect_stroke(body, 1.8 * u, s);
+            let arc: Vec<Pos2> = (0..=16)
+                .map(|i| {
+                    let a = std::f32::consts::PI * (1.0 + i as f32 / 16.0);
+                    at(sx + 3.4 * a.cos(), -3.5 + 3.4 * a.sin())
+                })
+                .collect();
+            let mut pts = vec![at(sx - 3.4, -1.0)];
+            pts.extend(arc);
+            pts.push(at(sx + 3.4, if open { -2.0 } else { -1.0 }));
+            line(p, &pts, s);
         }
         Icon::More => {
             for x in [-5.0, 0.0, 5.0] {
