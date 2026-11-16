@@ -23,6 +23,7 @@ impl App {
             Location::Folder(f) => self.lib.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
+            Location::Smart(_) => self.lib.location_title(&self.location, ""),
         }
     }
 

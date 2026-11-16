@@ -22,7 +22,7 @@ use cleannotes_core::editing::{Command, Editing};
 use cleannotes_core::library::{self, BodySet, Library, Location};
 use cleannotes_core::model::{new_id, LOCAL};
 use cleannotes_core::sync::{s3, BackendConfig};
-use cleannotes_core::settings::{SortBy, StartWith, TEXT_SIZES};
+use cleannotes_core::settings::{self, SortBy, StartWith, TEXT_SIZES};
 use cleannotes_core::{dates, lock};
 
 uniffi::setup_scaffolding!();
@@ -66,6 +66,8 @@ pub enum Place {
     /// An account's Recently Deleted.
     Deleted { account: String },
     Tag { name: String },
+    /// A Smart Folder.
+    Smart { id: String },
 }
 
 impl From<&Place> for Location {
@@ -75,6 +77,7 @@ impl From<&Place> for Location {
             Place::Folder { id } => Location::Folder(id.clone()),
             Place::Deleted { account } => Location::Deleted(account.clone()),
             Place::Tag { name } => Location::Tag(name.clone()),
+            Place::Smart { id } => Location::Smart(id.clone()),
         }
     }
 }
@@ -86,8 +89,80 @@ impl From<Location> for Place {
             Location::Folder(id) => Place::Folder { id },
             Location::Deleted(account) => Place::Deleted { account },
             Location::Tag(name) => Place::Tag { name },
+            Location::Smart(id) => Place::Smart { id },
         }
     }
+}
+
+/// A Smart Folder's filter: every part that's set must pass.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct SmartFilter {
+    /// #tags, without the #; none: any note.
+    pub tags: Vec<String>,
+    /// Every one of the tags, rather than any.
+    pub all_tags: bool,
+    pub checklists: ChecklistFilter,
+    pub pinned: bool,
+    pub locked: bool,
+    /// Edited in the last this many days (0: any time).
+    pub edited_within_days: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum ChecklistFilter {
+    /// Checklists don't matter.
+    Off,
+    /// Notes with a checklist.
+    HasChecklist,
+    /// Notes with an unticked item.
+    Unchecked,
+    /// Notes whose items are all ticked.
+    AllChecked,
+}
+
+impl From<settings::NoteFilter> for SmartFilter {
+    fn from(f: settings::NoteFilter) -> SmartFilter {
+        SmartFilter {
+            tags: f.tags,
+            all_tags: f.all_tags,
+            checklists: match f.checklists {
+                settings::ChecklistFilter::Off => ChecklistFilter::Off,
+                settings::ChecklistFilter::Any => ChecklistFilter::HasChecklist,
+                settings::ChecklistFilter::Unchecked => ChecklistFilter::Unchecked,
+                settings::ChecklistFilter::AllChecked => ChecklistFilter::AllChecked,
+            },
+            pinned: f.pinned,
+            locked: f.locked,
+            edited_within_days: f.edited_within_days,
+        }
+    }
+}
+
+impl From<SmartFilter> for settings::NoteFilter {
+    fn from(f: SmartFilter) -> settings::NoteFilter {
+        settings::NoteFilter {
+            tags: f.tags.into_iter().map(|t| t.trim().trim_start_matches('#').to_owned()).filter(|t| !t.is_empty()).collect(),
+            all_tags: f.all_tags,
+            checklists: match f.checklists {
+                ChecklistFilter::Off => settings::ChecklistFilter::Off,
+                ChecklistFilter::HasChecklist => settings::ChecklistFilter::Any,
+                ChecklistFilter::Unchecked => settings::ChecklistFilter::Unchecked,
+                ChecklistFilter::AllChecked => settings::ChecklistFilter::AllChecked,
+            },
+            pinned: f.pinned,
+            locked: f.locked,
+            edited_within_days: f.edited_within_days,
+        }
+    }
+}
+
+/// A Smart Folder on the Folders screen.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct SmartFolderItem {
+    pub id: String,
+    pub name: String,
+    pub count: u32,
+    pub filter: SmartFilter,
 }
 
 // ---- Records for the screens --------------------------------------------------
@@ -207,6 +282,8 @@ pub struct Overview {
     pub accounts: Vec<AccountItem>,
     pub tags: Vec<String>,
     pub show_note_count: bool,
+    /// Smart Folders, with their note counts.
+    pub smart_folders: Vec<SmartFolderItem>,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
@@ -425,13 +502,38 @@ impl NotesCore {
                 }
             })
             .collect();
+        let smart_folders = lib
+            .settings
+            .smart_folders
+            .iter()
+            .map(|s| SmartFolderItem {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                count: lib.visible_notes(&Location::Smart(s.id.clone()), "").len() as u32,
+                filter: s.filter.clone().into(),
+            })
+            .collect();
         Overview {
             show_all_notes: lib.show_all_notes(),
             all_count: lib.all_count() as u32,
             accounts,
             tags: lib.all_tags(),
             show_note_count: lib.settings.show_note_count,
+            smart_folders,
         }
+    }
+
+    /// A new Smart Folder; returns its id.
+    pub fn add_smart_folder(&self, name: String, filter: SmartFilter) -> String {
+        self.lib().add_smart_folder(&name, filter.into())
+    }
+
+    pub fn update_smart_folder(&self, id: String, name: String, filter: SmartFilter) {
+        self.lib().update_smart_folder(&id, &name, filter.into());
+    }
+
+    pub fn delete_smart_folder(&self, id: String) {
+        self.lib().delete_smart_folder(&id);
     }
 
     /// Where the app was when last used, and the note open then.
@@ -1454,6 +1556,43 @@ mod tests {
         assert!(other.snippet_parts.iter().any(|p| p.matched && p.text == "milk"));
         // Not searching: no parts.
         assert!(core.sections(home, String::new()).iter().flat_map(|s| &s.notes).all(|n| n.title_parts.is_empty()));
+    }
+
+    #[test]
+    fn smart_folders_through_the_bindings() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.default_folder() };
+        let a = core.new_note(home.clone()).id;
+        core.lib().set_body(&a, "# Trip #travel\n- [ ] passport\n");
+        let b = core.new_note(home).id;
+        core.lib().set_body(&b, "# Notes\nplain\n");
+        let filter = SmartFilter {
+            tags: vec!["#travel ".into(), " ".into()],
+            all_tags: false,
+            checklists: ChecklistFilter::Off,
+            pinned: false,
+            locked: false,
+            edited_within_days: 0,
+        };
+        let id = core.add_smart_folder("Travel".into(), filter);
+        let ov = core.overview();
+        assert_eq!(ov.smart_folders.len(), 1);
+        let s = &ov.smart_folders[0];
+        assert_eq!((s.name.as_str(), s.count), ("Travel", 1));
+        assert_eq!(s.filter.tags, ["travel"], "the # and spaces are taken off");
+        let place = Place::Smart { id: id.clone() };
+        assert_eq!(core.title(place.clone(), String::new()), "Travel");
+        assert_eq!(core.sections(place.clone(), String::new())[0].notes[0].id, a);
+
+        let mut f = s.filter.clone();
+        f.tags.clear();
+        f.checklists = ChecklistFilter::Unchecked;
+        core.update_smart_folder(id.clone(), "To Do".into(), f);
+        assert_eq!(core.overview().smart_folders[0].name, "To Do");
+        assert_eq!(core.overview().smart_folders[0].count, 1);
+        core.delete_smart_folder(id);
+        assert!(core.overview().smart_folders.is_empty());
+        assert!(!core.place_exists(place));
     }
 
     #[test]

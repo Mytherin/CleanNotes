@@ -14,6 +14,8 @@ struct FoldersView: View {
     @State private var chooseAccount = false
     @State private var deleting: FolderItem?
     @State private var showSettings = false
+    @State private var smartEditor: SmartEditing?
+    @State private var deletingSmart: SmartFolderItem?
 
     var body: some View {
         let _ = store.revision
@@ -45,12 +47,15 @@ struct FoldersView: View {
                 }
             }
             ToolbarItemGroup(placement: .bottomBar) {
-                Button {
-                    if overview.accounts.count > 1 {
-                        chooseAccount = true
-                    } else {
-                        newFolder(account: overview.accounts.first?.id ?? localAccountId(), parent: nil)
-                    }
+                Menu {
+                    Button {
+                        if overview.accounts.count > 1 {
+                            chooseAccount = true
+                        } else {
+                            newFolder(account: overview.accounts.first?.id ?? localAccountId(), parent: nil)
+                        }
+                    } label: { Label("New Folder", systemImage: "folder") }
+                    Button { smartEditor = .new } label: { Label("New Smart Folder", systemImage: "gearshape") }
                 } label: {
                     Image(systemName: "folder.badge.plus")
                 }
@@ -96,6 +101,27 @@ struct FoldersView: View {
             Text("All notes and subfolders in this folder will be deleted. Notes will be kept in Recently Deleted for 30 days.")
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(item: $smartEditor) { editing in
+            SmartFolderEditor(existing: editing.folder, tags: overview.tags) { id in
+                if editing.folder == nil {
+                    path.append(.list(.smart(id: id)))
+                }
+            }
+        }
+        .confirmationDialog(
+            "Delete Smart Folder?",
+            isPresented: Binding(get: { deletingSmart != nil }, set: { if !$0 { deletingSmart = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete Smart Folder", role: .destructive) {
+                if let s = deletingSmart {
+                    store.perform { $0.deleteSmartFolder(id: s.id) }
+                }
+                deletingSmart = nil
+            }
+        } message: {
+            Text("Its notes stay where they are.")
+        }
     }
 
     @ViewBuilder
@@ -132,6 +158,23 @@ struct FoldersView: View {
                     }
                 } header: {
                     AccountHeader(account: account)
+                }
+            }
+            if !overview.smartFolders.isEmpty {
+                Section("Smart Folders") {
+                    ForEach(overview.smartFolders) { s in
+                        NavigationLink(value: Route.list(.smart(id: s.id))) {
+                            FolderRow(name: s.name, icon: "gearshape", count: overview.showNoteCount ? Int(s.count) : nil)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) { deletingSmart = s } label: { Label("Delete", systemImage: "trash") }
+                        }
+                        .contextMenu {
+                            Button { smartEditor = .edit(s) } label: { Label("Edit Smart Folder", systemImage: "slider.horizontal.3") }
+                            Divider()
+                            Button(role: .destructive) { deletingSmart = s } label: { Label("Delete", systemImage: "trash") }
+                        }
+                    }
                 }
             }
             if !overview.tags.isEmpty {
@@ -204,6 +247,141 @@ struct FoldersView: View {
             break
         }
         folderAlert = nil
+    }
+}
+
+/// Making a Smart Folder, or changing one.
+private enum SmartEditing: Identifiable {
+    case new
+    case edit(SmartFolderItem)
+
+    var id: String { folder?.id ?? "new" }
+
+    var folder: SmartFolderItem? {
+        if case let .edit(s) = self { return s }
+        return nil
+    }
+}
+
+/// A Smart Folder's name and filters, as Apple Notes' New Smart Folder
+/// sheet: tags (any or all of them), checklists, pinned, locked, and when
+/// notes were edited.
+struct SmartFolderEditor: View {
+    @EnvironmentObject private var store: NotesStore
+    @Environment(\.dismiss) private var dismiss
+    let existing: SmartFolderItem?
+    let tags: [String]
+    /// Saved (with its id).
+    let saved: (String) -> Void
+
+    @State private var name: String
+    @State private var chosenTags: Set<String>
+    @State private var allTags: Bool
+    @State private var checklists: ChecklistFilter
+    @State private var pinned: Bool
+    @State private var locked: Bool
+    @State private var days: UInt32
+
+    init(existing: SmartFolderItem?, tags: [String], saved: @escaping (String) -> Void) {
+        self.existing = existing
+        self.tags = tags
+        self.saved = saved
+        let f = existing?.filter
+        _name = State(initialValue: existing?.name ?? "")
+        _chosenTags = State(initialValue: Set(f?.tags ?? []))
+        _allTags = State(initialValue: f?.allTags ?? false)
+        _checklists = State(initialValue: f?.checklists ?? .off)
+        _pinned = State(initialValue: f?.pinned ?? false)
+        _locked = State(initialValue: f?.locked ?? false)
+        _days = State(initialValue: f?.editedWithinDays ?? 0)
+    }
+
+    var body: some View {
+        // Tags in the notes, and any chosen before that no note has now.
+        let choices = (tags + chosenTags.filter { !tags.contains($0) }.sorted())
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Name", text: $name)
+                }
+                Section {
+                    if choices.isEmpty {
+                        Text("Add #tags to notes to filter by them.").foregroundStyle(.secondary)
+                    }
+                    ForEach(choices, id: \.self) { t in
+                        Button {
+                            if chosenTags.contains(t) { chosenTags.remove(t) } else { chosenTags.insert(t) }
+                        } label: {
+                            HStack {
+                                Text("#\(t)").foregroundStyle(.primary)
+                                Spacer()
+                                if chosenTags.contains(t) {
+                                    Image(systemName: "checkmark").foregroundStyle(Color.notesAccent)
+                                }
+                            }
+                        }
+                    }
+                    if chosenTags.count > 1 {
+                        Picker("Include Notes With", selection: $allTags) {
+                            Text("Any Selected Tags").tag(false)
+                            Text("All Selected Tags").tag(true)
+                        }
+                    }
+                } header: {
+                    Text("Tags")
+                }
+                Section {
+                    Picker("Checklists", selection: $checklists) {
+                        Text("Off").tag(ChecklistFilter.off)
+                        Text("Any Checklist").tag(ChecklistFilter.hasChecklist)
+                        Text("Unchecked Items").tag(ChecklistFilter.unchecked)
+                        Text("All Items Checked").tag(ChecklistFilter.allChecked)
+                    }
+                    Toggle("Pinned Notes", isOn: $pinned)
+                    Toggle("Locked Notes", isOn: $locked)
+                    Picker("Edited", selection: $days) {
+                        Text("Any Time").tag(UInt32(0))
+                        Text("Today").tag(UInt32(1))
+                        Text("In the Last 7 Days").tag(UInt32(7))
+                        Text("In the Last 30 Days").tag(UInt32(30))
+                    }
+                } header: {
+                    Text("Filters")
+                } footer: {
+                    Text("Notes from every folder that pass every filter that's on.")
+                }
+            }
+            .navigationTitle(existing == nil ? "New Smart Folder" : "Edit Smart Folder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { save() }
+                        .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                }
+            }
+        }
+    }
+
+    private func save() {
+        let filter = SmartFilter(
+            tags: chosenTags.sorted(),
+            allTags: allTags,
+            checklists: checklists,
+            pinned: pinned,
+            locked: locked,
+            editedWithinDays: days
+        )
+        let id: String
+        if let existing {
+            store.core.updateSmartFolder(id: existing.id, name: name, filter: filter)
+            id = existing.id
+        } else {
+            id = store.core.addSmartFolder(name: name, filter: filter)
+        }
+        store.changed()
+        dismiss()
+        saved(id)
     }
 }
 

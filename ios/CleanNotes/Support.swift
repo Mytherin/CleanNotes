@@ -6,6 +6,7 @@ import UIKit
 extension NoteItem: Identifiable {}
 extension FolderItem: Identifiable {}
 extension AccountItem: Identifiable {}
+extension SmartFolderItem: Identifiable {}
 
 /// Where the navigation stack can go.
 enum Route: Hashable {

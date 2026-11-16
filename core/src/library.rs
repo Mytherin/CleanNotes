@@ -19,7 +19,13 @@ use crate::db::{Db, Secrets};
 use crate::lock::{self, Keys};
 use crate::markdown;
 use crate::model::{self, Account, Folder, Note, Store, Tombstone, LOCAL};
-use crate::settings::{Settings, SortBy};
+use crate::settings::{NoteFilter, Settings, SmartFolder, SortBy};
+
+/// A Smart Folder's name, trimmed ("Smart Folder" if empty).
+fn smart_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() { "Smart Folder".to_owned() } else { name.to_owned() }
+}
 use crate::sync::engine::{self, AccountSnapshot};
 use crate::sync::worker::{Reply, Synced, Worker};
 
@@ -45,6 +51,8 @@ pub enum Location {
     /// An account's Recently Deleted.
     Deleted(String),
     Tag(String),
+    /// A Smart Folder (its id in the settings).
+    Smart(String),
 }
 
 /// A note as the notes list shows it.
@@ -305,7 +313,42 @@ impl Library {
             Location::Folder(f) => self.store.folder(f).is_some_and(|f| self.account_enabled(&f.account)),
             Location::Deleted(a) => self.account_enabled(a),
             Location::Tag(_) => true,
+            Location::Smart(s) => self.smart_folder(s).is_some(),
         }
+    }
+
+    // ---- Smart Folders --------------------------------------------------------
+
+    pub fn smart_folder(&self, id: &str) -> Option<&SmartFolder> {
+        self.settings.smart_folders.iter().find(|s| s.id == id)
+    }
+
+    /// Whether a note is in a Smart Folder (`now` for the date filter).
+    fn in_smart_folder(&self, s: &SmartFolder, n: &Note, now: DateTime<Utc>) -> bool {
+        let locked = lock::is_locked(&n.body);
+        let days = (now - n.modified).num_days();
+        s.filter.matches(&n.body, n.pinned, locked, days)
+    }
+
+    /// A new Smart Folder; returns its id.
+    pub fn add_smart_folder(&mut self, name: &str, filter: NoteFilter) -> String {
+        let id = model::new_id();
+        self.settings.smart_folders.push(SmartFolder { id: id.clone(), name: smart_name(name), filter });
+        self.save(true);
+        id
+    }
+
+    pub fn update_smart_folder(&mut self, id: &str, name: &str, filter: NoteFilter) {
+        if let Some(s) = self.settings.smart_folders.iter_mut().find(|s| s.id == id) {
+            s.name = smart_name(name);
+            s.filter = filter;
+            self.save(true);
+        }
+    }
+
+    pub fn delete_smart_folder(&mut self, id: &str) {
+        self.settings.smart_folders.retain(|s| s.id != id);
+        self.save(true);
     }
 
     /// The list's title: the folder's name, "All Notes", "Recently Deleted",
@@ -319,6 +362,7 @@ impl Library {
             Location::Folder(f) => self.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
+            Location::Smart(s) => self.smart_folder(s).map(|s| s.name.clone()).unwrap_or_default(),
         }
     }
 
@@ -334,6 +378,11 @@ impl Library {
     pub fn list_sections(&self, loc: &Location, search: &str) -> Vec<(String, Vec<String>)> {
         let words: Vec<String> = search.split_whitespace().map(|w| w.to_lowercase()).collect();
         let searching = !words.is_empty();
+        let smart = match loc {
+            Location::Smart(s) => self.smart_folder(s),
+            _ => None,
+        };
+        let now = Utc::now();
         let mut notes: Vec<&Note> = self
             .store
             .notes
@@ -350,6 +399,7 @@ impl Library {
                         Location::Folder(f) => n.deleted.is_none() && &n.folder == f,
                         Location::Deleted(a) => n.deleted.is_some() && &n.account == a,
                         Location::Tag(t) => n.deleted.is_none() && n.tags().contains(t),
+                        Location::Smart(_) => n.deleted.is_none() && smart.is_some_and(|f| self.in_smart_folder(f, n, now)),
                     }
                 }
             })
@@ -461,7 +511,7 @@ impl Library {
     /// Whether a list at `loc` shows each note's folder (All Notes, tags and
     /// search results mix folders).
     pub fn list_shows_folders(&self, loc: &Location, search: &str) -> bool {
-        !search.trim().is_empty() || matches!(loc, Location::All | Location::Tag(_))
+        !search.trim().is_empty() || matches!(loc, Location::All | Location::Tag(_) | Location::Smart(_))
     }
 
     /// Notes (not deleted) in a folder.
@@ -519,10 +569,22 @@ impl Library {
         let (account, folder) = self.new_note_target(loc);
         let body = match loc {
             Location::Tag(t) => format!("\n#{t}\n"),
+            // A Smart Folder's tags, so the note is in it.
+            Location::Smart(s) => match self.smart_folder(s).map(|s| &s.filter.tags) {
+                Some(tags) if !tags.is_empty() => {
+                    format!("\n{}\n", tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "))
+                }
+                _ => String::new(),
+            },
             _ => String::new(),
         };
-        // The tag stays shown, and All Notes shows it too.
-        let stays = matches!(loc, Location::Tag(_) | Location::All) || matches!(loc, Location::Folder(f) if *f == folder);
+        // The tag stays shown, and All Notes shows it too; a Smart Folder
+        // if the new note is in it.
+        let in_smart = match loc {
+            Location::Smart(s) => self.smart_folder(s).is_some_and(|s| s.filter.matches(&body, false, false, 0)),
+            _ => false,
+        };
+        let stays = in_smart || matches!(loc, Location::Tag(_) | Location::All) || matches!(loc, Location::Folder(f) if *f == folder);
         let shown = if stays { loc.clone() } else { Location::Folder(folder.clone()) };
         let n = Note::new(&account, &folder, &body);
         let id = n.id.clone();
@@ -1492,6 +1554,44 @@ mod tests {
         lib.settings.last_folder = Some(home.clone());
         lib.settings.last_note = Some(there);
         assert_eq!(lib.initial_location(), (Location::Folder(home), Some(here)));
+    }
+
+    #[test]
+    fn smart_folders_gather_notes_from_every_folder() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let other = lib.new_folder(LOCAL, None, Some("Other"));
+        let shop = add(&mut lib, &home, "# Shop #errands\n- [ ] milk\n");
+        let done = add(&mut lib, &other, "# Done #errands\n- [x] post\n");
+        add(&mut lib, &other, "# Plain\nno tags\n");
+        let filter = NoteFilter { tags: vec!["errands".into()], ..Default::default() };
+        let id = lib.add_smart_folder("  ", filter.clone());
+        let smart = Location::Smart(id.clone());
+        assert!(lib.location_exists(&smart));
+        assert_eq!(lib.location_title(&smart, ""), "Smart Folder");
+        let mut found = lib.visible_notes(&smart, "");
+        found.sort();
+        let mut want = vec![shop.clone(), done.clone()];
+        want.sort();
+        assert_eq!(found, want);
+        assert!(lib.list_shows_folders(&smart, ""));
+
+        lib.update_smart_folder(&id, "To Do", NoteFilter { checklists: crate::settings::ChecklistFilter::Unchecked, ..filter });
+        assert_eq!(lib.location_title(&smart, ""), "To Do");
+        assert_eq!(lib.visible_notes(&smart, ""), [shop.clone()]);
+
+        // A new note made there carries its tags, and stays in it if it can.
+        lib.update_smart_folder(&id, "Errands", NoteFilter { tags: vec!["errands".into()], ..Default::default() });
+        let (n, body, shown) = lib.new_note(&smart);
+        assert_eq!(body, "\n#errands\n");
+        assert_eq!(shown, smart);
+        assert!(lib.visible_notes(&smart, "").contains(&n));
+        let pinned_only = lib.add_smart_folder("Pinned", NoteFilter { pinned: true, ..Default::default() });
+        let (_, _, shown) = lib.new_note(&Location::Smart(pinned_only));
+        assert!(matches!(shown, Location::Folder(_)), "a new note isn't pinned: shown in its folder");
+
+        lib.delete_smart_folder(&id);
+        assert!(!lib.location_exists(&smart));
     }
 
     #[test]
