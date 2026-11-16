@@ -33,6 +33,14 @@ Set `CLEANNOTES_DATA=<dir>` to keep the data in a folder of your choice, `CLEANN
 
 On Windows, `build.rs` embeds `assets/CleanNotes.ico` and version information in the executable. The icon is drawn in code (`src/app_icon.rs`); `cargo test app_icon::tests::write_exe_icon -- --ignored` regenerates the file.
 
+## Downloads
+
+The [Build workflow](.github/workflows/build.yml) builds every push to `main` on GitHub Actions; the builds are the run's artifacts (Actions → the run → Artifacts). Pushing a tag like `v0.2.0` also attaches them to a GitHub release.
+
+- **Windows:** `CleanNotes.exe`, nothing to install.
+- **macOS:** `CleanNotes.dmg` with the app for Apple silicon and Intel Macs (`macos/make-app.sh` makes it on a Mac). It isn't signed with an Apple Developer ID, so the first time, open it with right-click → Open.
+- **iPhone:** `CleanNotes-unsigned.ipa`. iPhones only run signed apps: install it with a tool that signs it with your Apple ID, such as [Sideloadly](https://sideloadly.io) or [AltStore](https://altstore.io) (with a free Apple ID, it has to be signed again every 7 days). `CleanNotes-Simulator.zip` runs in Xcode's iOS Simulator. TestFlight or App Store builds would need a paid Apple Developer account's certificate in the workflow's secrets.
+
 ## iPhone app
 
 `ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps read and write the same notes, and sync with each other through an S3 account.

@@ -1,0 +1,125 @@
+# Builds CleanNotes for Windows, macOS and the iPhone, with downloads:
+#
+# - Every run: the builds are artifacts of the run (Actions → the run →
+#   Artifacts).
+# - A tag like v0.2.0: they're also attached to a GitHub release.
+#
+# Nothing is signed with an Apple certificate: the Mac app is signed ad hoc
+# (open it with right-click → Open the first time), and the iPhone app is an
+# unsigned .ipa to install with a tool that signs it with your Apple ID
+# (Sideloadly, AltStore), plus a build for the iOS Simulator.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build --release --bin CleanNotes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanNotes-Windows
+          path: target/release/CleanNotes.exe
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CleanNotes.app
+        run: macos/make-app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanNotes-macOS
+          path: dist/CleanNotes.dmg
+          if-no-files-found: error
+
+  iphone:
+    name: iPhone
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      # The Swift bindings must exist before the project is made.
+      - name: Build the Rust core
+        run: ios/build-rust.sh
+      - name: Make the Xcode project
+        working-directory: ios
+        run: xcodegen
+      - name: Build for iPhone (unsigned)
+        working-directory: ios
+        run: |
+          xcodebuild -project CleanNotes.xcodeproj -target CleanNotes -configuration Release \
+            -sdk iphoneos SYMROOT="$PWD/xcbuild" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+          mkdir -p ../dist/Payload
+          cp -R xcbuild/Release-iphoneos/CleanNotes.app ../dist/Payload/
+          (cd ../dist && zip -qr CleanNotes-unsigned.ipa Payload && rm -rf Payload)
+      - name: Build for the iOS Simulator
+        working-directory: ios
+        run: |
+          xcodebuild -project CleanNotes.xcodeproj -target CleanNotes -configuration Release \
+            -sdk iphonesimulator SYMROOT="$PWD/xcbuild" \
+            CODE_SIGNING_ALLOWED=NO build
+          (cd xcbuild/Release-iphonesimulator && zip -qr ../../../dist/CleanNotes-Simulator.zip CleanNotes.app)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CleanNotes-iPhone
+          path: |
+            dist/CleanNotes-unsigned.ipa
+            dist/CleanNotes-Simulator.zip
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos, iphone]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Name the files after the release
+        run: |
+          mkdir out
+          cp dist/CleanNotes-Windows/CleanNotes.exe "out/CleanNotes-${GITHUB_REF_NAME}-Windows.exe"
+          cp dist/CleanNotes-macOS/CleanNotes.dmg "out/CleanNotes-${GITHUB_REF_NAME}-macOS.dmg"
+          cp dist/CleanNotes-iPhone/CleanNotes-unsigned.ipa "out/CleanNotes-${GITHUB_REF_NAME}-iPhone-unsigned.ipa"
+          cp dist/CleanNotes-iPhone/CleanNotes-Simulator.zip "out/CleanNotes-${GITHUB_REF_NAME}-iOS-Simulator.zip"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
