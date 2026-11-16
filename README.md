@@ -57,6 +57,8 @@ open CleanNotes.xcodeproj  # choose your team under Signing, then Run
 
 Run `build-rust.sh` once before `xcodegen`, since the project includes the generated `Generated/cleannotes_ffi.swift`. After that, Xcode runs the script before every build: a debug Rust build for Debug and a release build for Release. Set `CLEANNOTES_SEED=1` in the scheme's environment to start with example notes.
 
+**Tests:** ⌘U in Xcode, or `xcodebuild test -project CleanNotes.xcodeproj -scheme CleanNotes -destination 'platform=iOS Simulator,name=iPhone 16'`. `ios/CleanNotesTests` drives the real text view and the Rust engine together, typing as the keyboard does (lists started and ended, Backspace, emoji, undo, checklist commands, list markers, sharing), and checks after each edit that the two agree. The Build workflow runs them on every push and pull request. The engine's side of the same cases is in `cargo test` (`ffi/src/lib.rs`).
+
 ### What it does, as in Apple Notes
 
 - **Folders:** each account's folders with note counts (nested, collapsible accounts), Recently Deleted, tags, and All Notes once there are several folders. New Folder and the compose button are in the bottom toolbar. Swipe a folder to delete it, or touch and hold to rename it or add a subfolder. Search there looks through every note.

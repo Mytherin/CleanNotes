@@ -481,32 +481,11 @@ struct NoteEditorView: UIViewRepresentable {
     func makeUIView(context: Context) -> NoteTextView {
         let tv = NoteTextView()
         let c = context.coordinator
-        c.textView = tv
         c.readOnly = readOnly
         c.onBlockedEdit = onBlockedEdit
         c.onLink = onLink
-        tv.coordinator = c
-        tv.engineUndo.coordinator = c
-        tv.delegate = c
-        tv.backgroundColor = .systemBackground
-        tv.alwaysBounceVertical = true
-        tv.keyboardDismissMode = .interactive
-        tv.textContainerInset = UIEdgeInsets(top: 34, left: 16, bottom: 120, right: 16)
-        tv.textContainer.lineFragmentPadding = 0
-        tv.isFindInteractionEnabled = true
-        tv.isEditable = !readOnly
-        tv.dataDetectorTypes = []
-        tv.linkTextAttributes = [.foregroundColor: UIColor.notesAccent, .underlineStyle: NSUnderlineStyle.single.rawValue]
-        tv.autocapitalizationType = .sentences
-        tv.smartDashesType = .no
-        tv.smartQuotesType = .yes
+        c.attach(tv)
         tv.dateLabel.text = date
-        tv.inputAccessoryView = c.makeAccessoryBar()
-        let tap = UITapGestureRecognizer(target: c, action: #selector(Coordinator.tapped(_:)))
-        tap.delegate = c
-        tv.addGestureRecognizer(tap)
-        bridge.coordinator = c
-        c.render()
         if startEditing && !readOnly {
             DispatchQueue.main.async { tv.becomeFirstResponder() }
         }
@@ -551,6 +530,33 @@ struct NoteEditorView: UIViewRepresentable {
             let s = store.core.settings()
             textSize = s.textSize
             sortChecked = s.sortChecked
+        }
+
+        /// Sets up the text view to show and edit the note (the app's, or a
+        /// test's).
+        func attach(_ tv: NoteTextView) {
+            textView = tv
+            tv.coordinator = self
+            tv.engineUndo.coordinator = self
+            tv.delegate = self
+            tv.backgroundColor = .systemBackground
+            tv.alwaysBounceVertical = true
+            tv.keyboardDismissMode = .interactive
+            tv.textContainerInset = UIEdgeInsets(top: 34, left: 16, bottom: 120, right: 16)
+            tv.textContainer.lineFragmentPadding = 0
+            tv.isFindInteractionEnabled = true
+            tv.isEditable = !readOnly
+            tv.dataDetectorTypes = []
+            tv.linkTextAttributes = [.foregroundColor: UIColor.notesAccent, .underlineStyle: NSUnderlineStyle.single.rawValue]
+            tv.autocapitalizationType = .sentences
+            tv.smartDashesType = .no
+            tv.smartQuotesType = .yes
+            tv.inputAccessoryView = makeAccessoryBar()
+            let tap = UITapGestureRecognizer(target: self, action: #selector(tapped(_:)))
+            tap.delegate = self
+            tv.addGestureRecognizer(tap)
+            bridge.coordinator = self
+            render()
         }
 
         // ---- Showing the note ----

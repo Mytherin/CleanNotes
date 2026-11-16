@@ -1294,6 +1294,61 @@ mod tests {
         assert_eq!(core.shared_text(n.id.clone()), None, "a closed locked note isn't shared");
     }
 
+    /// Types as the iPhone's text view does: each character goes to
+    /// `replace` at the caret; plain typing is then applied by the text view,
+    /// which reports the caret after it.
+    fn type_like_the_text_view(e: &NoteEditor, text: &str) {
+        for ch in text.chars() {
+            let at = e.state().selection_start;
+            let s = ch.to_string();
+            if e.replace(at, at, s.clone()) {
+                let after = at + s.encode_utf16().count() as u32;
+                e.select(after, after);
+            }
+        }
+    }
+
+    /// What the Swift tests (ios/CleanNotesTests) expect of the engine.
+    #[test]
+    fn typing_as_the_text_view_does_makes_lists_as_the_swift_tests_expect() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.default_folder() };
+        let styles = |e: &NoteEditor| e.state().paragraphs.into_iter().map(|p| p.style).collect::<Vec<_>>();
+
+        let e = core.new_note_editor(core.new_note(home.clone()).id);
+        type_like_the_text_view(&e, "List\n- eggs\nmilk");
+        assert_eq!(styles(&e), [ParagraphStyle::Title, ParagraphStyle::Dashed, ParagraphStyle::Dashed]);
+        assert_eq!(e.plain_text(), "List\neggs\nmilk");
+        type_like_the_text_view(&e, "\n\n");
+        assert_eq!(styles(&e).len(), 4);
+        assert_eq!(styles(&e)[3], ParagraphStyle::Body);
+
+        let e = core.new_note_editor(core.new_note(home.clone()).id);
+        type_like_the_text_view(&e, "N\n1. one\ntwo\n\n* dot");
+        let markers: Vec<String> = e.state().paragraphs.into_iter().map(|p| p.marker).collect();
+        assert_eq!(markers, ["", "1.", "2.", "•"]);
+
+        let e = core.new_note_editor(core.new_note(home.clone()).id);
+        type_like_the_text_view(&e, "List\n[] eggs");
+        assert_eq!(e.shared_text(), "List\n☐ eggs");
+
+        let e = core.new_note_editor(core.new_note(home.clone()).id);
+        type_like_the_text_view(&e, "Trip\npassport\ntickets");
+        e.select(5, 21);
+        e.command(EditorCommand::ToggleChecklist);
+        e.command(EditorCommand::CheckAll);
+        assert!(e.state().paragraphs[1..].iter().all(|p| p.checked));
+        e.command(EditorCommand::DeleteChecked);
+        assert_eq!(e.plain_text(), "Trip");
+
+        let e = core.new_note_editor(core.new_note(home).id);
+        type_like_the_text_view(&e, "T\n- a");
+        e.select(2, 2);
+        assert!(!e.replace(1, 2, String::new()), "Backspace at a list item's start isn't plain typing");
+        assert_eq!(styles(&e)[1], ParagraphStyle::Body);
+        assert_eq!(e.plain_text(), "T\na");
+    }
+
     #[test]
     fn the_core_decides_markers_empty_notes_and_the_default_folder() {
         let e = editor("- [ ] a\n- [x] b\n1. one\n2. two\n* dot\nplain\n");
