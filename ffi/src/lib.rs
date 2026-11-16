@@ -844,7 +844,21 @@ pub struct Paragraph {
     /// The list marker as text ("•", "–", "3.", "☐", "☑"; empty if not a
     /// list item), for drawing it and for printing.
     pub marker: String,
+    /// A table cell (its style is Body): where it is in its table.
+    pub cell: Option<TableCell>,
     pub runs: Vec<TextRun>,
+}
+
+/// Where a table cell is. A table's cells are paragraphs in a row, row by
+/// row; Return in a cell is a line break in it.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TableCell {
+    pub row: u32,
+    pub column: u32,
+    pub rows: u32,
+    pub columns: u32,
+    /// In the table's header row or header column.
+    pub header: bool,
 }
 
 /// The whole note to show: its paragraphs (joined by line breaks, they're
@@ -864,6 +878,11 @@ pub struct Formatting {
     /// A list item (bulleted, dashed, numbered or checklist): it can move
     /// up and down.
     pub is_list: bool,
+    /// The caret is in a table cell (the Table menu's row and column
+    /// commands), and whether that table has a header row and column.
+    pub in_table: bool,
+    pub header_row: bool,
+    pub header_column: bool,
     pub checked: bool,
     pub indent: u32,
     pub number: u32,
@@ -909,6 +928,22 @@ pub enum EditorCommand {
     /// Puts a picture (saved with [`NotesCore::add_image`]) at the caret,
     /// on a line of its own.
     InsertImage { name: String },
+    /// A 3×3 table at the caret (not inside a table).
+    InsertTable,
+    /// The table at the caret: rows, columns, headers, or all of it.
+    AddRowAbove,
+    AddRowBelow,
+    AddColumnBefore,
+    AddColumnAfter,
+    DeleteRow,
+    DeleteColumn,
+    DeleteTable,
+    ToggleHeaderRow,
+    ToggleHeaderColumn,
+    /// Tab and Shift+Tab in a table: the next or previous cell (Tab in the
+    /// last cell adds a row).
+    NextCell,
+    PreviousCell,
 }
 
 #[derive(uniffi::Object)]
@@ -944,7 +979,7 @@ impl NoteEditor {
     pub fn state(&self) -> EditorState {
         let e = self.ed();
         let numbers = e.doc.list_numbers();
-        let paragraphs = e.doc.blocks.iter().enumerate().map(|(i, b)| paragraph(b, numbers[i])).collect();
+        let paragraphs = e.doc.blocks.iter().enumerate().map(|(i, b)| paragraph(b, numbers[i], table_cell(&e.doc, i))).collect();
         let (a, b) = (to_utf16(&e.doc, e.sel.start()), to_utf16(&e.doc, e.sel.end()));
         EditorState { paragraphs, selection_start: a, selection_end: b }
     }
@@ -954,7 +989,7 @@ impl NoteEditor {
         let e = self.ed();
         let i = index as usize;
         let b = e.doc.blocks.get(i)?;
-        Some(paragraph(b, e.doc.list_numbers()[i]))
+        Some(paragraph(b, e.doc.list_numbers()[i], table_cell(&e.doc, i)))
     }
 
     /// The paragraph the UTF-16 offset is in.
@@ -1035,6 +1070,24 @@ impl NoteEditor {
             EditorCommand::Redo => Command::Redo,
             EditorCommand::SelectAll => Command::SelectAll,
             EditorCommand::InsertImage { name } => Command::InsertImage(name),
+            EditorCommand::InsertTable => Command::InsertTable,
+            EditorCommand::AddRowAbove => Command::AddRowAbove,
+            EditorCommand::AddRowBelow => Command::AddRowBelow,
+            EditorCommand::AddColumnBefore => Command::AddColumnBefore,
+            EditorCommand::AddColumnAfter => Command::AddColumnAfter,
+            EditorCommand::DeleteRow => Command::DeleteRow,
+            EditorCommand::DeleteColumn => Command::DeleteColumn,
+            EditorCommand::DeleteTable => Command::DeleteTable,
+            EditorCommand::ToggleHeaderRow => Command::ToggleHeaderRow,
+            EditorCommand::ToggleHeaderColumn => Command::ToggleHeaderColumn,
+            EditorCommand::NextCell => {
+                self.ed().tab_in_table(false);
+                return;
+            }
+            EditorCommand::PreviousCell => {
+                self.ed().tab_in_table(true);
+                return;
+            }
         };
         self.ed().command(c);
     }
@@ -1054,6 +1107,9 @@ impl NoteEditor {
         Formatting {
             style: ParagraphStyle::of(b.kind),
             is_list: b.kind.is_list(),
+            in_table: b.kind.is_cell(),
+            header_row: matches!(b.kind, Kind::Cell { header_row: true, .. }),
+            header_column: matches!(b.kind, Kind::Cell { header_col: true, .. }),
             checked: b.kind == Kind::Checklist(true),
             indent: b.indent as u32,
             number: e.doc.list_numbers()[e.sel.caret.block.min(e.doc.blocks.len() - 1)],
@@ -1112,7 +1168,22 @@ fn shape(d: &Doc) -> Vec<(Kind, u8)> {
     d.blocks.iter().map(|b| (b.kind, b.indent)).collect()
 }
 
-fn paragraph(b: &doc::Block, number: u32) -> Paragraph {
+/// Where a block is in its table, if it's a table cell.
+fn table_cell(d: &Doc, block: usize) -> Option<TableCell> {
+    let Kind::Cell { header_row, header_col, .. } = d.blocks.get(block)?.kind else { return None };
+    let (range, columns) = d.table_of(block)?;
+    let (row, column) = d.cell_at(block)?;
+    let rows = range.len().div_ceil(columns);
+    Some(TableCell {
+        row: row as u32,
+        column: column as u32,
+        rows: rows as u32,
+        columns: columns as u32,
+        header: (header_row && row == 0) || (header_col && column == 0),
+    })
+}
+
+fn paragraph(b: &doc::Block, number: u32, cell: Option<TableCell>) -> Paragraph {
     let mono = b.kind == Kind::Monospaced;
     let chars: Vec<char> = b.text.chars().collect();
     // Plain URLs and #tags are shown as links and tags (not in code).
@@ -1158,6 +1229,7 @@ fn paragraph(b: &doc::Block, number: u32) -> Paragraph {
         checked: b.kind == Kind::Checklist(true),
         number,
         marker: b.kind.list_marker(number),
+        cell,
         runs,
     }
 }
@@ -1332,6 +1404,46 @@ mod tests {
                 e.select(after, after);
             }
         }
+    }
+
+    #[test]
+    fn tables_through_the_bindings() {
+        let (core, _dir) = core();
+        let e = core.new_note_editor(core.new_note(Place::Folder { id: core.default_folder() }).id);
+        type_like_the_text_view(&e, "Plan\n");
+        assert!(!e.formatting().in_table);
+        e.command(EditorCommand::InsertTable);
+        let f = e.formatting();
+        assert!(f.in_table && !f.header_row && !f.header_column);
+        let cells: Vec<TableCell> = e.state().paragraphs.into_iter().filter_map(|p| p.cell).collect();
+        assert_eq!(cells.len(), 9);
+        assert_eq!((cells[4].row, cells[4].column, cells[4].rows, cells[4].columns), (1, 1, 3, 3));
+
+        // Typing in a cell, Tab to the next, Return a line break in it.
+        type_like_the_text_view(&e, "Day");
+        e.command(EditorCommand::NextCell);
+        type_like_the_text_view(&e, "What\nWhere");
+        let s = e.state();
+        let first = s.paragraphs.iter().position(|p| p.cell.is_some()).unwrap();
+        assert_eq!(s.paragraphs[first].runs[0].text, "Day");
+        assert_eq!(s.paragraphs[first + 1].runs.iter().map(|r| r.text.as_str()).collect::<String>(), "What\nWhere");
+        assert_eq!(s.paragraphs.iter().filter(|p| p.cell.is_some()).count(), 9, "Return didn't add a cell");
+        e.command(EditorCommand::PreviousCell);
+        assert_eq!(e.paragraph_at(e.state().selection_start), first as u32);
+
+        e.command(EditorCommand::ToggleHeaderRow);
+        assert!(e.formatting().header_row);
+        let headers: Vec<bool> = e.state().paragraphs.into_iter().filter_map(|p| p.cell.map(|c| c.header)).collect();
+        assert_eq!(headers, [true, true, true, false, false, false, false, false, false]);
+
+        e.command(EditorCommand::AddColumnAfter);
+        assert_eq!(e.state().paragraphs.iter().find_map(|p| p.cell.clone()).unwrap().columns, 4);
+        e.command(EditorCommand::DeleteRow);
+        assert_eq!(e.state().paragraphs.iter().find_map(|p| p.cell.clone()).unwrap().rows, 2);
+        assert_eq!(e.shared_text().lines().nth(1), Some("\t\t\t"), "the header row with Day went: four empty cells");
+        e.command(EditorCommand::DeleteTable);
+        assert!(e.state().paragraphs.iter().all(|p| p.cell.is_none()));
+        assert!(!e.formatting().in_table);
     }
 
     /// What the Swift tests (ios/CleanNotesTests) expect of the engine.

@@ -161,6 +161,38 @@ final class NoteEditorTests: XCTestCase {
         assertInStep(tv, c)
     }
 
+    // ---- Tables ----
+
+    func testTablesAreInsertedTypedInAndDrawnAsCells() {
+        let (tv, c) = newNote()
+        type("Plan\n", into: tv)
+        c.command(.insertTable)
+        XCTAssertEqual(c.formatting?.inTable, true)
+        type("Day", into: tv)
+        c.command(.nextCell)
+        type("What\nWhere", into: tv)
+        let cells = paragraphs(c).compactMap(\.cell)
+        XCTAssertEqual(cells.count, 9, "Return in a cell is a line break in it")
+        assertInStep(tv, c)
+
+        c.command(.toggleHeaderRow)
+        XCTAssertEqual(c.formatting?.headerRow, true)
+        // The first cell's text carries its place in the table, for drawing.
+        let start = (tv.text as NSString).range(of: "Day").location
+        let mark = tv.storage.attribute(.cnParagraph, at: start, effectiveRange: nil) as? ParagraphMark
+        XCTAssertEqual(mark?.cell?.row, 0)
+        XCTAssertEqual(mark?.cell?.columns, 3)
+        XCTAssertEqual(mark?.cell?.header, true)
+        let font = tv.storage.attribute(.font, at: start, effectiveRange: nil) as? UIFont
+        XCTAssertTrue(font?.fontDescriptor.symbolicTraits.contains(.traitBold) ?? false, "header cells are bold")
+
+        let items = TableActions.items(c.formatting) { _ in }
+        XCTAssertEqual(items.count, 4, "cells, rows and columns, headers, deleting")
+        c.command(.deleteTable)
+        XCTAssertTrue(paragraphs(c).allSatisfy { $0.cell == nil })
+        assertInStep(tv, c)
+    }
+
     // ---- Sharing ----
 
     func testSharingGivesTextAndRichText() throws {

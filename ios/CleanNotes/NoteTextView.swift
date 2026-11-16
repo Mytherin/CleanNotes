@@ -27,12 +27,15 @@ final class ParagraphMark: NSObject {
     let checked: Bool
     /// The core's marker ("•", "–", "3.", "☐"); empty if not a list item.
     let marker: String
+    /// A table cell: where it is in its table.
+    let cell: TableCell?
 
     init(_ p: Paragraph) {
         style = p.style
         indent = Int(p.indent)
         checked = p.checked
         marker = p.marker
+        cell = p.cell
     }
 
     var isList: Bool { !marker.isEmpty }
@@ -169,9 +172,22 @@ enum NoteTextRenderer {
         return a
     }
 
+    /// Space between a table cell's box and its text.
+    static let cellPadding: CGFloat = 12
+
     static func paragraphStyle(_ p: Paragraph, textSize: Float) -> NSParagraphStyle {
         let body = bodySize(textSize)
         let s = NSMutableParagraphStyle()
+        if p.cell != nil {
+            // A table cell: its text inset in the box drawn around it.
+            s.firstLineHeadIndent = cellPadding
+            s.headIndent = cellPadding
+            s.tailIndent = -cellPadding
+            s.paragraphSpacingBefore = body * 0.4
+            s.paragraphSpacing = body * 0.4
+            s.lineSpacing = body * 0.08
+            return s
+        }
         var indent = CGFloat(p.indent) * indentStep(body)
         let mark = ParagraphMark(p)
         if mark.isList {
@@ -222,6 +238,11 @@ enum NoteTextRenderer {
             .paragraphStyle: para ?? paragraphStyle(p, textSize: textSize),
             .cnParagraph: mark ?? ParagraphMark(p),
         ]
+        // A table's header cells are bold.
+        if p.cell?.header == true, let f = a[.font] as? UIFont,
+           let d = f.fontDescriptor.withSymbolicTraits(f.fontDescriptor.symbolicTraits.union(.traitBold)) {
+            a[.font] = UIFont(descriptor: d, size: f.pointSize)
+        }
         guard let run else { return a }
         if run.underline { a[.underlineStyle] = NSUnderlineStyle.single.rawValue }
         if run.strike { a[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
@@ -297,6 +318,10 @@ final class NotesLayoutManager: NSLayoutManager {
                 guard let mark = value as? ParagraphMark else { return }
                 let rects = lineRects(for: r, origin: origin)
                 guard let first = rects.first else { return }
+                if let cell = mark.cell {
+                    drawCell(cell, rects: rects, origin: origin)
+                    return
+                }
                 switch mark.style {
                 case .quote:
                     let x = origin.x + CGFloat(mark.indent) * NoteTextRenderer.indentStep(body) + 2
@@ -325,6 +350,36 @@ final class NotesLayoutManager: NSLayoutManager {
             let r = extraLineFragmentRect.offsetBy(dx: origin.x, dy: origin.y)
             let font = NoteTextRenderer.font(mark.style, run: nil, textSize: textSize)
             drawMarker(mark, lineTop: r.minY, baseline: r.minY + font.ascender + NoteTextRenderer.paragraphStyleSpacing(mark, body: body), origin: origin, body: body)
+        }
+    }
+
+    /// A table cell's box. The phone is too narrow for the table's columns
+    /// side by side: each row is a box with its cells one under another,
+    /// a faint line between them and a solid one between rows; header
+    /// cells are shaded.
+    private func drawCell(_ cell: TableCell, rects: [CGRect], origin: CGPoint) {
+        guard let first = rects.first else { return }
+        let width = textContainers.first?.size.width ?? first.width
+        let bottom = rects.last?.maxY ?? first.maxY
+        let box = CGRect(x: origin.x, y: first.minY, width: width, height: bottom - first.minY)
+        if cell.header {
+            UIColor.secondarySystemFill.setFill()
+            UIRectFill(box)
+        }
+        let line: CGFloat = 1
+        UIColor.separator.setFill()
+        UIRectFill(CGRect(x: box.minX, y: box.minY, width: line, height: box.height))
+        UIRectFill(CGRect(x: box.maxX - line, y: box.minY, width: line, height: box.height))
+        if cell.column == 0 {
+            UIRectFill(CGRect(x: box.minX, y: box.minY, width: box.width, height: line))
+        } else {
+            let inset = NoteTextRenderer.cellPadding
+            UIColor.separator.withAlphaComponent(0.35).setFill()
+            UIRectFill(CGRect(x: box.minX + inset, y: box.minY, width: box.width - 2 * inset, height: 0.5))
+            UIColor.separator.setFill()
+        }
+        if cell.row + 1 == cell.rows && cell.column + 1 == cell.columns {
+            UIRectFill(CGRect(x: box.minX, y: box.maxY - line, width: box.width, height: line))
         }
     }
 
@@ -497,12 +552,21 @@ final class NoteTextView: UITextView {
         ("Add Link", "k", [.command], "link"),
         ("Move Up", UIKeyCommand.inputUpArrow, [.command, .control], "up"),
         ("Move Down", UIKeyCommand.inputDownArrow, [.command, .control], "down"),
+        ("Table", "t", [.command, .alternate], "table"),
     ]
 
     override var keyCommands: [UIKeyCommand]? {
         guard let c = coordinator, !c.readOnly else { return super.keyCommands }
-        let mine = Self.shortcuts.map { s in
+        var mine = Self.shortcuts.map { s in
             UIKeyCommand(title: s.title, action: #selector(shortcut(_:)), input: s.input, modifierFlags: s.flags, propertyList: s.id)
+        }
+        // In a table, Tab and Shift+Tab go from cell to cell.
+        if c.formatting?.inTable == true {
+            for (title, flags, id) in [("Next Cell", UIKeyModifierFlags(), "nextCell"), ("Previous Cell", UIKeyModifierFlags.shift, "previousCell")] {
+                let k = UIKeyCommand(title: title, action: #selector(shortcut(_:)), input: "\t", modifierFlags: flags, propertyList: id)
+                k.wantsPriorityOverSystemBehavior = true
+                mine.append(k)
+            }
         }
         return (super.keyCommands ?? []) + mine
     }
@@ -526,6 +590,9 @@ final class NoteTextView: UITextView {
         case "outdent": command = .outdent
         case "up": command = .moveUp
         case "down": command = .moveDown
+        case "table": command = c.formatting?.inTable == true ? .nextCell : .insertTable
+        case "nextCell": command = .nextCell
+        case "previousCell": command = .previousCell
         case "link":
             c.onLink()
             return
@@ -550,6 +617,41 @@ enum ChecklistActions {
             item("Move Checked to Bottom", "arrow.down.to.line", .moveCheckedToBottom, enabled: f.checklistHasChecked),
             item("Delete Checked Items", "trash", .deleteChecked, enabled: f.checklistHasChecked, destructive: true),
         ])
+    }
+}
+
+/// The Table menu (keyboard bar, edit menu): Insert Table, or in a table,
+/// moving to the next cell (there's no Tab on the iPhone's keyboard), rows,
+/// columns, headers and deleting.
+enum TableActions {
+    static func items(_ f: Formatting?, run: @escaping (EditorCommand) -> Void) -> [UIMenuElement] {
+        func item(_ title: String, _ symbol: String, _ c: EditorCommand, on: Bool = false, destructive: Bool = false) -> UIAction {
+            UIAction(title: title, image: UIImage(systemName: symbol), attributes: destructive ? [.destructive] : [], state: on ? .on : .off) { _ in run(c) }
+        }
+        guard let f, f.inTable else {
+            return [item("Insert Table", "tablecells", .insertTable)]
+        }
+        return [
+            UIMenu(options: .displayInline, children: [
+                item("Next Cell", "arrow.right.to.line", .nextCell),
+                item("Previous Cell", "arrow.left.to.line", .previousCell),
+            ]),
+            UIMenu(options: .displayInline, children: [
+                item("Add Row Above", "arrow.up.to.line", .addRowAbove),
+                item("Add Row Below", "arrow.down.to.line", .addRowBelow),
+                item("Add Column Before", "arrow.left.to.line.compact", .addColumnBefore),
+                item("Add Column After", "arrow.right.to.line.compact", .addColumnAfter),
+            ]),
+            UIMenu(options: .displayInline, children: [
+                item("Header Row", "rectangle.topthird.inset.filled", .toggleHeaderRow, on: f.headerRow),
+                item("Header Column", "rectangle.leftthird.inset.filled", .toggleHeaderColumn, on: f.headerColumn),
+            ]),
+            UIMenu(options: .displayInline, children: [
+                item("Delete Row", "minus.square", .deleteRow, destructive: true),
+                item("Delete Column", "minus.square", .deleteColumn, destructive: true),
+                item("Delete Table", "trash", .deleteTable, destructive: true),
+            ]),
+        ]
     }
 }
 
@@ -919,6 +1021,9 @@ struct NoteEditorView: UIViewRepresentable {
             if let f, f.style == .checklist {
                 mine.append(ChecklistActions.menu(f) { [weak self] c in self?.command(c) })
             }
+            if let f, f.inTable {
+                mine.append(UIMenu(title: "Table", image: UIImage(systemName: "tablecells"), children: TableActions.items(f) { [weak self] c in self?.command(c) }))
+            }
             return UIMenu(children: suggestedActions + mine)
         }
 
@@ -1006,7 +1111,16 @@ struct NoteEditorView: UIViewRepresentable {
                 return b
             }
             let flex = { UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil) }
+            // The Table button's menu is made when it opens: Insert Table,
+            // or in a table its rows, columns and headers.
+            let table = UIBarButtonItem(image: UIImage(systemName: "tablecells"), menu: UIMenu(children: [
+                UIDeferredMenuElement.uncached { [weak self] completion in
+                    completion(TableActions.items(self?.formatting) { c in self?.command(c) })
+                },
+            ]))
+            table.accessibilityLabel = "Table"
             bar.items = [
+                table, flex(),
                 item("textformat", "Format", #selector(formatTapped)), flex(),
                 item("checklist", "Checklist", #selector(checklistTapped)), flex(),
                 item("decrease.indent", "Outdent", #selector(outdentTapped)), flex(),

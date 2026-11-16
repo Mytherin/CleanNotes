@@ -136,6 +136,14 @@ struct NoteView: View {
                 } label: { Image(systemName: "checklist") }
                     .accessibilityLabel("Checklist")
                 Spacer()
+                Menu {
+                    TableMenu(formatting: bridge.formatting) { c in
+                        bridge.beginEditing()
+                        bridge.command(c)
+                    }
+                } label: { Image(systemName: "tablecells") }
+                    .accessibilityLabel("Table")
+                Spacer()
                 Button {
                     bridge.beginEditing()
                     bridge.toggleFormatPanel()
@@ -380,5 +388,42 @@ struct FormatPanel: View {
         .buttonStyle(.plain)
         .accessibilityLabel(label)
         .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+/// The note's Table menu (the bottom toolbar): Insert Table, or in a
+/// table, the next cell, rows, columns, headers and deleting.
+struct TableMenu: View {
+    let formatting: Formatting?
+    let run: (EditorCommand) -> Void
+
+    var body: some View {
+        if let f = formatting, f.inTable {
+            Section {
+                Button { run(.nextCell) } label: { Label("Next Cell", systemImage: "arrow.right.to.line") }
+                Button { run(.previousCell) } label: { Label("Previous Cell", systemImage: "arrow.left.to.line") }
+            }
+            Section {
+                Button { run(.addRowAbove) } label: { Label("Add Row Above", systemImage: "arrow.up.to.line") }
+                Button { run(.addRowBelow) } label: { Label("Add Row Below", systemImage: "arrow.down.to.line") }
+                Button { run(.addColumnBefore) } label: { Label("Add Column Before", systemImage: "arrow.left.to.line.compact") }
+                Button { run(.addColumnAfter) } label: { Label("Add Column After", systemImage: "arrow.right.to.line.compact") }
+            }
+            Section {
+                Toggle(isOn: Binding(get: { f.headerRow }, set: { _ in run(.toggleHeaderRow) })) {
+                    Label("Header Row", systemImage: "rectangle.topthird.inset.filled")
+                }
+                Toggle(isOn: Binding(get: { f.headerColumn }, set: { _ in run(.toggleHeaderColumn) })) {
+                    Label("Header Column", systemImage: "rectangle.leftthird.inset.filled")
+                }
+            }
+            Section {
+                Button(role: .destructive) { run(.deleteRow) } label: { Label("Delete Row", systemImage: "minus.square") }
+                Button(role: .destructive) { run(.deleteColumn) } label: { Label("Delete Column", systemImage: "minus.square") }
+                Button(role: .destructive) { run(.deleteTable) } label: { Label("Delete Table", systemImage: "trash") }
+            }
+        } else {
+            Button { run(.insertTable) } label: { Label("Insert Table", systemImage: "tablecells") }
+        }
     }
 }
