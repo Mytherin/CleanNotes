@@ -40,6 +40,8 @@ pub enum Secrets {
 
 pub struct Db {
     conn: Connection,
+    /// The data folder (`data.db` and the attachments of imported notes).
+    dir: PathBuf,
     secrets: Secrets,
     /// Keyring entry names are qualified by the data folder when it isn't
     /// the default one, so test copies don't share secrets.
@@ -112,7 +114,7 @@ impl Db {
         } else {
             String::new()
         };
-        let mut db = Db { conn, secrets, keyring_prefix, saved_meta: None, in_memory: Mutex::new(HashMap::new()) };
+        let mut db = Db { conn, dir: dir.to_path_buf(), secrets, keyring_prefix, saved_meta: None, in_memory: Mutex::new(HashMap::new()) };
         db.move_secrets_out()?;
         let (store, settings) = db.load()?;
         Ok((db, store, settings))
@@ -257,6 +259,11 @@ impl Db {
 
     fn keyring_name(&self, account: &str) -> String {
         format!("{}account-{account}", self.keyring_prefix)
+    }
+
+    /// The data folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     pub fn secret(&self, account: &str) -> Option<String> {

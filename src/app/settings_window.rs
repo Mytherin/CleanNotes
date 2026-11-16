@@ -284,6 +284,18 @@ impl App {
         if lock_now {
             self.lock_now();
         }
+        ui.separator();
+        let mut import = false;
+        form_row(ui, p, "Import:", |ui| {
+            if ui.button("Import from Evernote…").clicked() {
+                import = true;
+            }
+        });
+        explain(ui, p, "Adds notes from Evernote export files (.enex), also those made from Apple Notes. You can also drop the files on the window.");
+        if import {
+            self.settings_ui.open = false;
+            self.open_import(&[]);
+        }
     }
 
     fn accounts_tab(&mut self, ui: &mut Ui, p: &Palette) {
@@ -875,7 +887,7 @@ fn ck_config(f: &CkForm) -> cloudkit::Config {
 
 /// Error text, a spinner while busy, and Cancel / the default button.
 /// Returns whether the default button was pressed.
-fn sheet_buttons(ui: &mut Ui, p: &Palette, busy: bool, error: &Option<String>, ready: bool, label: &str, close: &mut bool) -> bool {
+pub(super) fn sheet_buttons(ui: &mut Ui, p: &Palette, busy: bool, error: &Option<String>, ready: bool, label: &str, close: &mut bool) -> bool {
     if let Some(e) = error {
         ui.add_space(6.0);
         wrapped(ui, e, theme::RED);
@@ -951,7 +963,7 @@ fn check_row(ui: &mut Ui, p: &Palette, value: &mut bool, label: &str, detail: &s
     ui.add_space(2.0);
 }
 
-fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)]) {
+pub(super) fn combo<T: PartialEq + Clone>(ui: &mut Ui, id: &str, value: &mut T, options: &[(T, String)]) {
     let current = options.iter().find(|(v, _)| v == value).map(|(_, l)| l.clone()).unwrap_or_default();
     ui.spacing_mut().interact_size.y = 28.0;
     egui::ComboBox::from_id_salt(id).selected_text(current).width(320.0).height(300.0).show_ui(ui, |ui| {
