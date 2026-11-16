@@ -1,0 +1,2 @@
+# Scripts run on macOS (ios/build-rust.sh): LF even in a Windows checkout.
+*.sh text eol=lf

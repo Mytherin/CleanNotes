@@ -20,7 +20,7 @@ impl App {
         }
         match &self.location {
             Location::All => "All Notes".into(),
-            Location::Folder(f) => self.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
+            Location::Folder(f) => self.lib.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
         }
@@ -31,9 +31,9 @@ impl App {
     fn list_header(&mut self, ui: &mut Ui, p: &Palette, bar: Rect, more_x: f32) -> f32 {
         let y = bar.center().y;
         let mut x = bar.left() + 18.0;
-        if !self.settings.sidebar_visible {
+        if !self.lib.settings.sidebar_visible {
             if tool_button(ui, p, Rect::from_center_size(Pos2::new(x + 12.0, y), Vec2::splat(30.0)), Icon::Sidebar, "Show Folders (Ctrl+Alt+S)") {
-                self.settings.sidebar_visible = true;
+                self.lib.settings.sidebar_visible = true;
             }
             x += 40.0;
         }
@@ -54,30 +54,30 @@ impl App {
                 menu_look(ui, p);
                 ui.set_min_width(210.0);
                 let mut close = false;
-                let gallery = self.settings.view == ListView::Gallery;
+                let gallery = self.lib.settings.view == ListView::Gallery;
                 let (label, view) = if gallery { ("View as List", ListView::List) } else { ("View as Gallery", ListView::Gallery) };
                 if ui.add(egui::Button::new(label).shortcut_text(if gallery { cmd_key!("1") } else { cmd_key!("2") })).clicked() {
-                    self.settings.view = view;
+                    self.lib.settings.view = view;
                     close = true;
                 }
                 ui.separator();
                 ui.menu_button("Sort By", |ui| {
                     for o in crate::settings::SortBy::ALL {
-                        if ui.radio(self.settings.sort_by == o, o.label()).clicked() {
-                            self.settings.sort_by = o;
+                        if ui.radio(self.lib.settings.sort_by == o, o.label()).clicked() {
+                            self.lib.settings.sort_by = o;
                             ui.close_menu();
                         }
                     }
                 });
                 ui.menu_button("Group By Date", |ui| {
                     for (on, l) in [(true, "On"), (false, "Off")] {
-                        if ui.radio(self.settings.group_by_date == on, l).clicked() {
-                            self.settings.group_by_date = on;
+                        if ui.radio(self.lib.settings.group_by_date == on, l).clicked() {
+                            self.lib.settings.group_by_date = on;
                             ui.close_menu();
                         }
                     }
                 });
-                if ui.checkbox(&mut self.settings.show_note_count, "Show Note Count").clicked() {
+                if ui.checkbox(&mut self.lib.settings.show_note_count, "Show Note Count").clicked() {
                     close = true;
                 }
                 if close {
@@ -128,10 +128,10 @@ impl App {
     }
 
     fn note_row(&mut self, ui: &mut Ui, p: &Palette, id: &str, show_folder: bool, separator: bool) {
-        let Some(n) = self.store.note(id) else { return };
+        let Some(n) = self.lib.store.note(id) else { return };
         // Off screen: only its space (reading its title and snippet for
         // every note, every frame, made the whole window slow).
-        let folder_known = show_folder && self.store.folder(&n.folder).is_some();
+        let folder_known = show_folder && self.lib.store.folder(&n.folder).is_some();
         let h = if folder_known { ROW_H + 16.0 } else { ROW_H };
         let next = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), h));
         if !ui.is_rect_visible(next) && !(self.scroll_list && self.is_selected(id)) {
@@ -143,9 +143,9 @@ impl App {
         let locked = crate::lock::is_locked(&n.body);
         let snippet = if locked { "Locked".to_owned() } else { markdown::snippet_of(&n.body, 120) };
         let snippet = if snippet.is_empty() { "No additional text".to_owned() } else { snippet };
-        let when = if n.deleted.is_some() && matches!(self.location, Location::Deleted(_)) { n.deleted.unwrap() } else if self.settings.sort_by == crate::settings::SortBy::Created { n.created } else { n.modified };
+        let when = if n.deleted.is_some() && matches!(self.location, Location::Deleted(_)) { n.deleted.unwrap() } else if self.lib.settings.sort_by == crate::settings::SortBy::Created { n.created } else { n.modified };
         let time = list_time(when);
-        let folder = show_folder.then(|| self.store.folder(&n.folder).map(|f| f.name.clone())).flatten();
+        let folder = show_folder.then(|| self.lib.store.folder(&n.folder).map(|f| f.name.clone())).flatten();
         let selected = self.is_selected(id);
         let active = selected && self.focus == Pane::List;
 
@@ -211,7 +211,7 @@ impl App {
     /// The right-click menu of a note in the list or gallery; with several
     /// notes selected, it acts on all of them.
     fn note_menu(&mut self, resp: &egui::Response, id: &str) {
-        let Some(n) = self.store.note(id).cloned() else { return };
+        let Some(n) = self.lib.store.note(id).cloned() else { return };
         let ids = if self.is_selected(id) { self.selected_ids() } else { vec![id.to_owned()] };
         let several = ids.len() > 1;
         let noun = if several { "Notes" } else { "Note" };
@@ -230,10 +230,10 @@ impl App {
                 }
                 return;
             }
-            let all_pinned = ids.iter().all(|i| self.store.note(i).is_some_and(|n| n.pinned));
+            let all_pinned = ids.iter().all(|i| self.lib.store.note(i).is_some_and(|n| n.pinned));
             if ui.button(format!("{} {noun}", if all_pinned { "Unpin" } else { "Pin" })).clicked() {
                 for id in &ids {
-                    if self.store.note(id).is_some_and(|n| n.pinned == all_pinned) {
+                    if self.lib.store.note(id).is_some_and(|n| n.pinned == all_pinned) {
                         self.toggle_pin(id);
                     }
                 }
@@ -264,17 +264,17 @@ impl App {
 
     /// The folders of every account, to move `ids` into one.
     pub(super) fn move_to_menu(&mut self, ui: &mut Ui, ids: &[String]) {
-        let accounts: Vec<(String, String)> = self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
         let several = accounts.len() > 1;
         for (aid, aname) in accounts {
             if several {
                 ui.label(egui::RichText::new(aname).small().strong());
             }
             let folders: Vec<(String, String, usize)> =
-                self.store.folder_tree(&aid).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
+                self.lib.store.folder_tree(&aid).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
             for (fid, fname, depth) in folders {
                 let label = format!("{}{}", "    ".repeat(depth), fname);
-                let all_there = ids.iter().all(|i| self.store.note(i).is_some_and(|n| n.folder == fid));
+                let all_there = ids.iter().all(|i| self.lib.store.note(i).is_some_and(|n| n.folder == fid));
                 if ui.add_enabled(!all_there, egui::Button::new(label)).clicked() {
                     self.move_notes(ids, &fid);
                     ui.close_menu();
@@ -333,7 +333,7 @@ impl App {
     }
 
     fn card(&mut self, ui: &mut Ui, p: &Palette, id: &str, r: Rect) {
-        let Some(n) = self.store.note(id) else { return };
+        let Some(n) = self.lib.store.note(id) else { return };
         let selected = self.is_selected(id);
         let painter = ui.painter();
         painter.rect(r, 10.0, p.card, egui::Stroke::new(if selected { 3.0_f32 } else { 1.0 }, if selected { p.accent } else { p.separator }));

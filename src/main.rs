@@ -15,20 +15,16 @@ macro_rules! cmd_key {
 
 mod app;
 mod app_icon;
-mod db;
-mod doc;
 mod editor;
 mod enex;
 mod fonts;
 mod icons;
-mod lock;
-mod markdown;
-mod model;
-mod settings;
-mod sync;
 mod theme;
 #[cfg(any(windows, target_os = "macos"))]
 mod webfetch;
+
+// The shared core (also the iPhone app's): notes, documents, storage, sync.
+use cleannotes_core::{db, doc, lock, markdown, model, settings, sync};
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

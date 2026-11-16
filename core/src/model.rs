@@ -21,6 +21,8 @@ pub const KEEP_DELETED_DAYS: i64 = 30;
 pub fn local_account_name() -> &'static str {
     if cfg!(target_os = "macos") {
         "On My Mac"
+    } else if cfg!(target_os = "ios") {
+        "On My iPhone"
     } else {
         "On My PC"
     }

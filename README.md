@@ -1,7 +1,7 @@
 # CleanNotes
 
-A desktop notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, **Amazon S3** (or an S3-compatible service), or a **SQLite database** file.
-Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCalendar](../CleanCalendar).
+A notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, **Amazon S3** (or an S3-compatible service), or a **SQLite database** file.
+The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCalendar](../CleanCalendar); the [iPhone app](#iphone-app) is SwiftUI and UIKit on the same Rust core.
 
 ## Features
 
@@ -26,12 +26,45 @@ Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCa
 ```sh
 cargo run            # debug
 cargo run --release  # optimized; no console window on Windows
-cargo test
+cargo test --workspace  # the core, the desktop app and the bindings
 ```
 
 Set `CLEANNOTES_DATA=<dir>` to keep the data in a folder of your choice, `CLEANNOTES_SEED=1` (with an empty data folder) to start with example notes, and `CLEANNOTES_THEME=light|dark` to override the system's appearance.
 
 On Windows, `build.rs` embeds `assets/CleanNotes.ico` and version information in the executable. The icon is drawn in code (`src/app_icon.rs`); `cargo test app_icon::tests::write_exe_icon -- --ignored` regenerates the file.
+
+## iPhone app
+
+`ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps read and write the same notes and sync with each other through any of the shared backends.
+
+### Building
+
+On a Mac with Xcode 15 or later, [rustup](https://rustup.rs) and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`):
+
+```sh
+ios/build-rust.sh          # the Rust core as an XCFramework, and its Swift bindings
+cd ios && xcodegen         # makes CleanNotes.xcodeproj from project.yml
+open CleanNotes.xcodeproj  # choose your team under Signing, then Run
+```
+
+Run `build-rust.sh` once before `xcodegen`, since the project includes the generated `Generated/cleannotes_ffi.swift`. After that, Xcode runs the script before every build: a debug Rust build for Debug and a release build for Release. Set `CLEANNOTES_SEED=1` in the scheme's environment to start with example notes.
+
+### What it does, as in Apple Notes
+
+- **Folders:** each account's folders with note counts (nested, collapsible accounts), Recently Deleted, tags, and All Notes once there are several folders. New Folder and the compose button are in the bottom toolbar. Swipe a folder to delete it, or touch and hold to rename it or add a subfolder. Search there looks through every note.
+- **Notes list:** large title, date sections (Pinned, Today, Yesterday, Previous 7 Days, …), each note's title, time, first line and (in mixed lists) folder. Swipe right to pin. Swipe left to delete or move. Touch and hold for a preview and a menu (pin, lock, share, move, duplicate, delete). The "…" menu switches to the gallery view, selects several notes (Move, Delete, Recover All in Recently Deleted), and sets sort and grouping. The bottom toolbar shows the note count and the compose button. Pull down to sync; **shake to undo** deleting notes.
+- **Note:** the date on top, then the rich text with the same paragraph styles as the desktop: titles, headings, lists, checklists you tick by tapping the circle, quotes and monospaced. While typing, undo, redo and Done are in the navigation bar, and the keyboard bar has Aa, checklist, indent and link. **Aa** replaces the keyboard with the format panel (styles, B I U S, lists, indents). The usual iOS editing works: autocorrect, dictation, the edit menu, ⌘B/⌘I/⌘U and ⌘Z on a keyboard, and shake to undo typing. "…" has Find in Note (the system find bar), Move, Pin, Lock and Delete. Recently Deleted notes can be read and recovered but not edited. Swipe from the left edge to go back.
+- **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, plus accounts: **Standard Notes** and **Bitwarden** sign-in (with two-step codes). iCloud (CloudKit) and SQLite syncing are only in the desktop app for now. CloudKit's sign-in needs a browser callback, and a SQLite file needs a shared folder.
+
+### How the text view uses the shared editor
+
+The note is a `UITextView` (TextKit 1) whose text is the editing engine's document, positions converted to UTF-16 as UIKit counts them (`ffi/src/lib.rs`, `NoteEditor`). Every edit goes to the engine first:
+
+- **Plain typing** (the engine confirms the result is exactly what the text view would make) is left to the text view, so the keyboard's autocorrect, predictions and marked text work as in any app.
+- **Edits that change paragraphs** are refused and the note is shown again from the engine. These include Return continuing or ending a list, `- ` / `* ` / `1. ` / `[] ` starting one, Backspace taking a list style off, pasting several lines, and anything from the Aa panel. This is the same code the desktop editor runs (`core/src/editing.rs`, `Editing::replace_range`).
+- If the text view ever changes its text without saying how, the engine catches up from a diff.
+
+List markers, checklist circles, quote bars and code backgrounds are drawn in the margin by a layout manager (`ios/CleanNotes/NoteTextView.swift`).
 
 ## Keyboard shortcuts
 
@@ -155,7 +188,7 @@ An object's ETag is its revision: updates are written with `If-Match` and new no
 
 **Encryption (optional):** enter an **encryption key** (a passphrase) when adding the account, and notes and folders are encrypted on your computer before upload, so S3 and anyone with access to the bucket see only ciphertext. The key is made from the passphrase with Argon2id (64 MiB, 3 passes); its random salt and a check value are in `<folder>/encryption.json`, so every device with the same passphrase gets the same key, and a wrong one is refused. Each file is XChaCha20-Poly1305 with a random nonce, bound to its file name. Only the key is saved, in the credential store, never the passphrase. Other devices must enter the same key; one without it sees the notes as unreadable and leaves them alone. If the passphrase is lost, the notes can't be recovered. Notes already in a folder before encryption is turned on stay readable and are encrypted the next time they're saved. Without an encryption key, notes are stored as plain Markdown (locked notes stay encrypted either way).
 
-Requests are signed with AWS Signature V4 by the app itself (`src/sync/s3/`), on the same blocking HTTP client as the other backends.
+Requests are signed with AWS Signature V4 by the app itself (`core/src/sync/s3/`), on the same blocking HTTP client as the other backends.
 
 ### SQLite database
 
@@ -189,43 +222,60 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 
 ## Code layout
 
+A Cargo workspace: the shared core, the desktop app on it, and the core's Swift bindings for the iPhone app.
+
+**`core/` (cleannotes-core), shared by both apps:** everything that isn't drawing.
+
+| File | Purpose |
+|---|---|
+| `core/src/library.rs` | The notes session: the list and its sections, new notes, deleting and undoing it, moving, pinning, folders, accounts, saving, sync scheduling, locked notes' password and keys |
+| `core/src/editing.rs` | The editing engine: typing, Return and Backspace in lists, auto-lists, paragraph and character styles, undo grouping, find, clipboard, edits as a system text view reports them |
+| `core/src/doc.rs` | The rich-text document and all editing operations; links, tags and font sizes |
+| `core/src/markdown.rs` | Markdown ↔ document, titles and snippets |
+| `core/src/model.rs` | Accounts, folders, notes, and the in-memory store |
+| `core/src/db.rs` | Local SQLite storage and the credential store |
+| `core/src/settings.rs`, `core/src/dates.rs` | Preferences and their defaults; how dates are shown |
+| `core/src/lock.rs` | Locked notes' encryption |
+| `core/src/sync/mod.rs` | The `Backend` trait and backend settings |
+| `core/src/sync/engine.rs` | The sync algorithm, shared by all backends |
+| `core/src/sync/merge.rs` | Three-way merges of note text |
+| `core/src/sync/worker.rs` | The background sync thread |
+| `core/src/sync/sqlite.rs` | The SQLite backend |
+| `core/src/sync/bitwarden/` | The Bitwarden backend: protocol, crypto, front matter |
+| `core/src/sync/cloudkit/` | The CloudKit backend |
+| `core/src/sync/standardnotes/` | The Standard Notes backend: protocol 004 crypto, sign-in, items sync, notes and tags, Super notes (`lexical.rs`) |
+| `core/src/sync/s3/` | The S3 backend: Signature V4, Markdown files, optional encryption |
+
+**`src/` (the desktop app):** what's drawn and selected.
+
 | File | Purpose |
 |---|---|
 | `src/main.rs` | Window setup |
-| `src/app.rs` | App state, note and folder actions, shortcuts, saving, sync scheduling, dialogs |
+| `src/app.rs` | Selection, focus, shortcuts, dialogs, and the panes on the library |
 | `src/app/sidebar.rs` | Accounts, folders, Recently Deleted, tags, New Folder |
 | `src/app/list.rs` | The notes list and the gallery |
-| `src/lock.rs`, `src/app/locked.rs` | Locked notes: encryption, and the password, lock screen and unlocking |
+| `src/app/locked.rs` | The lock screen and password sheets |
 | `src/app/note_pane.rs` | The note's toolbar, Aa and "…" menus, search, find bar, link sheet |
 | `src/app/settings_window.rs` | Settings: General and Accounts, with the sign-in sheets |
-| `src/editor/mod.rs` | The rich-text editor: input, commands, undo, find, clipboard |
+| `src/app/import.rs`, `src/enex.rs` | Importing Evernote exports (`.enex`) |
+| `src/webfetch.rs` | Standard Notes requests through the system browser engine (Windows, macOS) |
+| `src/editor/mod.rs` | The editor on the editing engine: keys, pointer, caret, selection, context menu |
 | `src/editor/layout.rs` | Laying out and painting paragraphs, list markers, checkboxes |
-| `src/doc.rs` | The rich-text document and all editing operations (no UI) |
-| `src/markdown.rs` | Markdown ↔ document, titles and snippets |
-| `src/model.rs` | Accounts, folders, notes, and the in-memory store |
-| `src/db.rs` | Local SQLite storage and the credential store |
-| `src/settings.rs` | Preferences and their defaults |
-| `src/sync/mod.rs` | The `Backend` trait and backend settings |
-| `src/sync/engine.rs` | The sync algorithm, shared by all backends |
-| `src/sync/merge.rs` | Three-way merges of note text |
-| `src/sync/worker.rs` | The background sync thread |
-| `src/sync/sqlite.rs` | The SQLite backend |
-| `src/sync/bitwarden/` | The Bitwarden backend: protocol, crypto, front matter |
-| `src/sync/cloudkit/` | The CloudKit backend |
-| `src/sync/standardnotes/` | The Standard Notes backend: protocol 004 crypto, sign-in, items sync, notes and tags |
-| `src/theme.rs`, `src/fonts.rs`, `src/icons.rs`, `src/app_icon.rs` | Colors, fonts, drawn icons, the app icon |
+| `src/theme.rs`, `src/fonts.rs`, `src/icons.rs`, `src/app_icon.rs` | Colors, fonts, drawn icons, the app icon (`write_ios_icon` makes the iPhone's) |
+
+**`ffi/` (cleannotes-ffi)** is the core for Swift: `NotesCore` (the library), `NoteEditor` (the editing engine, in UTF-16 positions) and sign-in, as UniFFI records and enums. **`ios/`** is the iPhone app: `CleanNotes/*.swift` (screens, the text view), `project.yml` (XcodeGen) and `build-rust.sh`.
 
 ## Tests
 
-`cargo test` runs everything offline:
+`cargo test --workspace` runs everything offline:
 
 - **Document and Markdown:** every paragraph and character style round-trips; escaping; Markdown from elsewhere; editing operations (Return in lists, Backspace at a bullet, pasting, numbering, moving items); the editor's undo grouping, auto-lists, find, links and checklist sorting.
-- **Sync engine** (`src/sync/engine/tests.rs`): two "devices" with their own stores share one SQLite backend: merges, clashing edits kept as two notes, edit beats delete, Recently Deleted and pins, folder moves, renames and deletes, edits during a sync, lost replies, offline changes on both sides.
-- **Bitwarden** (`src/sync/bitwarden/tests.rs`) against a fake server (`fake.rs`) that only ever sees encrypted data and enforces revision checks, Bitwarden's length limits and token expiry: password, Argon2id, two-step, new-device and API-key sign-ins; round trips, conflicts, 100 KB notes, items typed into the vault, fields kept on update, folder renames, trash, token refresh, and two devices syncing through the vault. The key derivation and encryption are checked against vectors computed independently in Node.js (`kat.rs`).
-- **CloudKit** (`src/sync/cloudkit/tests.rs`) against a fake CloudKit Web Services server: browser sign-in through the loopback callback, records and change tags, conflicts, paging, folder renames, expired sign-ins, and two devices syncing.
-- **SQLite backend, local storage, model** unit tests.
+- **Sync engine** (`core/src/sync/engine/tests.rs`): two "devices" with their own stores share one SQLite backend: merges, clashing edits kept as two notes, edit beats delete, Recently Deleted and pins, folder moves, renames and deletes, edits during a sync, lost replies, offline changes on both sides.
+- **Bitwarden** (`core/src/sync/bitwarden/tests.rs`) against a fake server (`fake.rs`) that only ever sees encrypted data and enforces revision checks, Bitwarden's length limits and token expiry: password, Argon2id, two-step, new-device and API-key sign-ins; round trips, conflicts, 100 KB notes, items typed into the vault, fields kept on update, folder renames, trash, token refresh, and two devices syncing through the vault. The key derivation and encryption are checked against vectors computed independently in Node.js (`kat.rs`).
+- **CloudKit** (`core/src/sync/cloudkit/tests.rs`) against a fake CloudKit Web Services server: browser sign-in through the loopback callback, records and change tags, conflicts, paging, folder renames, expired sign-ins, and two devices syncing.
+- **SQLite backend, local storage, model** unit tests; the **library** (list sections, new notes, deletion undo, folders, sign-ins replaced mid-sync) and the **bindings** (UTF-16 positions, which edits the text view may make itself, notes and locking through `NotesCore`).
 
-- **Standard Notes** (`src/sync/standardnotes/tests.rs`) against a fake server that only sees protocol 004 strings, checks the PKCE verifier, enforces sync conflicts by timestamp, pages downloads and expires sessions: sign-in (two-factor, email retried in lowercase), items keys, round trips, conflicts, tags as folders, the trash, read-only Super notes, paging and incremental syncs, session refresh, and two devices syncing. The key derivation and encryption are checked against the official client's own test vectors, including an items key from a real account's backup (`kat.rs`).
+- **Standard Notes** (`core/src/sync/standardnotes/tests.rs`) against a fake server that only sees protocol 004 strings, checks the PKCE verifier, enforces sync conflicts by timestamp, pages downloads and expires sessions: sign-in (two-factor, email retried in lowercase), items keys, round trips, conflicts, tags as folders, the trash, read-only Super notes, paging and incremental syncs, session refresh, and two devices syncing. The key derivation and encryption are checked against the official client's own test vectors, including an items key from a real account's backup (`kat.rs`).
 
 The Bitwarden, CloudKit and Standard Notes backends have only been tested against those fakes, not against the real services.
 

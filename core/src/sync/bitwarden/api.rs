@@ -44,7 +44,7 @@ impl Urls {
 pub fn device_type() -> u8 {
     if cfg!(target_os = "windows") {
         23
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
         24
     } else {
         25

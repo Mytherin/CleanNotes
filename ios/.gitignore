@@ -1,0 +1,6 @@
+# Made by build-rust.sh and XcodeGen.
+/build/
+/Generated/
+/CleanNotes.xcodeproj/
+xcuserdata/
+DerivedData/

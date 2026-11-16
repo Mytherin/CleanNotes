@@ -7,10 +7,21 @@ use eframe::egui::IconData;
 
 /// RGBA pixels of the icon at `size`×`size`.
 pub fn render(size: u32) -> Vec<u8> {
+    draw(size, 0.06, 0.2)
+}
+
+/// The icon filling the whole square, for iOS (which rounds the corners
+/// itself).
+#[cfg(test)]
+fn render_full_bleed(size: u32) -> Vec<u8> {
+    draw(size, 0.0, 0.0)
+}
+
+fn draw(size: u32, margin: f32, radius: f32) -> Vec<u8> {
     let s = size as f32;
     let mut px = vec![0u8; (size * size * 4) as usize];
-    let margin = s * 0.06;
-    let radius = s * 0.2;
+    let margin = s * margin;
+    let radius = s * radius;
     let band = margin + (s - 2.0 * margin) * 0.27;
     const SS: u32 = 4;
     for y in 0..size {
@@ -89,6 +100,22 @@ mod tests {
         assert_eq!(px[mid + 3], 255);
         let top = ((10 * 64 + 32) * 4) as usize;
         assert!(px[top] > 240 && px[top + 2] < 90, "the band is yellow");
+    }
+
+    /// Writes the iPhone app's icon (1024 px, opaque, square).
+    #[test]
+    #[ignore]
+    fn write_ios_icon() {
+        let size = 1024;
+        let px = render_full_bleed(size);
+        assert!(px.chunks(4).all(|p| p[3] == 255), "iOS icons are opaque");
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, size, size);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&px).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ios/CleanNotes/Assets.xcassets/AppIcon.appiconset/AppIcon.png");
+        std::fs::write(path, out).unwrap();
     }
 
     /// Writes assets/CleanNotes.ico (PNG-compressed images).

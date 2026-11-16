@@ -97,11 +97,11 @@ impl App {
     /// Imports the notes of Evernote export files (or folders of them)
     /// into an account.
     pub fn import_enex(&mut self, paths: &[PathBuf], account: &str) -> Result<ImportReport> {
-        if self.store.account(account).is_none() {
+        if self.lib.store.account(account).is_none() {
             bail!("That account no longer exists.");
         }
         let files = enex_files(paths)?;
-        let attachments_dir = self.db.dir().join("Attachments");
+        let attachments_dir = self.lib.db.dir().join("Attachments");
         let mut save = |r: &Resource| save_attachment(&attachments_dir, r);
         // Every file is read before any note is added: a file that can't be
         // read adds nothing.
@@ -116,29 +116,29 @@ impl App {
 
         self.flush_editor();
         let existing: HashSet<(i64, &str)> =
-            self.store.notes.iter().filter(|n| n.account == account).map(|n| (n.created.timestamp(), n.body.as_str())).collect();
+            self.lib.store.notes.iter().filter(|n| n.account == account).map(|n| (n.created.timestamp(), n.body.as_str())).collect();
         let fresh: Vec<_> = notes.iter().filter(|n| !existing.contains(&(n.created.timestamp(), n.body.as_str()))).cloned().collect();
         let mut report = ImportReport { skipped: notes.len() - fresh.len(), ..ImportReport::default() };
-        let folders_before = self.store.folders.len();
+        let folders_before = self.lib.store.folders.len();
         for n in fresh {
-            let folder = self.store.ensure_folder_at(account, &[n.folder.clone()]);
+            let folder = self.lib.store.ensure_folder_at(account, &[n.folder.clone()]);
             report.first_folder.get_or_insert(folder.clone());
             let mut note = Note::new(account, &folder, &n.body);
             note.created = n.created;
             note.modified = n.modified;
             report.notes += 1;
             report.attachments += n.attachments;
-            self.unsaved.insert(note.id.clone());
-            self.store.notes.push(note);
+            self.lib.mark_changed(&note.id);
+            self.lib.store.notes.push(note);
         }
-        report.folders_created = self.store.folders.len() - folders_before;
-        self.save(true);
+        report.folders_created = self.lib.store.folders.len() - folders_before;
+        self.lib.save(true);
         Ok(report)
     }
 
     pub(super) fn import_sheet(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(sheet) = self.import.as_mut() else { return };
-        let accounts: Vec<(String, String)> = self.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
         let mut close = false;
         let mut go = false;
         modal(ctx, "import", p, |ui| {
@@ -255,16 +255,16 @@ mod tests {
 
         let r = app.import_enex(&[files.clone()], crate::model::LOCAL).unwrap();
         assert_eq!((r.notes, r.skipped, r.folders_created, r.attachments), (3, 0, 1, 1));
-        let cats = app.store.folder_at(crate::model::LOCAL, &["Cats".into()]).unwrap().id.clone();
-        let one = app.store.notes.iter().find(|n| n.title() == "One").unwrap();
+        let cats = app.lib.store.folder_at(crate::model::LOCAL, &["Cats".into()]).unwrap().id.clone();
+        let one = app.lib.store.notes.iter().find(|n| n.title() == "One").unwrap();
         assert_eq!(one.folder, cats);
         assert_eq!(one.body, "# One\nfirst\n");
         assert_eq!(one.created.to_rfc3339(), "2019-01-01T10:10:10+00:00");
         // "Notes" is the account's own folder.
-        let two = app.store.notes.iter().find(|n| n.title() == "Two").unwrap();
-        assert!(app.store.folder(&two.folder).unwrap().default);
+        let two = app.lib.store.notes.iter().find(|n| n.title() == "Two").unwrap();
+        assert!(app.lib.store.folder(&two.folder).unwrap().default);
         // The attachment is saved and linked.
-        let pic = app.store.notes.iter().find(|n| n.title() == "Pic").unwrap();
+        let pic = app.lib.store.notes.iter().find(|n| n.title() == "Pic").unwrap();
         let saved: Vec<_> = std::fs::read_dir(dir.path().join("data").join("Attachments")).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(saved.len(), 1);
         assert_eq!(std::fs::read(&saved[0]).unwrap(), b"png bytes");
@@ -273,11 +273,11 @@ mod tests {
         // Again: nothing new.
         let r = app.import_enex(&[files.join("a.enex")], crate::model::LOCAL).unwrap();
         assert_eq!((r.notes, r.skipped), (0, 3));
-        assert_eq!(app.store.notes.len(), 3);
+        assert_eq!(app.lib.store.notes.len(), 3);
         // Saved to the database.
         drop(app);
         let app = App::for_test(&dir.path().join("data"));
-        assert_eq!(app.store.notes.len(), 3);
+        assert_eq!(app.lib.store.notes.len(), 3);
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
         std::fs::write(&bad, "<html>nope</html>").unwrap();
         let e = app.import_enex(&[good, bad], crate::model::LOCAL).unwrap_err();
         assert!(format!("{e:#}").contains("not an Evernote export"), "{e:#}");
-        assert!(app.store.notes.is_empty());
+        assert!(app.lib.store.notes.is_empty());
         assert!(app.import_enex(&[dir.path().join("missing.enex")], crate::model::LOCAL).is_err());
     }
 
