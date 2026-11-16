@@ -1,6 +1,6 @@
 # CleanNotes
 
-A desktop notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, or a **SQLite database** file.
+A desktop notes app written in Rust that looks and behaves like Apple Notes, with pluggable sync: **Bitwarden**, **iCloud (CloudKit)**, **Standard Notes**, **Amazon S3** (or an S3-compatible service), or a **SQLite database** file.
 Built on [egui/eframe](https://github.com/emilk/egui), like its sibling [CleanCalendar](../CleanCalendar).
 
 ## Features
@@ -136,6 +136,24 @@ Notes go into a [Standard Notes](https://standardnotes.com) account (`api.standa
 
 The app speaks Standard Notes' client protocol itself (`src/sync/standardnotes/`): Argon2id root keys, XChaCha20-Poly1305 with the client's authenticated data, items keys, PKCE sign-in, session refresh and the paged items sync. Add an account under Settings → Accounts → + → Standard Notes (standardnotes.com or a self-hosted server; two-factor codes are asked for when needed).
 
+### Amazon S3
+
+Notes go into a folder of your choice in an S3 bucket, as Markdown files any tool can read. S3-compatible services (Cloudflare R2, MinIO, …) work too, if they support conditional writes:
+
+```text
+<folder>/head                  rewritten with every change, so other devices notice cheaply
+<folder>/notes/<id>.md         a note: YAML front matter (id, folder, dates, pin, tags), then its Markdown
+<folder>/folders/<id>.json     a folder: its path, e.g. ["Work","2026"]
+```
+
+1. In the AWS console, create a bucket (keep "Block all public access" on; turning on versioning keeps old versions of notes as a backup).
+2. In IAM, create a user without console access, with an inline policy that allows only `s3:ListBucket` on `arn:aws:s3:::BUCKET` and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` on `arn:aws:s3:::BUCKET/*`, and create an access key for it ("Application running outside AWS").
+3. In CleanNotes, **Settings → Accounts → + → Amazon S3**: enter the account name, bucket, region, folder and access key. Adding the account checks that the key can list, read and write the folder, and that the service refuses outdated writes. The key is kept in the system's credential store.
+
+An object's ETag is its revision: updates are written with `If-Match` and new notes with `If-None-Match: *`, so S3 refuses a save based on an outdated copy and the sync engine merges instead. A note deleted for good leaves a small tombstone file (cleaned up after 30 days), so a delete loses to an edit made elsewhere. When nothing changed, a sync is a single `HEAD` request on `head`; otherwise the folder is listed and only changed notes are downloaded, several at once. Everything is listed at least every 15 minutes. A `.md` file without front matter put into `notes/` by hand shows up as a note. Notes are stored as plain text (locked notes stay encrypted); S3's own encryption at rest applies, but the bucket's owner can read them.
+
+Requests are signed with AWS Signature V4 by the app itself (`src/sync/s3/`), on the same blocking HTTP client as the other backends.
+
 ### SQLite database
 
 Notes go into a SQLite file of your choice, as plain tables any SQLite tool can read:
@@ -164,7 +182,7 @@ To add a backend: implement `Backend`, add a `BackendConfig` variant, and open i
 
 ## Data
 
-Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (a Bitwarden session, a CloudKit web auth token, a Standard Notes session and key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
+Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on Windows (`~/Library/Application Support/CleanNotes` on macOS, `~/.local/share/cleannotes` on Linux), or `CLEANNOTES_DATA`. Notes are rows with their Markdown; accounts, folders and sync bookkeeping are JSON. Sign-ins (a Bitwarden session, a CloudKit web auth token, a Standard Notes session and key, an S3 access key) go to the OS credential store (Windows Credential Manager, macOS Keychain, Secret Service), under `CleanNotes` / `account-<id>`; without one, into `data.db` with a warning.
 
 ## Code layout
 

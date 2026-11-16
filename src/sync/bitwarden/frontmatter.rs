@@ -46,7 +46,7 @@ fn ts(t: DateTime<Utc>) -> String {
 }
 
 /// A YAML scalar, quoted when it would otherwise read as something else.
-fn scalar(s: &str) -> String {
+pub(crate) fn scalar(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/' | '+'))
         && !s.starts_with(['-', ':'])
@@ -208,7 +208,7 @@ fn plain_body(name: &str, notes: &str) -> String {
     }
 }
 
-fn unquote(v: &str) -> String {
+pub(crate) fn unquote(v: &str) -> String {
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
         let inner = &v[1..v.len() - 1];
         let mut out = String::new();

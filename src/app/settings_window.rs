@@ -10,7 +10,7 @@ use super::{modal, App, Confirm, Location};
 use crate::model::{new_id, Account, LOCAL};
 use crate::settings::{refresh_label, SortBy, StartWith, REFRESH_CHOICES, TEXT_SIZES};
 use crate::sync::bitwarden::{self, Method, SignInRequest, SignInStep, TwoFactorCode, TwoFactorKind};
-use crate::sync::{cloudkit, sqlite, standardnotes, BackendConfig};
+use crate::sync::{cloudkit, s3, sqlite, standardnotes, BackendConfig};
 use crate::theme::{self, Palette};
 
 const LABEL_W: f32 = 190.0;
@@ -130,6 +130,43 @@ struct SqliteForm {
     path: String,
 }
 
+struct S3Form {
+    /// The account whose keys are being replaced.
+    again: Option<String>,
+    name: String,
+    bucket: String,
+    region: String,
+    prefix: String,
+    endpoint: String,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl S3Form {
+    fn config(&self) -> s3::Config {
+        let endpoint = self.endpoint.trim().trim_end_matches('/');
+        s3::Config {
+            bucket: self.bucket.trim().to_owned(),
+            region: self.region.trim().to_owned(),
+            prefix: self.prefix.trim().trim_matches('/').to_owned(),
+            endpoint: (!endpoint.is_empty()).then(|| endpoint.to_owned()),
+        }
+    }
+
+    fn keys(&self) -> s3::Keys {
+        s3::Keys { access_key_id: self.access_key_id.trim().to_owned(), secret_access_key: self.secret_access_key.trim().to_owned() }
+    }
+
+    fn ready(&self) -> bool {
+        let endpoint = self.endpoint.trim();
+        !self.bucket.trim().is_empty()
+            && !self.region.trim().is_empty()
+            && !self.access_key_id.trim().is_empty()
+            && !self.secret_access_key.trim().is_empty()
+            && (endpoint.is_empty() || endpoint.starts_with("http"))
+    }
+}
+
 struct CkForm {
     again: Option<String>,
     name: String,
@@ -145,6 +182,7 @@ enum Sheet {
     Sqlite(SqliteForm),
     CloudKit(CkForm),
     StandardNotes(Box<SnForm>),
+    S3(Box<S3Form>),
 }
 
 /// A sign-in running in the background.
@@ -155,6 +193,7 @@ enum Pending {
     Bitwarden(Receiver<(bitwarden::Config, Result<SignInStep, String>)>),
     CloudKit(Receiver<(cloudkit::Config, Result<String, String>)>),
     StandardNotes(Receiver<(standardnotes::Config, Result<standardnotes::SignInStep, String>)>),
+    S3(Receiver<(s3::Config, Result<String, String>)>),
 }
 
 #[derive(Default)]
@@ -389,6 +428,22 @@ impl App {
                     ui.label(&c.email);
                     ui.end_row();
                 }
+                BackendConfig::S3(c) => {
+                    ui.label("Bucket:");
+                    ui.label(&c.bucket);
+                    ui.end_row();
+                    ui.label("Region:");
+                    ui.label(&c.region);
+                    ui.end_row();
+                    ui.label("Folder:");
+                    ui.label(if c.prefix.is_empty() { "(top of the bucket)" } else { c.prefix.as_str() });
+                    ui.end_row();
+                    if let Some(e) = &c.endpoint {
+                        ui.label("Endpoint:");
+                        ui.label(e);
+                        ui.end_row();
+                    }
+                }
                 BackendConfig::Local => {}
             }
             ui.label("Status:");
@@ -453,6 +508,21 @@ impl App {
                             server: c.server.clone(),
                             email: c.email.clone(),
                             ..SnForm::default()
+                        })));
+                        self.settings_ui.error = None;
+                    }
+                }
+                BackendConfig::S3(c) => {
+                    if ui.button("Change Access Key…").clicked() {
+                        self.settings_ui.sheet = Some(Sheet::S3(Box::new(S3Form {
+                            again: Some(id.to_owned()),
+                            name: a.name.clone(),
+                            bucket: c.bucket.clone(),
+                            region: c.region.clone(),
+                            prefix: c.prefix.clone(),
+                            endpoint: c.endpoint.clone().unwrap_or_default(),
+                            access_key_id: String::new(),
+                            secret_access_key: String::new(),
                         })));
                         self.settings_ui.error = None;
                     }
@@ -566,6 +636,24 @@ impl App {
                     Err(e) => self.settings_ui.error = Some(e),
                 }
             }
+            Pending::S3(rx) => {
+                let Ok((config, r)) = rx.try_recv() else { return };
+                self.settings_ui.pending = None;
+                let Some(Sheet::S3(form)) = &self.settings_ui.sheet else { return };
+                match r {
+                    Ok(secret) => {
+                        let (id, name) = match &form.again {
+                            Some(id) => (id.clone(), form.name.clone()),
+                            None => (new_id(), if form.name.trim().is_empty() { "S3".to_owned() } else { form.name.trim().to_owned() }),
+                        };
+                        let account = self.account_for(&id, name, BackendConfig::S3(config));
+                        self.settings_ui.sheet = None;
+                        self.settings_ui.selected = Some(id);
+                        self.add_account(account, Some(secret));
+                    }
+                    Err(e) => self.settings_ui.error = Some(e),
+                }
+            }
         }
     }
 
@@ -590,6 +678,7 @@ impl App {
         let mut start_ck: Option<cloudkit::Config> = None;
         let mut start_sn: Option<(standardnotes::Config, standardnotes::SignInRequest)> = None;
         let mut add_sqlite: Option<(String, String)> = None;
+        let mut start_s3: Option<(s3::Config, s3::Keys)> = None;
         let sheet = self.settings_ui.sheet.as_mut().unwrap();
         modal(ctx, "add-account", p, |ui| {
             ui.set_width(400.0);
@@ -623,7 +712,20 @@ impl App {
                         }));
                     }
                     ui.add_space(6.0);
-                    if choice(ui, "SQLite Database", "A database file, e.g. on a network drive or in a synced folder") {
+                    if choice(ui, "Amazon S3", "Markdown files in a folder of an S3 (or S3-compatible) bucket") {
+                        next = Some(Sheet::S3(Box::new(S3Form {
+                            again: None,
+                            name: String::new(),
+                            bucket: String::new(),
+                            region: s3::DEFAULT_REGION.into(),
+                            prefix: s3::DEFAULT_PREFIX.into(),
+                            endpoint: String::new(),
+                            access_key_id: String::new(),
+                            secret_access_key: String::new(),
+                        })));
+                    }
+                    ui.add_space(6.0);
+                    if choice(ui, "SQLite Database","A database file, e.g. on a network drive or in a synced folder") {
                         let default = directories::UserDirs::new()
                             .and_then(|d| d.document_dir().map(|p| p.join("CleanNotes.db")))
                             .unwrap_or_else(|| "CleanNotes.db".into());
@@ -786,6 +888,47 @@ impl App {
                         start_sn = Some((f.config(), f.request()));
                     }
                 }
+                Sheet::S3(f) => {
+                    ui.label(RichText::new(if f.again.is_some() { "Change the S3 access key" } else { "Add an S3 bucket" }).font(theme::bold_font(14.0)));
+                    ui.add_space(8.0);
+                    let fixed = f.again.is_some();
+                    // Fixed while checking: the account is saved with what
+                    // the check used.
+                    ui.add_enabled_ui(!busy, |ui| egui::Grid::new("s3").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+                        if !fixed {
+                            ui.label("Account name:");
+                            ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("S3").desired_width(240.0));
+                            ui.end_row();
+                            ui.label("Bucket:");
+                            ui.add(egui::TextEdit::singleline(&mut f.bucket).hint_text("my-notes-bucket").desired_width(240.0));
+                            ui.end_row();
+                            ui.label("Region:");
+                            ui.add(egui::TextEdit::singleline(&mut f.region).hint_text("us-east-1").desired_width(240.0));
+                            ui.end_row();
+                            ui.label("Folder:");
+                            ui.add(egui::TextEdit::singleline(&mut f.prefix).hint_text("empty: the top of the bucket").desired_width(240.0));
+                            ui.end_row();
+                            ui.label("Endpoint:");
+                            ui.add(egui::TextEdit::singleline(&mut f.endpoint).hint_text("empty for Amazon S3").desired_width(240.0));
+                            ui.end_row();
+                        }
+                        ui.label("Access key ID:");
+                        ui.add(egui::TextEdit::singleline(&mut f.access_key_id).hint_text("AKIA…").desired_width(240.0));
+                        ui.end_row();
+                        ui.label("Secret access key:");
+                        ui.add(egui::TextEdit::singleline(&mut f.secret_access_key).password(true).desired_width(240.0));
+                        ui.end_row();
+                    }));
+                    ui.add_space(4.0);
+                    wrapped(
+                        ui,
+                        "Each note is a Markdown file in the folder's notes/ subfolder. Use an IAM user that can only list, read, write and delete in this bucket. The access key is kept in the system's credential store. For R2, MinIO and other S3-compatible services, enter their endpoint (R2's region is “auto”).",
+                        p.secondary,
+                    );
+                    if sheet_buttons(ui, p, busy, &error, f.ready(), if fixed { "Save" } else { "Add" }, &mut close) {
+                        start_s3 = Some((f.config(), f.keys()));
+                    }
+                }
                 Sheet::Sqlite(f) => {
                     ui.label(RichText::new("Add a SQLite database").font(theme::bold_font(14.0)));
                     ui.add_space(8.0);
@@ -844,6 +987,17 @@ impl App {
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::CloudKit(rx));
+            self.settings_ui.error = None;
+        }
+        if let Some((config, keys)) = start_s3 {
+            let (tx, rx) = mpsc::channel();
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let r = s3::check(&config, &keys).map_err(|e| format!("{e:#}"));
+                let _ = tx.send((config, r));
+                ctx.request_repaint();
+            });
+            self.settings_ui.pending = Some(Pending::S3(rx));
             self.settings_ui.error = None;
         }
         if let Some((name, path)) = add_sqlite {
