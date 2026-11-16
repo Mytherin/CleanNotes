@@ -11,8 +11,10 @@
 //!   deleting and undoing it, moving, folders, accounts, saving, syncing and
 //!   locked notes.
 //! - [`lock`], [`sync`]: locked notes' encryption, and the sync backends.
+//! - [`attachments`]: images attached to notes.
 //! - [`dates`]: how dates are shown.
 
+pub mod attachments;
 pub mod dates;
 pub mod db;
 pub mod doc;

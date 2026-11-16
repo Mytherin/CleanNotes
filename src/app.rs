@@ -12,6 +12,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 
 use crate::db::{self, Secrets};
 use crate::doc::Kind;
+use crate::editor::images::ImageCache;
 use crate::editor::{Command, Editor};
 use crate::settings::{ListView, Settings};
 use crate::theme::{self, Palette};
@@ -20,6 +21,7 @@ use cleannotes_core::library::{BodySet, Library};
 pub use cleannotes_core::dates::{list_time, note_header_time};
 pub use cleannotes_core::library::Location;
 
+mod attach;
 mod import;
 mod list;
 pub mod locked;
@@ -91,6 +93,8 @@ pub struct App {
     tag_cache: Option<(u64, Vec<String>)>,
     /// The notes list's sections, and what they were worked out for.
     sections_cache: Option<(u64, Vec<(String, Vec<String>)>)>,
+    /// Pictures in notes, loaded.
+    pub images: ImageCache,
 }
 
 impl App {
@@ -127,6 +131,7 @@ impl App {
 
     fn with(lib: Library) -> Self {
         App {
+            images: ImageCache::new(lib.attachments_dir()),
             lib,
             location: Location::Folder(String::new()),
             selected: None,
@@ -598,6 +603,9 @@ impl App {
         }
         if ticked.changed || ticked.auto_locked {
             self.follow_changes();
+        }
+        if ticked.attachments {
+            self.images.retry_missing();
         }
         // Checked (in `tick`) before this frame's input counts: coming back
         // to a window left minimized for an hour brings input with it.

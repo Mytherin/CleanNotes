@@ -58,6 +58,46 @@ pub struct Laid {
     pub galley: Arc<Galley>,
     /// The checkbox, for clicks.
     pub checkbox: Option<Rect>,
+    /// A paragraph of pictures: each one's place, one below the other
+    /// (character `i` is picture `i`). Its galley is then empty: the caret,
+    /// clicks and selection go by these.
+    pub images: Vec<LaidImage>,
+}
+
+/// A picture as laid out.
+pub struct LaidImage {
+    pub name: String,
+    pub shown: super::images::Shown,
+    pub rect: Rect,
+}
+
+/// Space between pictures in one paragraph.
+pub const IMAGE_GAP: f32 = 6.0;
+
+/// Whether a paragraph is only pictures (as both apps make them): it's laid
+/// out as pictures. (A picture inside text shows as a placeholder.)
+pub fn is_image_block(b: &Block) -> bool {
+    !b.styles.is_empty() && b.styles.iter().all(|s| s.image.is_some())
+}
+
+/// Draws a picture, or a box saying why it isn't there.
+pub fn paint_image(painter: &egui::Painter, img: &LaidImage, p: &Palette) {
+    use super::images::Shown;
+    let r = img.rect;
+    match img.shown {
+        Shown::Ready(tex, _) => {
+            painter.image(tex, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        }
+        other => {
+            painter.rect(r, 8.0, p.code_bg, Stroke::new(1.0_f32, theme::blend(p.bg, p.tertiary, 0.4)));
+            let label = match other {
+                Shown::Loading => "Loading…",
+                Shown::Missing => "Waiting for this picture to sync",
+                _ => "This picture can't be shown here",
+            };
+            painter.text(r.center(), Align2::CENTER_CENTER, label, FontId::proportional(12.5), p.secondary);
+        }
+    }
 }
 
 
@@ -110,6 +150,11 @@ pub fn job(b: &Block, body: f32, p: &Palette, wrap: f32, marks: &Marks, strong: 
     let in_any = |rs: &[Range<usize>], i: usize| rs.iter().any(|r| r.contains(&i));
     let format_at = |i: usize| -> TextFormat {
         let s = &b.styles[i];
+        if s.image.is_some() {
+            // A picture inside text (from Markdown written elsewhere): a
+            // placeholder mark.
+            return TextFormat { font_id: FontId::new(size, theme::family(false, false, false)), color: p.secondary, ..Default::default() };
+        }
         let mono = mono_block || s.code;
         let bold = s.bold || heading;
         let link = s.link.is_some() || autos.iter().any(|(r, _)| r.contains(&i));

@@ -5,7 +5,13 @@
 //! <folder>/head                  changes after every write (cheap polling)
 //! <folder>/notes/<id>.md         a note: front matter + Markdown (see format)
 //! <folder>/folders/<id>.json     a folder: its path, as a JSON list
+//! <folder>/attachments/<name>    a picture a note shows (see crate::attachments)
 //! ```
+//!
+//! - Attachments are named by their content and never change: written with
+//!   `If-None-Match: *` (one there already is the same), before the note
+//!   that shows them. In an encrypted folder they're sealed and named by an
+//!   HMAC of their name instead (see [`crypto`]).
 //!
 //! - An object's ETag is its revision. Updates are `PUT`s with `If-Match`
 //!   and creates use `If-None-Match: *`, so S3 refuses a save based on an
@@ -143,7 +149,10 @@ struct Resp {
     last_modified: Option<String>,
     /// `x-amz-bucket-region`.
     region: Option<String>,
+    /// The reply as text (listings, notes, errors).
     body: String,
+    /// The reply as it came (attachments).
+    data: Vec<u8>,
 }
 
 impl Resp {
@@ -277,6 +286,9 @@ pub struct S3Backend {
     cache: HashMap<String, (String, Cached)>,
     /// Written since `head` was last rewritten (see [`Self::mark_changed`]).
     pending_touch: bool,
+    /// The attachment objects (keys) the last full listing showed, and
+    /// those uploaded since.
+    attachments: std::collections::HashSet<String>,
 }
 
 impl S3Backend {
@@ -295,7 +307,16 @@ impl S3Backend {
             None if config.encrypted => return Err(NeedsSignIn("the encryption key is missing".into()).into()),
             None => None,
         };
-        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new(), pending_touch: false })
+        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new(), pending_touch: false, attachments: Default::default() })
+    }
+
+    /// The key an attachment is kept under.
+    fn attachment_key(&self, name: &str) -> String {
+        let object = match &self.key {
+            Some(k) => crypto::attachment_object(k, name),
+            None => name.to_owned(),
+        };
+        format!("{}attachments/{object}", self.config.root())
     }
 
     /// A key's name inside the folder (what encryption binds an object to).
@@ -357,12 +378,13 @@ impl S3Backend {
         let header = |n: &str| resp.headers().get(n).and_then(|h| h.to_str().ok()).map(str::to_owned);
         let (etag, last_modified, region) = (header("etag"), header("last-modified"), header("x-amz-bucket-region"));
         let ok = (200..300).contains(&status);
-        let body = match resp.text() {
-            Ok(t) => t,
+        let data = match resp.bytes() {
+            Ok(b) => b.to_vec(),
             Err(e) if ok => return Err(anyhow::Error::new(e).context("reading S3's reply")),
-            Err(_) => String::new(),
+            Err(_) => Vec::new(),
         };
-        Ok(Resp { status, etag, last_modified, region, body })
+        let body = String::from_utf8_lossy(&data).into_owned();
+        Ok(Resp { status, etag, last_modified, region, body, data })
     }
 
     fn put(&self, key: &str, body: &str, content_type: &str, cond: Cond) -> Result<Resp> {
@@ -640,6 +662,8 @@ impl Backend for S3Backend {
     fn pull(&mut self) -> Result<Snapshot> {
         let listed = self.refresh("")?;
         let root = self.config.root();
+        let att = format!("{root}attachments/");
+        self.attachments = listed.iter().filter(|l| l.key.starts_with(&att)).map(|l| l.key.clone()).collect();
         let mut snap = Snapshot::default();
         let mut old_tombstones = Vec::new();
         for l in &listed {
@@ -833,6 +857,45 @@ impl Backend for S3Backend {
         }
         self.mark_changed();
         Ok(())
+    }
+
+    fn has_attachment(&mut self, name: &str) -> Result<bool> {
+        Ok(self.attachments.contains(&self.attachment_key(name)))
+    }
+
+    fn put_attachment(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        let key = self.attachment_key(name);
+        let sealed;
+        let (body, content_type) = match &self.key {
+            Some(k) => {
+                sealed = crypto::seal_bytes(k, self.rel(&key), data);
+                (sealed.as_slice(), "application/octet-stream".to_owned())
+            }
+            None => (data, format!("image/{}", name.rsplit('.').next().unwrap_or("png").replace("jpg", "jpeg"))),
+        };
+        let r = self.request("PUT", &key, &[], Some(body), &[("content-type", content_type), ("if-none-match", "*".to_owned())])?;
+        // Refused as there already: it's the same picture.
+        if !r.ok() && !matches!(r.status, 409 | 412) {
+            return Err(r.error());
+        }
+        self.attachments.insert(key);
+        Ok(())
+    }
+
+    fn get_attachment(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
+        let key = self.attachment_key(name);
+        let r = self.request("GET", &key, &[], None, &[])?;
+        if r.status == 404 {
+            return Ok(None);
+        }
+        if !r.ok() {
+            return Err(r.error());
+        }
+        if r.data.starts_with(crypto::MAGIC_BYTES) {
+            // One that can't be opened is as good as missing.
+            return Ok(self.key.as_ref().and_then(|k| crypto::open_bytes(k, self.rel(&key), &r.data)));
+        }
+        Ok(Some(r.data))
     }
 
     fn known(&mut self, notes: &[(&str, &str, &NoteData)], folders: &[(&str, &str, &[String])]) {

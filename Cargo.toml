@@ -27,6 +27,12 @@ serde_json = "1"
 base64 = "0.22"
 # Evernote exports refer to attachments by the MD5 hash of their data.
 md5 = { package = "md-5", version = "0.10" }
+# Showing pictures attached to notes (HEIC isn't decoded: shown as a box).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The "Attach Image…" file dialog.
+rfd = "0.15"
+# Pasting a picture (egui's clipboard only carries text).
+arboard = { version = "3", features = ["image-data"] }
 
 [dev-dependencies]
 tempfile = "3"

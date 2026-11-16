@@ -18,6 +18,7 @@
 //! | Bold, italic, strikethrough | `**…**`, `*…*`, `~~…~~` |
 //! | Underline | `<u>…</u>` |
 //! | Link | `[text](url)` |
+//! | Image (an attachment) | `![](attachments/<sha256>.<ext>)` |
 //!
 //! List items are indented four spaces per level. Characters that would
 //! otherwise be read as markup are escaped with a backslash. Markdown written
@@ -136,6 +137,13 @@ fn inline_markdown(b: &Block) -> String {
     let mut i = 0;
     while i < chars.len() {
         let s = &styles[i];
+        if let Some(name) = &s.image {
+            // An image stands on its own, outside any other style.
+            close_all(&mut out, &mut cur);
+            out.push_str(&crate::attachments::markdown(name));
+            i += 1;
+            continue;
+        }
         if s.link != cur.link {
             close_all(&mut out, &mut cur);
             if let Some(url) = &s.link {
@@ -273,6 +281,11 @@ fn escape_char(out: &mut String, chars: &[char], styles: &[Style], i: usize) {
     let next = chars.get(i + 1).copied().filter(|_| styles.get(i + 1) == Some(&styles[i]));
     let needs = match c {
         '\\' | '*' | '`' | '[' | ']' | '~' => true,
+        // `!` right before a link to an attachment would make it an image.
+        '!' => styles.get(i + 1).is_some_and(|n| {
+            n.link != styles[i].link
+                && n.link.as_deref().and_then(|u| u.strip_prefix(crate::attachments::URL_PREFIX)).is_some_and(crate::attachments::is_name)
+        }),
         // `_` only marks emphasis at the edge of a word.
         '_' => !prev.is_some_and(|p| p.is_alphanumeric()) || !next.is_some_and(|n| n.is_alphanumeric()),
         '<' => {
@@ -668,6 +681,13 @@ fn inline_into(b: &mut Block, chars: &[char], style: &mut Style) {
                 }
                 i = close + n;
             }
+            // An attached image: `![…](attachments/<name>)`. (Other images
+            // are kept as written: a `!` and a link.)
+            '!' if chars.get(i + 1) == Some(&'[') && image_at(chars, i).is_some() => {
+                let (name, end) = image_at(chars, i).unwrap();
+                push(b, crate::attachments::OBJECT, &Style { image: Some(Arc::from(name.as_str())), ..Style::default() });
+                i = end;
+            }
             '[' => {
                 if let Some((text_end, url, end)) = find_link(chars, i) {
                     let saved = style.clone();
@@ -687,6 +707,14 @@ fn inline_into(b: &mut Block, chars: &[char], style: &mut Style) {
             }
         }
     }
+}
+
+/// For a `!` at `bang` that starts `![…](attachments/<name>)`: the name and
+/// the index after it.
+fn image_at(chars: &[char], bang: usize) -> Option<(String, usize)> {
+    let (_, url, end) = find_link(chars, bang + 1)?;
+    let name = url.strip_prefix(crate::attachments::URL_PREFIX)?;
+    crate::attachments::is_name(name).then(|| (name.to_owned(), end))
 }
 
 /// For a `[` at `open`: the index of the matching `]`, the URL, and the
@@ -799,7 +827,8 @@ fn plain_lines(md: &str) -> impl Iterator<Item = String> + '_ {
         } else {
             let start = raw.trim_start_matches([' ', '\t']);
             let body = parse_prefix(start).map_or(start, |p| &start[p.len..]);
-            parse_inline(body).text.trim().to_owned()
+            // (Images aren't text.)
+            parse_inline(body).text.replace(crate::attachments::OBJECT, " ").trim().to_owned()
         };
         (!text.is_empty()).then_some(text)
     })
@@ -1094,6 +1123,29 @@ mod tests {
             d.blocks.push(around);
             doc_round_trip(&d);
         }
+    }
+
+    #[test]
+    fn images_round_trip() {
+        let a = crate::attachments::name_for(b"a", "png");
+        let md = format!("# Trip\n![](attachments/{a})\nBefore **bold ![](attachments/{a}) still** after\n- ![](attachments/{a})\n");
+        let d = from_markdown(&md);
+        let o = crate::attachments::OBJECT;
+        assert_eq!(d.blocks[1].text, o.to_string());
+        assert_eq!(d.blocks[1].styles[0].image.as_deref(), Some(a.as_str()));
+        assert_eq!(d.blocks[2].text, format!("Before bold {o} still after"));
+        assert_eq!(d.blocks[3].kind, Kind::Dashed);
+        // (Bold comes off the spaces next to the image.)
+        round_trip(&format!("# Trip\n![](attachments/{a})\nBefore **bold** ![](attachments/{a}) **still** after\n- ![](attachments/{a})\n"));
+        // Images that aren't attachments stay as written.
+        round_trip("![cat](https://example.com/cat.png)\n");
+        round_trip("![x](attachments/not-a-hash.png)\n");
+        // A "!" before a link isn't an image.
+        let b = Block::styled(Kind::Body, &[("!", Style::default()), ("x", st(|s| s.link = Some(Arc::from(format!("attachments/{a}").as_str()))))]);
+        doc_round_trip(&Doc::new(vec![b]));
+        // Titles and snippets leave images out.
+        assert_eq!(title_of(&format!("![](attachments/{a})\n# Trip\n![](attachments/{a}) photo\n")), "Trip");
+        assert_eq!(snippet_of(&format!("# Trip\n![](attachments/{a}) photo\n"), 50), "photo");
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::doc::{Attr, Kind, Pos, Selection};
 use crate::theme::Palette;
 pub use cleannotes_core::editing::{Command, Editing};
 
+pub mod images;
 pub mod layout;
 use layout::{Laid, Marks};
 
@@ -30,6 +31,10 @@ pub struct Options<'a> {
     pub read_only: bool,
     /// Words to highlight (the search in the toolbar).
     pub highlight: &'a str,
+    /// The pictures notes show.
+    pub images: &'a images::ImageCache,
+    /// Pictures can be added to this note (not locked, not deleted).
+    pub can_attach: bool,
 }
 
 /// What happened in a frame, for the app.
@@ -38,6 +43,13 @@ pub struct Output {
     /// The user wants to edit a read-only note.
     pub blocked_edit: bool,
     pub open_url: Option<String>,
+    /// A picture was double-clicked: its file, to open.
+    pub open_image: Option<std::path::PathBuf>,
+    /// "Attach Image…" was chosen.
+    pub attach_image: bool,
+    /// Paste was asked for: a picture on the clipboard is the app's to
+    /// paste (egui only brings text).
+    pub paste_image: bool,
 }
 
 /// The "Add Link" sheet.
@@ -113,8 +125,29 @@ impl Editor {
 
     fn caret_rect(&self, p: Pos) -> Option<Rect> {
         let l = self.laid.get(p.block)?;
+        if !l.images.is_empty() {
+            // Before a picture: at its left edge; after the last: its right.
+            let (img, right) = match l.images.get(p.offset) {
+                Some(img) => (img, false),
+                None => (l.images.last()?, true),
+            };
+            let x = if right { img.rect.right() + 1.0 } else { img.rect.left() - 3.0 };
+            return Some(Rect::from_min_max(Pos2::new(x, img.rect.top()), Pos2::new(x, img.rect.bottom())));
+        }
         let r = l.galley.pos_from_ccursor(CCursor::new(p.offset));
         Some(r.translate(l.origin.to_vec2()))
+    }
+
+    /// In a paragraph of pictures: the offset nearest a point (before or
+    /// after the picture at its height).
+    fn image_offset(l: &Laid, pt: Pos2) -> usize {
+        let i = l.images.iter().position(|img| pt.y < img.rect.bottom() + layout::IMAGE_GAP / 2.0).unwrap_or(l.images.len() - 1);
+        i + (pt.x > l.images[i].rect.center().x) as usize
+    }
+
+    /// The picture under a point, if any.
+    fn image_at(&self, pt: Pos2) -> Option<&layout::LaidImage> {
+        self.laid.iter().flat_map(|l| &l.images).find(|img| img.rect.contains(pt))
     }
 
     /// The position under a point (screen coordinates).
@@ -131,6 +164,9 @@ impl Editor {
             .or_else(|| self.laid.iter().position(|l| pt.y < l.rect.bottom()))
             .unwrap_or(self.laid.len() - 1);
         let l = &self.laid[i];
+        if !l.images.is_empty() {
+            return Pos::new(i, Self::image_offset(l, pt).min(self.doc.blocks[i].len()));
+        }
         let c = l.galley.cursor_from_pos(pt - l.origin);
         Pos::new(i, c.ccursor.index.min(self.doc.blocks[i].len()))
     }
@@ -182,6 +218,11 @@ impl Editor {
             return if dir < 0 { Pos::new(0, 0) } else { self.doc.end() };
         };
         let l = &self.laid[b];
+        if !l.images.is_empty() {
+            // Into a paragraph of pictures: before or after them, by `x`.
+            let first = &l.images[0].rect;
+            return Pos::new(b, if x > first.center().x { self.doc.blocks[b].len() } else { 0 });
+        }
         let y = l.galley.rows.get(r).map_or(0.0, |row| row.rect.center().y);
         let c = l.galley.cursor_from_pos(Vec2::new(x - l.origin.x, y));
         Pos::new(b, c.ccursor.index.min(self.doc.blocks[b].len()))
@@ -202,6 +243,9 @@ impl Editor {
             return Pos::new(p.block, if end { self.doc.blocks[p.block].len() } else { 0 });
         }
         let Some(l) = self.laid.get(p.block) else { return p };
+        if !l.images.is_empty() {
+            return Pos::new(p.block, if end { self.doc.blocks[p.block].len() } else { 0 });
+        }
         let cur = l.galley.from_ccursor(CCursor::new(p.offset));
         let c = if end { l.galley.cursor_end_of_row(&cur) } else { l.galley.cursor_begin_of_row(&cur) };
         Pos::new(p.block, c.ccursor.index.min(self.doc.blocks[p.block].len()))
@@ -429,6 +473,12 @@ impl Editor {
                         self.paste(&t);
                     }
                     Event::Paste(_) => out.blocked_edit = true,
+                    // egui sends no Paste for a clipboard without text (a
+                    // copied picture), only Ctrl+V's release: the app looks
+                    // for a picture then.
+                    Event::Key { key: Key::V, pressed: false, modifiers, .. } if modifiers.command && opts.can_attach => {
+                        out.paste_image = true;
+                    }
                     Event::Key { key, pressed: true, modifiers, .. } => {
                         if self.key(key, modifiers, opts, &ctx) {
                             self.last_activity = now;
@@ -505,7 +555,7 @@ impl Editor {
                     let row_h = h + 2.0 * layout::CELL_PAD.y;
                     for (col, galley) in row.into_iter().enumerate() {
                         let rect = Rect::from_min_size(Pos2::new(left + col as f32 * col_w, y), Vec2::new(col_w, row_h));
-                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None });
+                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None, images: Vec::new() });
                     }
                     y += row_h;
                     ys.push(y);
@@ -530,13 +580,35 @@ impl Editor {
                 highlights: find_marks.remove(&i).unwrap_or_default(),
                 current: current.as_ref().filter(|(cb, _)| *cb == i).map(|(_, r)| r.clone()),
             };
+            if layout::is_image_block(b) {
+                // Pictures, one below the other, as wide as they are (in
+                // points) but no wider than the text.
+                let ppp = ui.ctx().pixels_per_point();
+                let mut images = Vec::new();
+                let mut iy = y + layout::IMAGE_GAP / 2.0;
+                for s in &b.styles {
+                    let name = s.image.as_deref().unwrap_or_default();
+                    let shown = opts.images.get(&ctx, name);
+                    let size = images::display_size(shown, (width - indent - 4.0).max(40.0), ppp);
+                    let rect = Rect::from_min_size(Pos2::new(left + indent, iy), size);
+                    images.push(layout::LaidImage { name: name.to_owned(), shown, rect });
+                    iy += size.y + layout::IMAGE_GAP;
+                }
+                let empty = crate::doc::Block::new(b.kind, "");
+                let galley = ui.fonts(|f| f.layout_job(layout::job(&empty, body, p, width - indent, &Marks::default(), false)));
+                let h = iy - y - layout::IMAGE_GAP / 2.0;
+                let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
+                laid.push(Laid { rect, origin: Pos2::new(left + indent, y), galley, checkbox: None, images });
+                y += h + 1.0;
+                continue;
+            }
             let job = layout::job(b, body, p, width - indent, &marks, false);
             let galley = ui.fonts(|f| f.layout_job(job));
             let mono_pad = if b.kind == Kind::Monospaced { 2.0 } else { 0.0 };
             let origin = Pos2::new(left + indent, y + mono_pad);
             let h = galley.rect.height().max(layout::size(b.kind, body) * 1.2) + 2.0 * mono_pad;
             let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-            laid.push(Laid { rect, origin, galley, checkbox: None });
+            laid.push(Laid { rect, origin, galley, checkbox: None, images: Vec::new() });
             y += h + 1.0;
         }
         let content = Rect::from_min_max(full.min, Pos2::new(full.right(), (y + 120.0).max(full.bottom())));
@@ -566,14 +638,26 @@ impl Editor {
             for (i, l) in laid.iter().enumerate().take(e.block + 1).skip(s.block) {
                 let from = if i == s.block { s.offset } else { 0 };
                 let to = if i == e.block { e.offset } else { self.doc.blocks[i].len() };
-                paint_range(&painter, l, from, to, i != e.block, color);
+                if l.images.is_empty() {
+                    paint_range(&painter, l, from, to, i != e.block, color);
+                }
             }
         }
         painter.galley(header_pos, header_galley, p.secondary);
+        let (sel_start, sel_end) = (self.sel.start(), self.sel.end());
         for (i, l) in laid.iter_mut().enumerate() {
             let b = &self.doc.blocks[i];
             l.checkbox = layout::paint_margin(&painter, b, numbers[i], l.rect, l.origin, &l.galley, body, p);
             painter.galley(l.origin, l.galley.clone(), p.text);
+            for (k, img) in l.images.iter().enumerate() {
+                layout::paint_image(&painter, img, p);
+                // A selected picture is tinted with the selection.
+                let at = Pos::new(i, k);
+                if !self.sel.is_empty() && sel_start <= at && Pos::new(i, k + 1) <= sel_end {
+                    let c = if focused { p.text_selection } else { p.selection_inactive };
+                    painter.rect_filled(img.rect, 0.0, c.gamma_multiply(0.6));
+                }
+            }
         }
         self.laid = laid;
 
@@ -583,7 +667,7 @@ impl Editor {
         if let Some(_) = &hover_link {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         } else if resp.hovered() {
-            let over_box = pointer.is_some_and(|pt| self.laid.iter().any(|l| l.checkbox.is_some_and(|r| r.contains(pt))));
+            let over_box = pointer.is_some_and(|pt| self.laid.iter().any(|l| l.checkbox.is_some_and(|r| r.contains(pt))) || self.image_at(pt).is_some());
             ui.ctx().set_cursor_icon(if over_box { egui::CursorIcon::Default } else { egui::CursorIcon::Text });
         }
         if resp.clicked() || resp.drag_started() || resp.secondary_clicked() {
@@ -629,8 +713,16 @@ impl Editor {
         }
         if resp.double_clicked() {
             if let Some(pt) = pointer {
-                let (a, b) = self.doc.word_at(self.pos_at(pt));
-                self.sel = Selection { anchor: a, caret: b };
+                if let Some(img) = self.image_at(pt) {
+                    // A picture opens in the system's viewer.
+                    let path = cleannotes_core::attachments::path(opts.images.dir(), &img.name);
+                    if path.is_file() {
+                        out.open_image = Some(path);
+                    }
+                } else {
+                    let (a, b) = self.doc.word_at(self.pos_at(pt));
+                    self.sel = Selection { anchor: a, caret: b };
+                }
             }
         }
         if resp.triple_clicked() {
@@ -642,7 +734,7 @@ impl Editor {
                 out.open_url = Some(url);
             }
         }
-        self.context_menu(&resp, opts, &ctx);
+        self.context_menu(&resp, opts, &ctx, &mut out);
 
         // ---- Caret ----
         if self.sel != sel_before || (self.doc.blocks.len(), self.undo_depth()) != doc_before_len {
@@ -685,7 +777,7 @@ impl Editor {
         layout::auto_links(&b.text).into_iter().find(|(range, _)| range.contains(&ci)).map(|(_, u)| u)
     }
 
-    fn context_menu(&mut self, resp: &egui::Response, opts: &Options, ctx: &egui::Context) {
+    fn context_menu(&mut self, resp: &egui::Response, opts: &Options, ctx: &egui::Context, out: &mut Output) {
         let has_sel = !self.sel.is_empty();
         let editable = !opts.read_only;
         resp.context_menu(|ui| {
@@ -704,6 +796,8 @@ impl Editor {
             }
             if item(ui, "Paste", cmd_key!("V"), editable) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                // (A picture on the clipboard is the app's to paste.)
+                out.paste_image = opts.can_attach;
                 ui.close_menu();
             }
             if item(ui, "Copy as Markdown", "", true) {
@@ -732,6 +826,10 @@ impl Editor {
                 });
                 if item(ui, "Add Link…", cmd_key!("K"), true) {
                     self.command(Command::EditLink);
+                    ui.close_menu();
+                }
+                if item(ui, "Attach Image…", "", opts.can_attach) {
+                    out.attach_image = true;
                     ui.close_menu();
                 }
                 let block = self.sel.caret.block;
@@ -857,6 +955,47 @@ mod tests {
             e.command(Command::Undo);
         }
         assert_eq!(e.doc.blocks.len(), 1);
+    }
+
+    #[test]
+    fn pictures_are_laid_out_and_pointed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = images::png_from_rgba(40, 20, &[200; 40 * 20 * 4]).unwrap();
+        let name = cleannotes_core::attachments::save(dir.path(), &png).unwrap();
+        let cache = images::ImageCache::new(dir.path().to_owned());
+        let mut e = Editor::new("n", &format!("# Pics\n![](attachments/{name})\nafter\n"));
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = || egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))), ..Default::default() };
+        // Decoded on a thread of its own: shown a few frames on.
+        for _ in 0..300 {
+            let _ = ctx.run(input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = crate::theme::Palette::get(ctx);
+                    let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache, can_attach: true };
+                    e.show(ui, &p, &opts, "");
+                });
+            });
+            if matches!(e.laid[1].images[0].shown, images::Shown::Ready(..)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let img = &e.laid[1].images[0];
+        assert!(matches!(img.shown, images::Shown::Ready(_, s) if s == Vec2::new(40.0, 20.0)), "{:?}", img.shown);
+        let r = img.rect;
+        assert_eq!(r.size(), Vec2::new(40.0, 20.0));
+        assert!(e.laid[2].rect.top() >= r.bottom(), "the text after it is below it");
+        // Its left half puts the caret before it, its right half after.
+        assert_eq!(e.pos_at(r.left_center() + Vec2::new(2.0, 0.0)), Pos::new(1, 0));
+        assert_eq!(e.pos_at(r.right_center() - Vec2::new(2.0, 0.0)), Pos::new(1, 1));
+        assert_eq!(e.caret_rect(Pos::new(1, 1)).unwrap().left(), r.right() + 1.0);
+        assert_eq!(e.caret_rect(Pos::new(1, 0)).unwrap().height(), r.height());
+        assert_eq!(e.row_edge(Pos::new(1, 0), true), Pos::new(1, 1));
+        assert!(e.image_at(r.center()).is_some_and(|i| i.name == name));
+        // A picture that isn't here shows as a box, waiting for it.
+        let cache = images::ImageCache::new(dir.path().join("elsewhere"));
+        assert_eq!(cache.get(&ctx, &name), images::Shown::Missing);
     }
 
     #[test]

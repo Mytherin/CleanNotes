@@ -6,12 +6,14 @@
 //! notes(id, folder_id, title, body, created, modified, pinned, deleted, revision)
 //! tags(note_id, tag)
 //! meta(key, value)
+//! attachments(name, data)
 //! ```
 //!
 //! `notes.body` is the note's Markdown, `title` its first line and `tags`
 //! its hashtags (both kept up to date for other tools; the app reads only
 //! the body). Times are RFC 3339 in UTC. Each write bumps the note's
-//! `revision` and the database's `meta.change` counter.
+//! `revision` and the database's `meta.change` counter. `attachments` holds
+//! the images notes show, by name (see [`crate::attachments`]).
 //!
 //! Several computers can share one file (on a network share, or in a folder
 //! synced by Dropbox and the like, as long as only one writes at a time).
@@ -59,6 +61,10 @@ CREATE TABLE IF NOT EXISTS tags (
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    name TEXT PRIMARY KEY,
+    data BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS notes_folder ON notes(folder_id);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema', '1'), ('change', '0');
@@ -138,6 +144,19 @@ fn parse_ts(s: &str) -> DateTime<Utc> {
 }
 
 impl Backend for SqliteBackend {
+    fn has_attachment(&mut self, name: &str) -> Result<bool> {
+        Ok(self.conn.query_row("SELECT 1 FROM attachments WHERE name = ?1", params![name], |_| Ok(())).optional()?.is_some())
+    }
+
+    fn put_attachment(&mut self, name: &str, data: &[u8]) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO attachments (name, data) VALUES (?1, ?2)", params![name, data])?;
+        Ok(())
+    }
+
+    fn get_attachment(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.conn.query_row("SELECT data FROM attachments WHERE name = ?1", params![name], |r| r.get(0)).optional()?)
+    }
+
     fn cursor(&mut self) -> Result<Option<String>> {
         let v: String = self.conn.query_row("SELECT value FROM meta WHERE key = 'change'", [], |r| r.get(0))?;
         Ok(Some(v))

@@ -12,19 +12,19 @@ pub struct Request {
     pub query: HashMap<String, String>,
     /// Header names lowercased.
     pub headers: HashMap<String, String>,
-    pub body: String,
+    pub body: Vec<u8>,
 }
 
 pub struct Response {
     pub status: u16,
-    pub body: String,
+    pub body: Vec<u8>,
     pub content_type: &'static str,
     pub headers: Vec<(&'static str, String)>,
 }
 
 impl Response {
     pub fn json(status: u16, v: &serde_json::Value) -> Response {
-        let body = if v.is_null() { String::new() } else { v.to_string() };
+        let body = if v.is_null() { Vec::new() } else { v.to_string().into_bytes() };
         Response { status, body, content_type: "application/json", headers: vec![] }
     }
 }
@@ -82,7 +82,7 @@ fn read_request(r: &mut BufReader<TcpStream>) -> Option<Request> {
     let len: usize = headers.get("content-length").and_then(|l| l.parse().ok()).unwrap_or(0);
     let mut body = vec![0; len];
     r.read_exact(&mut body).ok()?;
-    Some(Request { method, path, query, headers, body: String::from_utf8_lossy(&body).into_owned() })
+    Some(Request { method, path, query, headers, body })
 }
 
 /// Serves requests with `handler` on a free port. Returns the base URL.
@@ -105,7 +105,7 @@ pub fn spawn(handler: impl Fn(&Request) -> Response + Send + Sync + 'static) -> 
                         resp.content_type,
                         resp.body.len(),
                     );
-                    if out.write_all(head.as_bytes()).and_then(|_| out.write_all(resp.body.as_bytes())).is_err() {
+                    if out.write_all(head.as_bytes()).and_then(|_| out.write_all(&resp.body)).is_err() {
                         return;
                     }
                 }
