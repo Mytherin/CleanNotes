@@ -44,16 +44,17 @@ impl App {
         }
         let compose_right = x + 36.0;
 
-        // Search and "…" on the right.
+        // Lock, "…" and search on the right.
         let search_left = self.search_control(ui, p, bar.right() - 14.0, y);
         let more = glass_button(ui, p, Pos2::new(search_left - 28.0, y), Icon::More, "More", self.selected.is_some() && self.multi.len() < 2);
         self.note_more_menu(ui, p, &more);
+        self.lock_button(ui, p, Pos2::new(search_left - 72.0, y));
 
         // The formatting buttons, in a glass capsule in the middle.
         let editable = has_note && !read_only;
         let item = 40.0;
         let cap_w = item * 4.0 + 8.0;
-        let room = (compose_right + 12.0, search_left - 56.0 - 12.0);
+        let room = (compose_right + 12.0, search_left - 100.0 - 12.0);
         let cx = (bar.center().x).clamp(room.0 + cap_w / 2.0, (room.1 - cap_w / 2.0).max(room.0 + cap_w / 2.0));
         let cap = Rect::from_center_size(Pos2::new(cx, y), Vec2::new(cap_w, 36.0));
         glass(ui, p, cap);
@@ -144,6 +145,46 @@ impl App {
             }
         }
         painter.text(c + Vec2::new(0.0, 110.0), Align2::CENTER_CENTER, format!("{n} Notes Selected"), theme::font(15.0), p.secondary);
+    }
+
+    /// The lock button, as in Apple Notes: a menu to lock the note, or, once
+    /// a locked note is open, to close locked notes or remove its lock.
+    fn lock_button(&mut self, ui: &mut Ui, p: &Palette, center: Pos2) {
+        let note = if self.multi.len() < 2 { self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned()) } else { None };
+        let note = note.filter(|n| n.deleted.is_none() && !self.is_closed(&n.id));
+        let open = note.as_ref().is_some_and(|n| self.is_locked(&n.id));
+        let icon = if open { Icon::LockOpen } else { Icon::LockOutline };
+        let resp = glass_button(ui, p, center, icon, if open { "Unlocked" } else { "Lock Note" }, note.is_some());
+        let id = ui.id().with("note-lock");
+        let Some(note) = note else { return };
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            popover_frame(ui, p).show(ui, |ui| {
+                menu_look(ui, p);
+                ui.set_min_width(200.0);
+                let mut close = false;
+                if !open {
+                    if ui.button("Lock Note").clicked() {
+                        self.lock_note(&note.id);
+                        close = true;
+                    }
+                } else {
+                    if ui.button("Close All Locked Notes").clicked() {
+                        self.lock_now();
+                        close = true;
+                    }
+                    if ui.button("Remove Lock").clicked() {
+                        self.remove_lock(&note.id);
+                        close = true;
+                    }
+                }
+                if close {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
     }
 
     /// The note's "…" menu: pin, find, move, duplicate, delete.
