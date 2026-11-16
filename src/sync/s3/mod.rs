@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, Conflict, NeedsSignIn, NoteData, RemoteFolder, RemoteNote, Snapshot};
 
+pub mod crypto;
 pub mod format;
 pub mod sigv4;
 #[cfg(test)]
@@ -57,6 +58,10 @@ pub struct Config {
     /// path-style URLs. `None` for Amazon S3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Notes and folders are encrypted with a key of your own (see
+    /// [`crypto`]); the key is in the credential store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub encrypted: bool,
 }
 
 impl Config {
@@ -89,6 +94,9 @@ impl Config {
 pub struct Keys {
     pub access_key_id: String,
     pub secret_access_key: String,
+    /// The encryption key (base64), when the folder is encrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
 }
 
 impl Keys {
@@ -242,15 +250,49 @@ pub struct S3Backend {
     http: reqwest::blocking::Client,
     config: Config,
     keys: Keys,
+    /// The encryption key, if the folder is encrypted.
+    key: Option<[u8; 32]>,
     /// Objects as last downloaded: key → (ETag, contents).
     cache: HashMap<String, (String, Cached)>,
 }
 
 impl S3Backend {
     pub fn open(config: &Config, secret: Option<String>) -> Result<S3Backend> {
+        use base64::Engine;
         let secret = secret.ok_or_else(|| NeedsSignIn("no access key saved".into()))?;
         let keys: Keys = serde_json::from_str(&secret).map_err(|_| NeedsSignIn("the saved access key is unreadable".into()))?;
-        Ok(S3Backend { http: http(), config: config.clone(), keys, cache: HashMap::new() })
+        let key = match &keys.encryption_key {
+            Some(k) => Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(k)
+                    .ok()
+                    .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                    .ok_or_else(|| NeedsSignIn("the saved encryption key is unreadable".into()))?,
+            ),
+            None if config.encrypted => return Err(NeedsSignIn("the encryption key is missing".into()).into()),
+            None => None,
+        };
+        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new() })
+    }
+
+    /// A key's name inside the folder (what encryption binds an object to).
+    fn rel<'a>(&self, key: &'a str) -> &'a str {
+        key.strip_prefix(&self.config.root()).unwrap_or(key)
+    }
+
+    /// Whether objects under this key are encrypted (notes and folders).
+    fn sealable(rel: &str) -> bool {
+        rel.starts_with("notes/") || rel.starts_with("folders/")
+    }
+
+    /// An object's text, decrypted if needed. `None` if it's encrypted and
+    /// can't be read with our key (or we have none). Unencrypted objects
+    /// are read as they are, also in an encrypted folder.
+    fn unseal(&self, key: &str, raw: String) -> Option<String> {
+        if !crypto::is_sealed(&raw) {
+            return Some(raw);
+        }
+        crypto::open(self.key.as_ref()?, self.rel(key), &raw)
     }
 
     fn request(&self, method: &str, key: &str, query: &[(String, String)], body: Option<&[u8]>, extra: &[(&str, String)]) -> Result<Resp> {
@@ -307,6 +349,16 @@ impl S3Backend {
             Cond::Match(e) => extra.push(("if-match", e.to_owned())),
             Cond::Absent => extra.push(("if-none-match", "*".to_owned())),
         }
+        let rel = self.rel(key);
+        let sealed;
+        let body = match &self.key {
+            Some(k) if Self::sealable(rel) => {
+                sealed = crypto::seal(k, rel, body);
+                extra[0].1 = "application/octet-stream".to_owned();
+                sealed.as_str()
+            }
+            _ => body,
+        };
         self.request("PUT", key, &[], Some(body.as_bytes()), &extra)
     }
 
@@ -419,6 +471,10 @@ impl S3Backend {
             };
             let rel = key[root.len()..].to_owned();
             let lm = lm.or_else(|| modified.get(key.as_str()).copied()).unwrap_or_else(Utc::now);
+            let Some(text) = self.unseal(&key, text) else {
+                self.cache.insert(key, (etag, Cached::Unreadable));
+                continue;
+            };
             let cached = if let Some(stem) = rel.strip_prefix("notes/").and_then(|r| r.strip_suffix(".md")) {
                 match format::read(&text, stem, lm) {
                     format::Object::Note(n) => Cached::Note(n),
@@ -468,13 +524,17 @@ impl S3Backend {
 
 /// Tests the bucket and access key, and that the service honours
 /// conditional writes (without them, two devices could overwrite each
-/// other's edits). Returns the secret to keep.
-pub fn check(config: &Config, keys: &Keys) -> Result<String> {
+/// other's edits). With a passphrase, sets up encryption for the folder or,
+/// if it's encrypted already, checks the passphrase is its key. Returns the
+/// config and secret to keep.
+pub fn check(config: &Config, keys: &Keys, passphrase: Option<&str>) -> Result<(Config, String)> {
+    use base64::Engine;
     if config.bucket.trim().is_empty() {
         bail!("enter the bucket's name");
     }
-    let secret = keys.to_secret();
-    let b = S3Backend::open(config, Some(secret.clone()))?;
+    let plain = Config { encrypted: false, ..config.clone() };
+    let keys = Keys { encryption_key: None, ..keys.clone() };
+    let b = S3Backend::open(&plain, Some(keys.to_secret()))?;
     b.touch().context("writing to the bucket")?;
     b.list("").context("listing the bucket")?;
     b.get(&b.head_key()).context("reading from the bucket")?.context("what was just written can't be read back")?;
@@ -484,7 +544,31 @@ pub fn check(config: &Config, keys: &Keys) -> Result<String> {
         bail!("this storage service ignores conditional writes (If-Match / If-None-Match), so devices could overwrite each other's edits; it can't be used");
     }
     b.touch()?;
-    Ok(secret)
+
+    let settings_key = format!("{}{}", config.root(), crypto::SETTINGS);
+    let existing = match b.get(&settings_key)? {
+        Some((text, _, _)) => Some(serde_json::from_str::<crypto::Settings>(&text).context("the folder's encryption.json is damaged")?),
+        None => None,
+    };
+    let passphrase = passphrase.filter(|p| !p.is_empty());
+    let key = match (existing, passphrase) {
+        (None, None) => None,
+        (Some(_), None) => bail!("this folder is encrypted; enter its encryption key"),
+        (Some(s), Some(p)) => Some(crypto::unlock(p, &s)?),
+        (None, Some(p)) => {
+            let (s, key) = crypto::create(p)?;
+            let r = b.put(&settings_key, &serde_json::to_string_pretty(&s)?, "application/json", Cond::Absent)?;
+            if r.conflict() {
+                bail!("another device set up encryption for this folder just now; try again");
+            }
+            if !r.ok() {
+                return Err(r.error());
+            }
+            Some(key)
+        }
+    };
+    let keys = Keys { encryption_key: key.map(|k| base64::engine::general_purpose::STANDARD.encode(k)), ..keys };
+    Ok((Config { encrypted: key.is_some(), ..config.clone() }, keys.to_secret()))
 }
 
 impl Backend for S3Backend {
@@ -595,10 +679,12 @@ impl Backend for S3Backend {
                 let mut r = self.put(&self.note_key(&stem), &text, MD, Cond::Absent)?;
                 if r.conflict() {
                     // Something is there already under this id.
-                    match self.get(&self.note_key(&stem))? {
-                        Some((existing, etag, _)) => match format::read(&existing, &stem, Utc::now()) {
+                    let key = self.note_key(&stem);
+                    let existing = self.get(&key)?.map(|(raw, etag, _)| (self.unseal(&key, raw), etag));
+                    match existing {
+                        Some((there, etag)) => match there.map(|t| format::read(&t, &stem, Utc::now())) {
                             // Deleted for good earlier: the note comes back.
-                            format::Object::Gone => {
+                            Some(format::Object::Gone) => {
                                 r = self.put(&self.note_key(&stem), &text, MD, Cond::Match(&etag))?;
                                 if r.conflict() {
                                     return Err(Conflict.into());
@@ -606,9 +692,10 @@ impl Backend for S3Backend {
                             }
                             // Our own create whose reply got lost: the next
                             // pull matches it up.
-                            format::Object::Note(n) if n.id == note.id => return Err(Conflict.into()),
-                            // Something else: this note goes next to it.
-                            format::Object::Note(_) => {
+                            Some(format::Object::Note(n)) if n.id == note.id => return Err(Conflict.into()),
+                            // Something else (or unreadable): this note
+                            // goes next to it.
+                            _ => {
                                 stem = format!("{stem}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
                                 r = self.put(&self.note_key(&stem), &text, MD, Cond::Absent)?;
                                 if r.conflict() {
@@ -642,8 +729,10 @@ impl Backend for S3Backend {
                 // Refused: fine if it's deleted already, else it was edited.
                 return match self.get(&key)? {
                     None => Ok(()),
-                    Some((text, _, _)) if format::read(&text, remote_id, now) == format::Object::Gone => Ok(()),
-                    Some(_) => Err(Conflict.into()),
+                    Some((raw, _, _)) => match self.unseal(&key, raw) {
+                        Some(t) if format::read(&t, remote_id, now) == format::Object::Gone => Ok(()),
+                        _ => Err(Conflict.into()),
+                    },
                 };
             }
             _ if !r.ok() => return Err(r.error()),

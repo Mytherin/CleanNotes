@@ -140,6 +140,8 @@ struct S3Form {
     endpoint: String,
     access_key_id: String,
     secret_access_key: String,
+    /// Optional: encrypts the folder's notes with a key made from it.
+    passphrase: String,
 }
 
 impl S3Form {
@@ -150,11 +152,12 @@ impl S3Form {
             region: self.region.trim().to_owned(),
             prefix: self.prefix.trim().trim_matches('/').to_owned(),
             endpoint: (!endpoint.is_empty()).then(|| endpoint.to_owned()),
+            encrypted: false,
         }
     }
 
     fn keys(&self) -> s3::Keys {
-        s3::Keys { access_key_id: self.access_key_id.trim().to_owned(), secret_access_key: self.secret_access_key.trim().to_owned() }
+        s3::Keys { access_key_id: self.access_key_id.trim().to_owned(), secret_access_key: self.secret_access_key.trim().to_owned(), encryption_key: None }
     }
 
     fn ready(&self) -> bool {
@@ -443,6 +446,9 @@ impl App {
                         ui.label(e);
                         ui.end_row();
                     }
+                    ui.label("Encryption:");
+                    ui.label(if c.encrypted { "On (with your encryption key)" } else { "Off" });
+                    ui.end_row();
                 }
                 BackendConfig::Local => {}
             }
@@ -523,6 +529,7 @@ impl App {
                             endpoint: c.endpoint.clone().unwrap_or_default(),
                             access_key_id: String::new(),
                             secret_access_key: String::new(),
+                            passphrase: String::new(),
                         })));
                         self.settings_ui.error = None;
                     }
@@ -678,7 +685,7 @@ impl App {
         let mut start_ck: Option<cloudkit::Config> = None;
         let mut start_sn: Option<(standardnotes::Config, standardnotes::SignInRequest)> = None;
         let mut add_sqlite: Option<(String, String)> = None;
-        let mut start_s3: Option<(s3::Config, s3::Keys)> = None;
+        let mut start_s3: Option<(s3::Config, s3::Keys, String)> = None;
         let sheet = self.settings_ui.sheet.as_mut().unwrap();
         modal(ctx, "add-account", p, |ui| {
             ui.set_width(400.0);
@@ -722,6 +729,7 @@ impl App {
                             endpoint: String::new(),
                             access_key_id: String::new(),
                             secret_access_key: String::new(),
+                            passphrase: String::new(),
                         })));
                     }
                     ui.add_space(6.0);
@@ -918,7 +926,16 @@ impl App {
                         ui.label("Secret access key:");
                         ui.add(egui::TextEdit::singleline(&mut f.secret_access_key).password(true).desired_width(240.0));
                         ui.end_row();
+                        ui.label("Encryption key:");
+                        ui.add(egui::TextEdit::singleline(&mut f.passphrase).password(true).hint_text("optional").desired_width(240.0));
+                        ui.end_row();
                     }));
+                    ui.add_space(4.0);
+                    wrapped(
+                        ui,
+                        "With an encryption key, notes and folders are encrypted on this computer before they're uploaded; other devices need the same key. For a folder that's encrypted already, enter its key. If the key is lost, the notes can't be recovered.",
+                        p.secondary,
+                    );
                     ui.add_space(4.0);
                     wrapped(
                         ui,
@@ -926,7 +943,7 @@ impl App {
                         p.secondary,
                     );
                     if sheet_buttons(ui, p, busy, &error, f.ready(), if fixed { "Save" } else { "Add" }, &mut close) {
-                        start_s3 = Some((f.config(), f.keys()));
+                        start_s3 = Some((f.config(), f.keys(), f.passphrase.clone()));
                     }
                 }
                 Sheet::Sqlite(f) => {
@@ -989,12 +1006,14 @@ impl App {
             self.settings_ui.pending = Some(Pending::CloudKit(rx));
             self.settings_ui.error = None;
         }
-        if let Some((config, keys)) = start_s3 {
+        if let Some((config, keys, passphrase)) = start_s3 {
             let (tx, rx) = mpsc::channel();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
-                let r = s3::check(&config, &keys).map_err(|e| format!("{e:#}"));
-                let _ = tx.send((config, r));
+                let _ = match s3::check(&config, &keys, Some(&passphrase)) {
+                    Ok((config, secret)) => tx.send((config, Ok(secret))),
+                    Err(e) => tx.send((config, Err(format!("{e:#}")))),
+                };
                 ctx.request_repaint();
             });
             self.settings_ui.pending = Some(Pending::S3(rx));
