@@ -522,6 +522,13 @@ impl NotesCore {
         self.lib().move_notes(&ids, &folder);
     }
 
+    /// A note as text to share (Apple Notes' "Send a Copy"): list markers
+    /// and checkboxes written out. None if it's locked and closed.
+    pub fn shared_text(&self, id: String) -> Option<String> {
+        let md = self.lib().plain_body_now(&id)?;
+        Some(cleannotes_core::markdown::from_markdown(&md).shared_text())
+    }
+
     /// A note's Markdown (a locked note's once unlocked).
     pub fn markdown(&self, id: String) -> Option<String> {
         self.lib().plain_body(&id)
@@ -1051,6 +1058,12 @@ impl NoteEditor {
     pub fn plain_text(&self) -> String {
         self.ed().doc.plain_text()
     }
+
+    /// The note as text to share: list markers and checkboxes written out
+    /// (with changes not saved yet).
+    pub fn shared_text(&self) -> String {
+        self.ed().doc.shared_text()
+    }
 }
 
 /// Paragraph kinds and indents, to tell plain typing from a change of
@@ -1242,6 +1255,25 @@ mod tests {
         assert!(e.sync_text("hello brave world".into()));
         assert_eq!(e.plain_text(), "hello brave world");
         assert!(!e.sync_text("hello brave world".into()));
+    }
+
+    #[test]
+    fn notes_are_shared_as_text_and_locked_ones_only_when_open() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.lib().default_folder_id(LOCAL) };
+        let n = core.new_note(home);
+        core.lib().set_body(&n.id, "# List\n- [ ] eggs\n- [x] milk\n");
+        assert_eq!(core.shared_text(n.id.clone()).as_deref(), Some("List\n☐ eggs\n☑ milk"));
+        // The open editor shares what's on screen, saved or not.
+        let e = core.open_editor(n.id.clone()).unwrap();
+        e.command(EditorCommand::SelectAll);
+        e.command(EditorCommand::SetStyle { style: ParagraphStyle::Bulleted });
+        assert_eq!(e.shared_text(), "• List\n• eggs\n• milk");
+
+        core.set_password("pw".into(), "".into()).unwrap();
+        assert_eq!(core.lock_note(n.id.clone()), LockOutcome::Locked);
+        core.lock_now();
+        assert_eq!(core.shared_text(n.id.clone()), None, "a closed locked note isn't shared");
     }
 
     #[test]

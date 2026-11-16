@@ -171,8 +171,10 @@ struct NotesListView: View {
             } else {
                 Button { lockRequest = note.id } label: { Label("Lock Note", systemImage: "lock") }
             }
-            if !note.locked, let text = store.core.markdown(id: note.id) {
-                ShareLink(item: text) { Label("Share Note", systemImage: "square.and.arrow.up") }
+            if !note.locked, let shared = SharedNote(note: note, store: store) {
+                ShareLink(item: shared, subject: Text(note.title), preview: SharePreview(note.title)) {
+                    Label("Share Note", systemImage: "square.and.arrow.up")
+                }
             }
             Button { moving = [note.id] } label: { Label("Move", systemImage: "folder") }
             Button {
