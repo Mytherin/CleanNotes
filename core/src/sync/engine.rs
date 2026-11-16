@@ -107,6 +107,32 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
             return Ok(out);
         }
     }
+    let known: Vec<(&str, &str, &super::NoteData)> = snap
+        .notes
+        .iter()
+        .filter_map(|n| Some((n.sync.remote_id.as_deref()?, n.sync.revision.as_deref()?, n.sync.base.as_ref()?)))
+        .collect();
+    let known_folders: Vec<(&str, &str, &[String])> = snap
+        .folders
+        .iter()
+        .filter_map(|f| Some((f.sync.remote_id.as_deref()?, f.sync.revision.as_deref()?, f.sync.synced_path.as_deref()?)))
+        .collect();
+    backend.known(&known, &known_folders);
+    let result = sync_changes(backend, snap, now, out);
+    let finished = backend.finish();
+    let mut out = result?;
+    if let Err(e) = finished {
+        // What was written is there; other devices may just not notice it
+        // straight away. Tried again next sync.
+        if out.error.is_none() {
+            out.error = Some(format!("{e:#}"));
+        }
+        out.cursor = None;
+    }
+    Ok(out)
+}
+
+fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime<Utc>, mut out: Outcome) -> Result<Outcome> {
     let mut w = snap.as_store();
     let account = snap.account.as_str();
 
@@ -196,7 +222,8 @@ fn push_folders(backend: &mut dyn Backend, w: &mut Store) -> Result<()> {
             continue;
         }
         backend.rename_folder(&remote_id, &old, &path)?;
-        // Folders inside it moved along on the backend.
+        // Folders inside it moved along on the backend. (Rewritten there, so
+        // their revisions are new; the next pull says which.)
         for d in w.folder_and_descendants(id) {
             let new_path = w.folder_path(&d);
             let f = w.folder_mut(&d).unwrap();
@@ -204,10 +231,12 @@ fn push_folders(backend: &mut dyn Backend, w: &mut Store) -> Result<()> {
                 if sp.starts_with(&old) {
                     let rest = sp[old.len()..].to_vec();
                     *sp = path.iter().cloned().chain(rest).collect();
+                    f.sync.revision = None;
                 }
             }
             if d == *id {
                 f.sync.synced_path = Some(new_path);
+                f.sync.revision = None;
             }
         }
     }
@@ -220,6 +249,7 @@ fn push_folders(backend: &mut dyn Backend, w: &mut Store) -> Result<()> {
         let f = w.folder_mut(id).unwrap();
         f.sync.remote_id = Some(remote_id);
         f.sync.synced_path = Some(path);
+        f.sync.revision = None;
     }
     Ok(())
 }
@@ -289,13 +319,16 @@ fn reconcile(
                         f.parent = parent;
                     }
                 }
-                w.folder_mut(&id).unwrap().sync.synced_path = Some(r.path.clone());
+                let f = w.folder_mut(&id).unwrap();
+                f.sync.synced_path = Some(r.path.clone());
+                f.sync.revision = r.revision.clone();
             }
             None => {
                 let id = w.ensure_folder_at(account, &r.path);
                 let f = w.folder_mut(&id).unwrap();
                 f.sync.remote_id = Some(r.remote_id.clone());
                 f.sync.synced_path = Some(r.path.clone());
+                f.sync.revision = r.revision.clone();
             }
         }
     }

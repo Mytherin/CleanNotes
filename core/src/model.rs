@@ -73,6 +73,10 @@ pub struct FolderSync {
     /// The folder's path as the backend last had it; differs from the
     /// current path after a rename here.
     pub synced_path: Option<Vec<String>>,
+    /// The backend's version of the folder at `synced_path`, if it has
+    /// versions (S3: the ETag). `None` once that isn't known to match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -45,6 +45,9 @@ fn notes_are_markdown_files_in_the_folder() {
     assert_eq!(obj.etag, rev);
     assert!(obj.body.starts_with("---\nid: n1\nfolder: [Notes, Recipes]\n"));
     assert!(obj.body.ends_with("---\n# Pancakes\nflour\n"));
+    // `head` is rewritten once the sync's writes are done.
+    assert!(!server.state().objects.contains_key(&format!("{PREFIX}/head")));
+    b.finish().unwrap();
     assert!(server.state().objects.contains_key(&format!("{PREFIX}/head")));
 
     // A fresh backend (another device) reads it back.
@@ -339,6 +342,131 @@ fn two_devices_sync_through_s3() {
     assert_eq!(phone.store.note(&id).unwrap().body, "# Pancakes\nflour (200 g)\neggs\nmilk\n");
 
     // Nothing changed: one HEAD, no listing.
+    server.state().log.clear();
+    laptop.sync();
+    let log = server.state().log.clone();
+    assert!(log.iter().all(|l| l.starts_with("HEAD ")), "{log:?}");
+}
+
+fn note_gets(server: &FakeS3) -> usize {
+    server.state().log.iter().filter(|l| l.starts_with("GET ") && l.contains("/notes/")).count()
+}
+
+#[test]
+fn a_restarted_app_downloads_only_what_changed() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    let folder = laptop.store.ensure_folder_at("s3", &["Notes".into()]);
+    let mut ids = Vec::new();
+    for i in 0..30 {
+        let n = Note::new("s3", &folder, &format!("# Note {i}\n"));
+        ids.push(n.id.clone());
+        laptop.store.notes.push(n);
+    }
+    laptop.sync();
+    phone.sync();
+    assert_eq!(phone.store.notes.iter().filter(|n| n.account == "s3").count(), 30);
+
+    // The phone's app restarts (an empty backend, the saved store) while
+    // the laptop edits one note.
+    phone.backend = backend(&server);
+    let n = laptop.store.note_mut(&ids[7]).unwrap();
+    n.body = "# Note 7\nedited\n".into();
+    n.touch();
+    laptop.sync();
+    server.state().log.clear();
+    phone.sync();
+    assert_eq!(note_gets(&server), 1, "{:?}", server.state().log);
+    assert_eq!(phone.store.note(&ids[7]).unwrap().body, "# Note 7\nedited\n");
+    assert_eq!(phone.store.note(&ids[8]).unwrap().body, "# Note 8\n");
+
+    // A restart with nothing changed: nothing downloaded either, and an
+    // edit made right after still saves (the seeded ETag is the real one).
+    phone.backend = backend(&server);
+    phone.store.account_mut("s3").unwrap().cursor = None;
+    server.state().log.clear();
+    phone.sync();
+    assert_eq!(note_gets(&server), 0, "{:?}", server.state().log);
+    let n = phone.store.note_mut(&ids[8]).unwrap();
+    n.body = "# Note 8\nfrom the phone\n".into();
+    n.touch();
+    phone.sync();
+    laptop.sync();
+    assert_eq!(laptop.store.note(&ids[8]).unwrap().body, "# Note 8\nfrom the phone\n");
+}
+
+fn folder_gets(server: &FakeS3) -> usize {
+    server.state().log.iter().filter(|l| l.starts_with("GET ") && l.contains("/folders/")).count()
+}
+
+#[test]
+fn a_restarted_app_downloads_no_unchanged_folders() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    let work = laptop.store.ensure_folder_at("s3", &["Work".into()]);
+    laptop.store.ensure_folder_at("s3", &["Work".into(), "2026".into()]);
+    let home = laptop.store.ensure_folder_at("s3", &["Home".into()]);
+    laptop.store.notes.push(Note::new("s3", &work, "# Plan\n"));
+    laptop.sync();
+    phone.sync();
+    let paths = |d: &Device| {
+        let mut p: Vec<Vec<String>> = d.store.folders.iter().filter(|f| f.account == "s3").map(|f| d.store.folder_path(&f.id)).collect();
+        p.sort();
+        p
+    };
+    assert_eq!(paths(&phone), paths(&laptop));
+
+    // Restarted, nothing changed: no folder downloaded.
+    let restart = |d: &mut Device| {
+        d.backend = backend(&server);
+        d.store.account_mut("s3").unwrap().cursor = None;
+        server.state().log.clear();
+    };
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 0, "{:?}", server.state().log);
+
+    // Renamed on the laptop (with its subfolder): only those two download.
+    laptop.store.folder_mut(&work).unwrap().name = "Job".into();
+    laptop.sync();
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 2, "{:?}", server.state().log);
+    assert_eq!(paths(&phone), paths(&laptop));
+    assert!(paths(&phone).contains(&vec!["Job".to_owned(), "2026".to_owned()]));
+
+    // Renamed on the phone itself: its sync learns the new ETags, so a
+    // restart after downloads nothing, and the laptop gets the rename.
+    let phone_home = phone.store.folders.iter().find(|f| f.account == "s3" && f.name == "Home").unwrap().id.clone();
+    phone.store.folder_mut(&phone_home).unwrap().name = "House".into();
+    phone.sync();
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 0, "{:?}", server.state().log);
+    laptop.sync();
+    assert_eq!(laptop.store.folder_path(&home), vec!["House"]);
+    assert_eq!(paths(&phone), paths(&laptop));
+}
+
+#[test]
+fn head_is_rewritten_once_per_sync() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    phone.sync();
+    let folder = laptop.store.ensure_folder_at("s3", &["Notes".into()]);
+    for i in 0..10 {
+        laptop.store.notes.push(Note::new("s3", &folder, &format!("# Note {i}\n")));
+    }
+    server.state().log.clear();
+    laptop.sync();
+    let heads = server.state().log.iter().filter(|l| l.starts_with("PUT ") && l.ends_with("/head")).count();
+    assert_eq!(heads, 1, "{:?}", server.state().log);
+    // Other devices notice, and the laptop's own next sync is cheap.
+    phone.sync();
+    assert_eq!(phone.store.notes.iter().filter(|n| n.account == "s3").count(), 10);
     server.state().log.clear();
     laptop.sync();
     let log = server.state().log.clone();

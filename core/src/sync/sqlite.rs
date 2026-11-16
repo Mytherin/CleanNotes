@@ -168,7 +168,7 @@ impl Backend for SqliteBackend {
             path
         };
         let mut snap = Snapshot {
-            folders: folders.iter().map(|f| RemoteFolder { remote_id: f.0.clone(), path: path_of(&f.0) }).collect(),
+            folders: folders.iter().map(|f| RemoteFolder { remote_id: f.0.clone(), path: path_of(&f.0), revision: None }).collect(),
             notes: Vec::new(),
             unreadable: Vec::new(),
         };
