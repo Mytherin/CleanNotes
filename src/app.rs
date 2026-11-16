@@ -16,6 +16,7 @@ use crate::sync::engine::{self, AccountSnapshot};
 use crate::sync::worker::{Reply, Synced, Worker};
 use crate::theme::{self, Palette};
 
+mod import;
 mod list;
 pub mod locked;
 mod note_pane;
@@ -104,6 +105,8 @@ pub struct App {
     pub rename: Option<Rename>,
     pub confirm: Option<Confirm>,
     pub settings_ui: settings_window::SettingsUi,
+    /// The Import Notes sheet, when open.
+    pub import: Option<import::ImportSheet>,
     /// New notes made this session: left empty, they're thrown away.
     fresh: HashSet<String>,
     /// The notes list as shown last frame (for ↑/↓).
@@ -201,6 +204,7 @@ impl App {
             rename: None,
             confirm: None,
             settings_ui: Default::default(),
+            import: None,
             fresh: HashSet::new(),
             shown: Vec::new(),
             scroll_list: true,
@@ -1477,6 +1481,8 @@ impl eframe::App for App {
         self.confirm_dialog(ctx, &p);
         self.lock_sheets(ctx, &p);
         self.settings_window(ctx, &p);
+        self.dropped_files(ctx);
+        self.import_sheet(ctx, &p);
         self.notices_bar(ctx, &p);
         if self.last_purge.elapsed() > StdDuration::from_secs(3600) {
             self.last_purge = Instant::now();

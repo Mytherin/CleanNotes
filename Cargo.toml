@@ -30,6 +30,8 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 hmac = "0.12"
 sha2 = "0.10"
+# Evernote exports refer to attachments by the MD5 hash of their data.
+md5 = { package = "md-5", version = "0.10" }
 pbkdf2 = "0.12"
 hkdf = "0.12"
 argon2 = "0.5"

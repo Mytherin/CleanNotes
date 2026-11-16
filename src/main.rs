@@ -18,6 +18,7 @@ mod app_icon;
 mod db;
 mod doc;
 mod editor;
+mod enex;
 mod fonts;
 mod icons;
 mod lock;
