@@ -23,13 +23,15 @@ final class NotesStore: ObservableObject {
     private var timer: Timer?
     private var noticeTask: Task<Void, Never>?
 
-    init() {
+    /// The notes in `directory` (Application Support/CleanNotes; the tests
+    /// give a folder of their own).
+    init(directory: URL? = nil) {
         let listener = SyncListener()
         var failure: String?
         var opened: NotesCore?
         do {
-            let dir = NotesStore.dataDirectory()
-            let seed = ProcessInfo.processInfo.environment["CLEANNOTES_SEED"] != nil
+            let dir = directory ?? NotesStore.dataDirectory()
+            let seed = directory == nil && ProcessInfo.processInfo.environment["CLEANNOTES_SEED"] != nil
             opened = try NotesCore(dir: dir.path, listener: listener, seed: seed)
         } catch {
             failure = message(error)
