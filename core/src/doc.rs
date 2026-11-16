@@ -422,6 +422,42 @@ impl Doc {
         self.blocks.iter().map(|b| b.text.as_str()).collect::<Vec<_>>().join("\n")
     }
 
+    /// The note as text to send elsewhere (Messages, Mail; Apple Notes'
+    /// "Send a Copy"): list markers, numbers and checkboxes written out,
+    /// nested items indented, a table's rows as lines of tab-separated cells.
+    pub fn shared_text(&self) -> String {
+        let numbers = self.list_numbers();
+        let mut lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < self.blocks.len() {
+            let b = &self.blocks[i];
+            if let Kind::Cell { cols, .. } = b.kind {
+                let cols = (cols as usize).max(1);
+                let mut end = i;
+                while end < self.blocks.len() && self.blocks[end].kind.is_cell() {
+                    end += 1;
+                }
+                for row in self.blocks[i..end].chunks(cols) {
+                    lines.push(row.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\t"));
+                }
+                i = end;
+                continue;
+            }
+            let pad = "    ".repeat(b.indent as usize);
+            let marker = match b.kind {
+                Kind::Bulleted => "• ".to_owned(),
+                Kind::Dashed => "– ".to_owned(),
+                Kind::Numbered => format!("{}. ", numbers[i]),
+                Kind::Checklist(true) => "☑ ".to_owned(),
+                Kind::Checklist(false) => "☐ ".to_owned(),
+                _ => String::new(),
+            };
+            lines.push(format!("{pad}{marker}{}", b.text));
+            i += 1;
+        }
+        lines.join("\n").trim_end_matches('\n').to_owned()
+    }
+
     /// The paragraphs between two positions (partial ones cut).
     pub fn fragment(&self, start: Pos, end: Pos) -> Vec<Block> {
         if start.block == end.block {
@@ -1004,6 +1040,17 @@ pub fn tag_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_text_writes_out_lists_checkboxes_and_tables() {
+        let d = crate::markdown::from_markdown(
+            "# Trip\n- [ ] passport\n- [x] tickets\n1. first\n   1. nested\n2. second\n* dot\n- dash\n> quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n",
+        );
+        assert_eq!(
+            d.shared_text(),
+            "Trip\n☐ passport\n☑ tickets\n1. first\n    1. nested\n2. second\n• dot\n– dash\nquoted\n\na\tb\n1\t2"
+        );
+    }
 
     #[test]
     fn the_caret_steps_over_whole_characters() {

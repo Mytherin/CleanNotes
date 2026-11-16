@@ -109,10 +109,16 @@ struct NoteView: View {
                     .disabled(!(bridge.formatting?.canRedo ?? false))
                     .accessibilityLabel("Redo")
             }
-            if editor != nil, !closed, let text = store.core.markdown(id: noteId) {
-                ShareLink(item: text) {
+            if let editor, !closed {
+                let title = item?.title ?? "Note"
+                ShareLink(
+                    item: SharedNote(title: title, textSize: store.core.settings().textSize, editor: editor),
+                    subject: Text(title),
+                    preview: SharePreview(title)
+                ) {
                     Image(systemName: "square.and.arrow.up")
                 }
+                .accessibilityLabel("Share")
             }
             if let item {
                 noteMenu(item: item, deleted: deleted)
