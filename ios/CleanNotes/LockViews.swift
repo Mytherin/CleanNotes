@@ -11,6 +11,7 @@ struct LockedNoteView: View {
     @State private var asking = false
     @State private var password = ""
     @State private var error: String?
+    @State private var triedBiometrics = false
 
     var body: some View {
         VStack(spacing: 14) {
@@ -20,7 +21,7 @@ struct LockedNoteView: View {
                 .foregroundStyle(.secondary)
             Text("This note is locked.")
                 .font(.title3.bold())
-            Text("Enter the notes password to view locked notes.")
+            Text(Biometrics.ready ? "Use \(Biometrics.name) or enter the notes password to view locked notes." : "Enter the notes password to view locked notes.")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -30,12 +31,9 @@ struct LockedNoteView: View {
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
             }
-            Button("View Note") {
-                password = ""
-                asking = true
-            }
-            .buttonStyle(.borderedProminent)
-            .padding(.top, 6)
+            Button("View Note") { viewNote() }
+                .buttonStyle(.borderedProminent)
+                .padding(.top, 6)
             Spacer()
             Spacer()
         }
@@ -43,22 +41,53 @@ struct LockedNoteView: View {
         .alert("Enter Password", isPresented: $asking) {
             SecureField("Password", text: $password)
             Button("Cancel", role: .cancel) {}
-            Button("OK") { unlock() }
+            Button("OK") { unlock(with: password, typed: true) }
         } message: {
             Text("Enter the password for your locked notes.")
         }
+        .onAppear {
+            // With Face ID on, it's asked for right away, as in Apple Notes.
+            if !triedBiometrics && Biometrics.ready {
+                triedBiometrics = true
+                viewNote()
+            }
+        }
     }
 
-    private func unlock() {
+    /// Face ID if it's on, else (or if it fails) the password.
+    private func viewNote() {
+        password = ""
+        guard Biometrics.ready else {
+            asking = true
+            return
+        }
+        Biometrics.password(reason: "Unlock your locked notes.") { kept in
+            if let kept {
+                unlock(with: kept, typed: false)
+            } else {
+                asking = true
+            }
+        }
+    }
+
+    private func unlock(with password: String, typed: Bool) {
         do {
             try store.core.unlock(id: noteId, password: password)
-            password = ""
+            self.password = ""
             error = nil
+            // A password typed while Face ID is on (say, after it was changed
+            // on another device) is the one Face ID gives from now on.
+            if typed { Biometrics.passwordChanged(to: password) }
             store.changed()
             onUnlocked()
         } catch {
-            password = ""
-            self.error = message(error)
+            self.password = ""
+            if typed {
+                self.error = message(error)
+            } else {
+                // The kept password no longer opens the notes: ask for it.
+                asking = true
+            }
         }
     }
 }
@@ -102,6 +131,7 @@ private struct LockPrompts: ViewModifier {
                     let id = enter
                     do {
                         try store.core.enterPassword(password: password)
+                        Biometrics.passwordChanged(to: password)
                         password = ""
                         enter = nil
                         if let id { lock(id) }
@@ -125,7 +155,18 @@ private struct LockPrompts: ViewModifier {
         switch store.core.lockNote(id: id) {
         case .locked: store.changed()
         case .choosePassword: choose = id
-        case .enterPassword: enter = id
+        case .enterPassword:
+            guard Biometrics.ready else {
+                enter = id
+                return
+            }
+            Biometrics.password(reason: "Lock this note with your notes password.") { kept in
+                if let kept, (try? store.core.enterPassword(password: kept)) != nil {
+                    lock(id)
+                } else {
+                    enter = id
+                }
+            }
         }
     }
 }
@@ -221,6 +262,7 @@ struct ChangePasswordView: View {
                     do {
                         store.saveEditor()
                         _ = try store.core.changePassword(old: old, password: password, hint: hint)
+                        Biometrics.passwordChanged(to: password)
                         store.changed()
                         dismiss()
                     } catch {

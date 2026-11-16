@@ -154,6 +154,20 @@ struct NoteView: View {
                 if !closed {
                     Button { bridge.find() } label: { Label("Find in Note", systemImage: "magnifyingglass") }
                 }
+                if !closed, let f = bridge.formatting, f.style == .checklist {
+                    Menu {
+                        Button { bridge.command(.checkAll) } label: { Label("Check All", systemImage: "checkmark.circle") }
+                            .disabled(!f.checklistHasUnchecked)
+                        Button { bridge.command(.uncheckAll) } label: { Label("Uncheck All", systemImage: "circle") }
+                            .disabled(!f.checklistHasChecked)
+                        Button { bridge.command(.moveCheckedToBottom) } label: { Label("Move Checked to Bottom", systemImage: "arrow.down.to.line") }
+                            .disabled(!f.checklistHasChecked)
+                        Button(role: .destructive) { bridge.command(.deleteChecked) } label: { Label("Delete Checked Items", systemImage: "trash") }
+                            .disabled(!f.checklistHasChecked)
+                    } label: {
+                        Label("Checklist", systemImage: "checklist")
+                    }
+                }
                 Button { moving = true } label: { Label("Move Note", systemImage: "folder") }
                 Button {
                     store.perform { $0.togglePin(id: noteId) }
@@ -170,6 +184,9 @@ struct NoteView: View {
                         store.saveEditor()
                         lockRequest = noteId
                     } label: { Label("Lock", systemImage: "lock") }
+                }
+                if !closed && editor != nil {
+                    Button { bridge.printNote(title: item.title) } label: { Label("Print", systemImage: "printer") }
                 }
                 Divider()
                 Button(role: .destructive) { delete() } label: { Label("Delete", systemImage: "trash") }

@@ -7,6 +7,10 @@ struct SettingsView: View {
     @EnvironmentObject private var store: NotesStore
     @Environment(\.dismiss) private var dismiss
     @State private var setPassword = false
+    @State private var useBiometrics = Biometrics.enabled
+    @State private var askBiometricsPassword = false
+    @State private var biometricsPassword = ""
+    @State private var biometricsError: String?
 
     var body: some View {
         let _ = store.revision
@@ -74,6 +78,20 @@ struct SettingsView: View {
                 Section {
                     if settings.hasLockPassword {
                         NavigationLink("Change Password") { ChangePasswordView() }
+                        if Biometrics.available {
+                            Toggle("Use \(Biometrics.name)", isOn: Binding(
+                                get: { useBiometrics },
+                                set: { on in
+                                    if on {
+                                        biometricsPassword = ""
+                                        askBiometricsPassword = true
+                                    } else {
+                                        Biometrics.turnOff()
+                                        useBiometrics = false
+                                    }
+                                }
+                            ))
+                        }
                     } else {
                         Button("Set Password") { setPassword = true }
                     }
@@ -86,9 +104,26 @@ struct SettingsView: View {
                 } header: {
                     Text("Password")
                 } footer: {
-                    Text("Locked notes are encrypted with this password, here and wherever they sync to.")
+                    if useBiometrics {
+                        Text("Locked notes are encrypted with this password, here and wherever they sync to. \(Biometrics.name) opens them on this iPhone: the password is kept in its keychain, readable only after \(Biometrics.name).")
+                    } else {
+                        Text("Locked notes are encrypted with this password, here and wherever they sync to.")
+                    }
                 }
             }
+            .alert("Use \(Biometrics.name)", isPresented: $askBiometricsPassword) {
+                SecureField("Password", text: $biometricsPassword)
+                Button("Cancel", role: .cancel) { biometricsPassword = "" }
+                Button("OK") { turnOnBiometrics() }
+            } message: {
+                Text("Enter the password for your locked notes.")
+            }
+            .alert("Couldn't Turn On \(Biometrics.name)", isPresented: Binding(get: { biometricsError != nil }, set: { if !$0 { biometricsError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(biometricsError ?? "")
+            }
+            .onAppear { useBiometrics = Biometrics.enabled }
             .navigationTitle("Notes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -100,6 +135,23 @@ struct SettingsView: View {
                     store.changed()
                 }
             }
+        }
+    }
+
+    /// Checks the password, then keeps it for Face ID.
+    private func turnOnBiometrics() {
+        let password = biometricsPassword
+        biometricsPassword = ""
+        do {
+            try store.core.enterPassword(password: password)
+            if Biometrics.turnOn(password: password) {
+                useBiometrics = true
+            } else {
+                biometricsError = "The password couldn't be saved in the keychain. Is a passcode set for this iPhone?"
+            }
+            store.changed()
+        } catch {
+            biometricsError = message(error)
         }
     }
 

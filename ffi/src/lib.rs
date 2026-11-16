@@ -833,6 +833,11 @@ pub struct Formatting {
     pub link: Option<String>,
     pub can_undo: bool,
     pub can_redo: bool,
+    /// The caret is in a checklist with ticked items (Uncheck All, Delete
+    /// Checked).
+    pub checklist_has_checked: bool,
+    /// The caret is in a checklist with unticked items (Check All).
+    pub checklist_has_unchecked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]
@@ -848,6 +853,12 @@ pub enum EditorCommand {
     Outdent,
     MoveUp,
     MoveDown,
+    /// The checklist at the caret: tick every item, untick every item,
+    /// remove the ticked ones, or move them below the others.
+    CheckAll,
+    UncheckAll,
+    DeleteChecked,
+    MoveCheckedToBottom,
     /// Link the selection (or insert the address); `None` removes links.
     SetLink { url: Option<String> },
     Undo,
@@ -970,6 +981,10 @@ impl NoteEditor {
             EditorCommand::Outdent => Command::Outdent,
             EditorCommand::MoveUp => Command::MoveUp,
             EditorCommand::MoveDown => Command::MoveDown,
+            EditorCommand::CheckAll => Command::CheckAll,
+            EditorCommand::UncheckAll => Command::UncheckAll,
+            EditorCommand::DeleteChecked => Command::DeleteChecked,
+            EditorCommand::MoveCheckedToBottom => Command::MoveCheckedToBottom,
             EditorCommand::SetLink { url } => Command::SetLink(url),
             EditorCommand::Undo => Command::Undo,
             EditorCommand::Redo => Command::Redo,
@@ -989,6 +1004,7 @@ impl NoteEditor {
         let b = &e.doc.blocks[e.sel.caret.block.min(e.doc.blocks.len() - 1)];
         let typing = e.typing_style();
         let on = |a: Attr| e.has_attr(a);
+        let (checklist_has_checked, checklist_has_unchecked) = e.checklist_state().unwrap_or((false, false));
         Formatting {
             style: ParagraphStyle::of(b.kind),
             checked: b.kind == Kind::Checklist(true),
@@ -1002,6 +1018,8 @@ impl NoteEditor {
             link: typing.link.as_deref().map(str::to_owned),
             can_undo: e.can_undo(),
             can_redo: e.can_redo(),
+            checklist_has_checked,
+            checklist_has_unchecked,
         }
     }
 

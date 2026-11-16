@@ -18,6 +18,8 @@ struct NotesListView: View {
     @State private var lockRequest: String?
     @State private var visible = false
     @State private var offerUndo = false
+    /// Sections folded away by tapping their header.
+    @State private var collapsed: Set<String> = []
 
     private var deletedView: Bool { place.isDeleted }
 
@@ -84,25 +86,32 @@ struct NotesListView: View {
         List(selection: $selection) {
             ForEach(sections, id: \.title) { section in
                 Section {
-                    ForEach(section.notes) { note in
-                        NavigationLink(value: Route.note(id: note.id, isNew: false)) {
-                            NoteRow(note: note)
-                        }
-                        .tag(note.id)
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) { leadingSwipe(note) }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) { trailingSwipe(note) }
-                        .contextMenu {
-                            noteMenu(note)
-                        } preview: {
-                            NotePreview(id: note.id).environmentObject(store)
+                    if section.title.isEmpty || !collapsed.contains(section.title) {
+                        ForEach(section.notes) { note in
+                            NavigationLink(value: Route.note(id: note.id, isNew: false)) {
+                                NoteRow(note: note)
+                            }
+                            .tag(note.id)
+                            .swipeActions(edge: .leading, allowsFullSwipe: true) { leadingSwipe(note) }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) { trailingSwipe(note) }
+                            .contextMenu {
+                                noteMenu(note)
+                            } preview: {
+                                NotePreview(id: note.id).environmentObject(store)
+                            }
                         }
                     }
                 } header: {
                     if !section.title.isEmpty {
-                        Text(section.title)
-                            .font(.title3.bold())
-                            .foregroundStyle(.primary)
-                            .textCase(nil)
+                        SectionHeader(title: section.title, collapsed: collapsed.contains(section.title)) {
+                            withAnimation {
+                                if collapsed.contains(section.title) {
+                                    collapsed.remove(section.title)
+                                } else {
+                                    collapsed.insert(section.title)
+                                }
+                            }
+                        }
                     }
                 } footer: {
                     if deletedView && section.title == sections.last?.title {
@@ -290,6 +299,34 @@ struct NotesListView: View {
         if restored.place != place && store.core.placeExists(place: restored.place) {
             path.append(.list(restored.place))
         }
+    }
+}
+
+/// A date section's header ("Pinned", "Today", …): tap it to fold the
+/// section away, as in Apple Notes.
+private struct SectionHeader: View {
+    let title: String
+    let collapsed: Bool
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack {
+                Text(title)
+                    .font(.title3.bold())
+                    .foregroundStyle(.primary)
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.notesAccent)
+                    .rotationEffect(.degrees(collapsed ? -90 : 0))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .textCase(nil)
+        .accessibilityLabel(title)
+        .accessibilityHint(collapsed ? "Shows the notes in this section." : "Hides the notes in this section.")
     }
 }
 
