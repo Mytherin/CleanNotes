@@ -19,9 +19,9 @@
 //!   least every 15 minutes even if a device died between a write and
 //!   updating `head`).
 //! - A pull lists the folder and downloads only objects whose ETag changed,
-//!   several at once. Notes still at the ETag this device last synced them
-//!   at aren't downloaded at all ([`Backend::known`]: the saved store has
-//!   them), so a newly started app fetches only what changed meanwhile.
+//!   several at once. Notes and folders still at the ETag this device last
+//!   synced them at aren't downloaded at all ([`Backend::known`]: the saved
+//!   store has them), so a newly started app fetches only what changed.
 //! - Requests are signed with AWS Signature V4 ([`sigv4`]). The access key
 //!   is kept in the OS credential store.
 
@@ -657,7 +657,7 @@ impl Backend for S3Backend {
                 }
             } else if let Some(id) = rel.strip_prefix("folders/").and_then(|r| r.strip_suffix(".json")) {
                 match cached {
-                    Cached::Folder(p) => snap.folders.push(RemoteFolder { remote_id: id.to_owned(), path: p.clone() }),
+                    Cached::Folder(p) => snap.folders.push(RemoteFolder { remote_id: id.to_owned(), path: p.clone(), revision: Some(etag.clone()) }),
                     _ => snap.unreadable.push(id.to_owned()),
                 }
             }
@@ -835,13 +835,18 @@ impl Backend for S3Backend {
         Ok(())
     }
 
-    fn known(&mut self, notes: &[(&str, &str, &NoteData)]) {
-        // An ETag names one version of an object, so a note still at the
-        // ETag it was last synced at holds what was synced then: no need to
-        // download it again. (What was downloaded since is newer; kept.)
+    fn known(&mut self, notes: &[(&str, &str, &NoteData)], folders: &[(&str, &str, &[String])]) {
+        // An ETag names one version of an object, so a note or folder still
+        // at the ETag it was last synced at holds what was synced then: no
+        // need to download it again. (What was downloaded since is newer;
+        // kept.)
         for (remote_id, revision, data) in notes {
             let key = self.note_key(remote_id);
             self.cache.entry(key).or_insert_with(|| (revision.to_string(), Cached::Note((*data).clone())));
+        }
+        for (remote_id, revision, path) in folders.iter().filter(|f| !f.2.is_empty()) {
+            let key = self.folder_key(remote_id);
+            self.cache.entry(key).or_insert_with(|| (revision.to_string(), Cached::Folder(path.to_vec())));
         }
     }
 

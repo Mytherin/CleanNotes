@@ -762,10 +762,10 @@ impl Backend for StandardNotesBackend {
         self.unlock()?;
         let tags = self.tags();
         let mut snap = Snapshot::default();
-        snap.folders.push(RemoteFolder { remote_id: DEFAULT_FOLDER_ID.into(), path: vec![DEFAULT_FOLDER.into()] });
+        snap.folders.push(RemoteFolder { remote_id: DEFAULT_FOLDER_ID.into(), path: vec![DEFAULT_FOLDER.into()], revision: None });
         for (path, id) in &tags.canonical {
             if path.as_slice() != [DEFAULT_FOLDER] {
-                snap.folders.push(RemoteFolder { remote_id: id.clone(), path: path.clone() });
+                snap.folders.push(RemoteFolder { remote_id: id.clone(), path: path.clone(), revision: None });
             }
         }
         snap.folders.sort_by(|a, b| a.path.cmp(&b.path));

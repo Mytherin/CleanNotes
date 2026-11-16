@@ -396,6 +396,60 @@ fn a_restarted_app_downloads_only_what_changed() {
     assert_eq!(laptop.store.note(&ids[8]).unwrap().body, "# Note 8\nfrom the phone\n");
 }
 
+fn folder_gets(server: &FakeS3) -> usize {
+    server.state().log.iter().filter(|l| l.starts_with("GET ") && l.contains("/folders/")).count()
+}
+
+#[test]
+fn a_restarted_app_downloads_no_unchanged_folders() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    let work = laptop.store.ensure_folder_at("s3", &["Work".into()]);
+    laptop.store.ensure_folder_at("s3", &["Work".into(), "2026".into()]);
+    let home = laptop.store.ensure_folder_at("s3", &["Home".into()]);
+    laptop.store.notes.push(Note::new("s3", &work, "# Plan\n"));
+    laptop.sync();
+    phone.sync();
+    let paths = |d: &Device| {
+        let mut p: Vec<Vec<String>> = d.store.folders.iter().filter(|f| f.account == "s3").map(|f| d.store.folder_path(&f.id)).collect();
+        p.sort();
+        p
+    };
+    assert_eq!(paths(&phone), paths(&laptop));
+
+    // Restarted, nothing changed: no folder downloaded.
+    let restart = |d: &mut Device| {
+        d.backend = backend(&server);
+        d.store.account_mut("s3").unwrap().cursor = None;
+        server.state().log.clear();
+    };
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 0, "{:?}", server.state().log);
+
+    // Renamed on the laptop (with its subfolder): only those two download.
+    laptop.store.folder_mut(&work).unwrap().name = "Job".into();
+    laptop.sync();
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 2, "{:?}", server.state().log);
+    assert_eq!(paths(&phone), paths(&laptop));
+    assert!(paths(&phone).contains(&vec!["Job".to_owned(), "2026".to_owned()]));
+
+    // Renamed on the phone itself: its sync learns the new ETags, so a
+    // restart after downloads nothing, and the laptop gets the rename.
+    let phone_home = phone.store.folders.iter().find(|f| f.account == "s3" && f.name == "Home").unwrap().id.clone();
+    phone.store.folder_mut(&phone_home).unwrap().name = "House".into();
+    phone.sync();
+    restart(&mut phone);
+    phone.sync();
+    assert_eq!(folder_gets(&server), 0, "{:?}", server.state().log);
+    laptop.sync();
+    assert_eq!(laptop.store.folder_path(&home), vec!["House"]);
+    assert_eq!(paths(&phone), paths(&laptop));
+}
+
 #[test]
 fn head_is_rewritten_once_per_sync() {
     let server = FakeS3::start();

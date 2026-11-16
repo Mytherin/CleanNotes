@@ -85,6 +85,9 @@ pub struct RemoteNote {
 pub struct RemoteFolder {
     pub remote_id: String,
     pub path: Vec<String>,
+    /// The folder's version, for a backend that has them (see
+    /// [`Backend::known`]).
+    pub revision: Option<String>,
 }
 
 /// Everything an account holds on its backend.
@@ -164,11 +167,11 @@ pub trait Backend: Send {
     /// [`Conflict`] returned: an edit beats a delete.
     fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> anyhow::Result<()>;
 
-    /// The notes this device has synced, as (remote id, revision, the note
-    /// at that revision), from the saved store; given before pulling. A
-    /// backend may take them as already downloaded, so a newly started app
-    /// fetches only what changed.
-    fn known(&mut self, _notes: &[(&str, &str, &NoteData)]) {}
+    /// The notes and folders this device has synced, as (remote id,
+    /// revision, the note or folder path at that revision), from the saved
+    /// store; given before pulling. A backend may take them as already
+    /// downloaded, so a newly started app fetches only what changed.
+    fn known(&mut self, _notes: &[(&str, &str, &NoteData)], _folders: &[(&str, &str, &[String])]) {}
 
     /// Called at the end of every sync that got past the cursor check,
     /// also one that failed, to finish work the backend put off (such as

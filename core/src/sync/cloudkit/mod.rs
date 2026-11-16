@@ -420,7 +420,7 @@ impl Backend for CloudKitBackend {
                         continue;
                     }
                     self.folders.insert(id.clone(), (path.clone(), r["recordChangeTag"].as_str().unwrap_or("").to_owned()));
-                    snap.folders.push(RemoteFolder { remote_id: id, path });
+                    snap.folders.push(RemoteFolder { remote_id: id, path, revision: None });
                 }
                 Some("Note") => {
                     match Self::read_note(r) {

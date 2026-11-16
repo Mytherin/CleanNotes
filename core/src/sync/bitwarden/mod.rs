@@ -465,7 +465,7 @@ impl Backend for BitwardenBackend {
                 paths.insert(f.id.clone(), path);
                 continue;
             }
-            snap.folders.push(RemoteFolder { remote_id: f.id.clone(), path: path.clone() });
+            snap.folders.push(RemoteFolder { remote_id: f.id.clone(), path: path.clone(), revision: None });
             paths.insert(f.id, path);
         }
         self.ciphers.clear();
