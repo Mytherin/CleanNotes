@@ -2,7 +2,7 @@
 //! as Cloudflare R2 or MinIO) under a folder (key prefix) of your choice:
 //!
 //! ```text
-//! <folder>/head                  changes with every write (cheap polling)
+//! <folder>/head                  changes after every write (cheap polling)
 //! <folder>/notes/<id>.md         a note: front matter + Markdown (see format)
 //! <folder>/folders/<id>.json     a folder: its path, as a JSON list
 //! ```
@@ -13,11 +13,15 @@
 //! - Deleting a note for good leaves a tombstone, written with `If-Match`
 //!   too, so an edit made elsewhere beats the delete. Tombstones are cleaned
 //!   up after 30 days.
-//! - Every write also rewrites `head`. [`Backend::cursor`] is a `HEAD` of it
-//!   (plus a quarter-hour counter, so everything is listed at least every
-//!   15 minutes even if a device died between a write and updating `head`).
+//! - A sync's writes are followed by rewriting `head`, once (before the
+//!   sync next reads the cursor, or at its end). [`Backend::cursor`] is a
+//!   `HEAD` of it (plus a quarter-hour counter, so everything is listed at
+//!   least every 15 minutes even if a device died between a write and
+//!   updating `head`).
 //! - A pull lists the folder and downloads only objects whose ETag changed,
-//!   several at once.
+//!   several at once. Notes still at the ETag this device last synced them
+//!   at aren't downloaded at all ([`Backend::known`]: the saved store has
+//!   them), so a newly started app fetches only what changed meanwhile.
 //! - Requests are signed with AWS Signature V4 ([`sigv4`]). The access key
 //!   is kept in the OS credential store.
 
@@ -271,6 +275,8 @@ pub struct S3Backend {
     key: Option<[u8; 32]>,
     /// Objects as last downloaded: key → (ETag, contents).
     cache: HashMap<String, (String, Cached)>,
+    /// Written since `head` was last rewritten (see [`Self::mark_changed`]).
+    pending_touch: bool,
 }
 
 impl S3Backend {
@@ -289,7 +295,7 @@ impl S3Backend {
             None if config.encrypted => return Err(NeedsSignIn("the encryption key is missing".into()).into()),
             None => None,
         };
-        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new() })
+        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new(), pending_touch: false })
     }
 
     /// A key's name inside the folder (what encryption binds an object to).
@@ -409,6 +415,21 @@ impl S3Backend {
         let r = self.put(&self.head_key(), &uuid::Uuid::new_v4().to_string(), "text/plain", Cond::None)?;
         if !r.ok() {
             return Err(r.error());
+        }
+        Ok(())
+    }
+
+    /// Notes that something was written: `head` is rewritten once, before
+    /// the cursor is next read or when the sync ends, rather than after
+    /// every write.
+    fn mark_changed(&mut self) {
+        self.pending_touch = true;
+    }
+
+    fn flush_touch(&mut self) -> Result<()> {
+        if self.pending_touch {
+            self.touch()?;
+            self.pending_touch = false;
         }
         Ok(())
     }
@@ -605,6 +626,8 @@ pub fn check(config: &Config, keys: &Keys, passphrase: Option<&str>) -> Result<(
 
 impl Backend for S3Backend {
     fn cursor(&mut self) -> Result<Option<String>> {
+        // Our own writes first, so the cursor read covers them.
+        self.flush_touch()?;
         let r = self.request("HEAD", &self.head_key(), &[], None, &[])?;
         let etag = match r.status {
             404 => "none".to_owned(),
@@ -657,7 +680,7 @@ impl Backend for S3Backend {
         if !r.ok() {
             return Err(r.error());
         }
-        self.touch()?;
+        self.mark_changed();
         Ok(id)
     }
 
@@ -700,7 +723,7 @@ impl Backend for S3Backend {
             let r = self.put(&key, &format::write(&n), "text/markdown; charset=utf-8", Cond::Match(&etag))?;
             if r.conflict() {
                 if changed {
-                    self.touch()?;
+                    self.mark_changed();
                 }
                 bail!("a note was changed on another device during the folder rename; will try again");
             }
@@ -713,7 +736,7 @@ impl Backend for S3Backend {
             changed = true;
         }
         if changed {
-            self.touch()?;
+            self.mark_changed();
         }
         Ok(())
     }
@@ -725,7 +748,8 @@ impl Backend for S3Backend {
             return Err(r.error());
         }
         self.cache.remove(&key);
-        self.touch()
+        self.mark_changed();
+        Ok(())
     }
 
     fn save_note(&mut self, remote_id: Option<&str>, base_revision: Option<&str>, note: &NoteData) -> Result<(String, String)> {
@@ -780,7 +804,7 @@ impl Backend for S3Backend {
         }
         let etag = r.etag.context("S3 sent no ETag for the saved note")?;
         self.cache.insert(self.note_key(&stem), (etag.clone(), Cached::Note(note.clone())));
-        self.touch()?;
+        self.mark_changed();
         Ok((stem, etag))
     }
 
@@ -807,6 +831,21 @@ impl Backend for S3Backend {
         if let Some(e) = r.etag {
             self.cache.insert(key, (e, Cached::Gone(now)));
         }
-        self.touch()
+        self.mark_changed();
+        Ok(())
+    }
+
+    fn known(&mut self, notes: &[(&str, &str, &NoteData)]) {
+        // An ETag names one version of an object, so a note still at the
+        // ETag it was last synced at holds what was synced then: no need to
+        // download it again. (What was downloaded since is newer; kept.)
+        for (remote_id, revision, data) in notes {
+            let key = self.note_key(remote_id);
+            self.cache.entry(key).or_insert_with(|| (revision.to_string(), Cached::Note((*data).clone())));
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.flush_touch()
     }
 }

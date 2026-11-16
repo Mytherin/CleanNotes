@@ -164,6 +164,19 @@ pub trait Backend: Send {
     /// [`Conflict`] returned: an edit beats a delete.
     fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> anyhow::Result<()>;
 
+    /// The notes this device has synced, as (remote id, revision, the note
+    /// at that revision), from the saved store; given before pulling. A
+    /// backend may take them as already downloaded, so a newly started app
+    /// fetches only what changed.
+    fn known(&mut self, _notes: &[(&str, &str, &NoteData)]) {}
+
+    /// Called at the end of every sync that got past the cursor check,
+    /// also one that failed, to finish work the backend put off (such as
+    /// marking for other devices that something changed).
+    fn finish(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Credentials the backend renewed since last asked, to be saved in
     /// place of the old ones.
     fn renewed_secret(&mut self) -> Option<String> {

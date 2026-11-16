@@ -107,6 +107,27 @@ pub fn sync_account(backend: &mut dyn Backend, snap: &AccountSnapshot, now: Date
             return Ok(out);
         }
     }
+    let known: Vec<(&str, &str, &super::NoteData)> = snap
+        .notes
+        .iter()
+        .filter_map(|n| Some((n.sync.remote_id.as_deref()?, n.sync.revision.as_deref()?, n.sync.base.as_ref()?)))
+        .collect();
+    backend.known(&known);
+    let result = sync_changes(backend, snap, now, out);
+    let finished = backend.finish();
+    let mut out = result?;
+    if let Err(e) = finished {
+        // What was written is there; other devices may just not notice it
+        // straight away. Tried again next sync.
+        if out.error.is_none() {
+            out.error = Some(format!("{e:#}"));
+        }
+        out.cursor = None;
+    }
+    Ok(out)
+}
+
+fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime<Utc>, mut out: Outcome) -> Result<Outcome> {
     let mut w = snap.as_store();
     let account = snap.account.as_str();
 
