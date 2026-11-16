@@ -22,6 +22,7 @@ struct NoteView: View {
     @State private var linkAlert = false
     @State private var linkURL = ""
     @State private var syncToken = UUID()
+    @State private var showedSearch = false
 
     var body: some View {
         let _ = store.revision
@@ -83,7 +84,10 @@ struct NoteView: View {
         } message: {
             Text("This action can't be undone.")
         }
-        .onAppear { open() }
+        .onAppear {
+            open()
+            showSearch()
+        }
         .onDisappear { leave() }
         .onChange(of: store.revision) { _, _ in
             // Locked by Lock Now (or the core) meanwhile.
@@ -211,6 +215,18 @@ struct NoteView: View {
     }
 
     // ---- Opening and leaving ----
+
+    /// Opened from search results: the note's matches are shown at once
+    /// (Find in Note with the search's first word), as Apple Notes
+    /// highlights them. Once, not on coming back to the note.
+    private func showSearch() {
+        guard !showedSearch, !startEditing, !closed, editor != nil else { return }
+        showedSearch = true
+        guard let word = store.search.split(whereSeparator: \.isWhitespace).first else { return }
+        let query = String(word)
+        // Once the text view is on screen.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { bridge.find(query) }
+    }
 
     /// Opens the note (again, coming back to it from a note pushed on top).
     private func open() {

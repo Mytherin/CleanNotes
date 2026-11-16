@@ -106,6 +106,18 @@ pub struct NoteItem {
     pub pinned: bool,
     pub locked: bool,
     pub deleted: bool,
+    /// While searching: the title, and the snippet from the line where the
+    /// words are, in parts with the matches marked (shown in bold). Empty
+    /// otherwise.
+    pub title_parts: Vec<TextPart>,
+    pub snippet_parts: Vec<TextPart>,
+}
+
+/// Part of a search result's text: a match of the search, or not.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TextPart {
+    pub text: String,
+    pub matched: bool,
 }
 
 /// A section of the notes list ("Pinned", "Today", …; the title is empty
@@ -470,7 +482,18 @@ impl NotesCore {
             .into_iter()
             .map(|(title, ids)| NoteSection {
                 title,
-                notes: ids.iter().filter_map(|id| lib.note_row(id, &loc, show_folder)).map(item).collect(),
+                notes: ids
+                    .iter()
+                    .filter_map(|id| {
+                        let mut it = item(lib.note_row(id, &loc, show_folder)?);
+                        if let Some((t, s)) = lib.search_parts(id, &search) {
+                            it.snippet = s.iter().map(|(text, _)| text.as_str()).collect();
+                            it.title_parts = parts(t);
+                            it.snippet_parts = parts(s);
+                        }
+                        Some(it)
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -783,7 +806,13 @@ fn item(r: library::NoteRow) -> NoteItem {
         pinned: r.pinned,
         locked: r.locked,
         deleted: r.deleted,
+        title_parts: Vec::new(),
+        snippet_parts: Vec::new(),
     }
+}
+
+fn parts(p: Vec<(String, bool)>) -> Vec<TextPart> {
+    p.into_iter().map(|(text, matched)| TextPart { text, matched }).collect()
 }
 
 /// The local account's id (notes on this iPhone only).
@@ -1404,6 +1433,27 @@ mod tests {
                 e.select(after, after);
             }
         }
+    }
+
+    #[test]
+    fn search_results_come_in_sections_with_matches_marked() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.default_folder() };
+        let a = core.new_note(home.clone()).id;
+        core.lib().set_body(&a, "# Milk run\nshop\n");
+        let b = core.new_note(home.clone()).id;
+        core.lib().set_body(&b, "# Pancakes\nflour and milk\n");
+        let sections = core.sections(Place::AllNotes, "milk".into());
+        let titles: Vec<&str> = sections.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Top Hits", "Notes"]);
+        let top = &sections[0].notes[0];
+        assert_eq!(top.id, a);
+        assert_eq!(top.title_parts, [TextPart { text: "Milk".into(), matched: true }, TextPart { text: " run".into(), matched: false }]);
+        let other = &sections[1].notes[0];
+        assert_eq!(other.snippet, "flour and milk");
+        assert!(other.snippet_parts.iter().any(|p| p.matched && p.text == "milk"));
+        // Not searching: no parts.
+        assert!(core.sections(home, String::new()).iter().flat_map(|s| &s.notes).all(|n| n.title_parts.is_empty()));
     }
 
     #[test]

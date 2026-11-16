@@ -41,6 +41,7 @@ struct NotesListView: View {
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.large)
         .searchable(text: $search, prompt: "Search")
+        .onChange(of: search) { _, s in store.search = s }
         .refreshable { await store.refresh() }
         .environment(\.editMode, $editMode)
         .toolbar { toolbar(settings: settings, count: count, sections: sections) }
@@ -74,6 +75,7 @@ struct NotesListView: View {
         }
         .onAppear {
             visible = true
+            store.search = search
             if store.core.placeExists(place: place) { store.core.rememberPlace(place: place) }
         }
         .onDisappear { visible = false }
@@ -337,10 +339,19 @@ private struct SectionHeader: View {
 struct NoteRow: View {
     let note: NoteItem
 
+    /// Text with a search's matches in bold (as Apple Notes shows search
+    /// results); just the text when not searching.
+    static func text(_ plain: String, parts: [TextPart]) -> Text {
+        guard !parts.isEmpty else { return Text(plain) }
+        return parts.reduce(Text("")) { shown, part in
+            shown + (part.matched ? Text(part.text).bold().foregroundStyle(.primary) : Text(part.text))
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 4) {
-                Text(note.title)
+                NoteRow.text(note.title, parts: note.titleParts)
                     .font(.headline)
                     .lineLimit(1)
                 if note.locked {
@@ -352,7 +363,7 @@ struct NoteRow: View {
             HStack(spacing: 6) {
                 Text(note.time)
                     .foregroundStyle(.primary)
-                Text(note.snippet)
+                NoteRow.text(note.snippet, parts: note.snippetParts)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }

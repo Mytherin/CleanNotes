@@ -27,6 +27,8 @@ struct FoldersView: View {
         }
         .navigationTitle("Folders")
         .searchable(text: $search, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search")
+        .onChange(of: search) { _, s in store.search = s }
+        .onAppear { store.search = search }
         .refreshable { await store.refresh() }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -301,16 +303,30 @@ struct SearchResults: View {
 
     var body: some View {
         let _ = store.revision
-        let notes = store.core.sections(place: .allNotes, search: search).flatMap(\.notes)
-        List {
-            Section(notes.isEmpty ? "No Results" : "Top Hits") {
-                ForEach(notes) { n in
-                    NavigationLink(value: Route.note(id: n.id, isNew: false)) {
-                        NoteRow(note: n)
+        // Top Hits (titles that match), then Notes, as in Apple Notes.
+        let sections = store.core.sections(place: .allNotes, search: search)
+        Group {
+            if sections.isEmpty {
+                ContentUnavailableView.search(text: search)
+            } else {
+                List {
+                    ForEach(sections, id: \.title) { section in
+                        Section {
+                            ForEach(section.notes) { n in
+                                NavigationLink(value: Route.note(id: n.id, isNew: false)) {
+                                    NoteRow(note: n)
+                                }
+                            }
+                        } header: {
+                            Text(section.title)
+                                .font(.title3.bold())
+                                .foregroundStyle(.primary)
+                                .textCase(nil)
+                        }
                     }
                 }
+                .listStyle(.insetGrouped)
             }
         }
-        .listStyle(.insetGrouped)
     }
 }

@@ -12,6 +12,9 @@ final class NotesStore: ObservableObject {
     @Published private(set) var revision = 0
     /// A message shown at the bottom for a few seconds.
     @Published var notice: String?
+    /// What the list on screen is searching for: a note opened from the
+    /// results shows where it's found.
+    var search = ""
     /// The core couldn't open the notes.
     let startupError: String?
 

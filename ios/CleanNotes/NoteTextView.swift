@@ -666,9 +666,14 @@ final class EditorBridge: ObservableObject {
     func toggleFormatPanel() { coordinator?.toggleFormatPanel() }
     func endEditing() { coordinator?.textView?.resignFirstResponder() }
     func beginEditing() { coordinator?.textView?.becomeFirstResponder() }
-    func find() {
-        guard let tv = coordinator?.textView else { return }
-        tv.findInteraction?.presentFindNavigator(showingReplace: false)
+    /// Find in Note; with `text`, its matches are found and shown at once
+    /// (a note opened from search results).
+    func find(_ text: String = "") {
+        guard let tv = coordinator?.textView, let finder = tv.findInteraction else { return }
+        if !text.isEmpty {
+            finder.searchText = text
+        }
+        finder.presentFindNavigator(showingReplace: false)
     }
     func linkAtSelection() -> String { coordinator?.editor.linkAtSelection() ?? "" }
 

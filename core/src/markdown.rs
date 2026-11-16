@@ -796,6 +796,31 @@ pub fn snippet_of(md: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// The snippet for a search result: the first line after the title with a
+/// match of one of `words`, from a little before the match ("…" where it's
+/// cut); the usual snippet if only the title matches.
+pub fn search_snippet_of(md: &str, words: &[&str], max_chars: usize) -> String {
+    const BEFORE: usize = 24;
+    for line in plain_lines(md).skip(1) {
+        if let Some(first) = crate::doc::match_ranges(&line, words).first() {
+            let chars: Vec<char> = line.chars().collect();
+            let start = first.start.saturating_sub(BEFORE);
+            // Cut at a word's start.
+            let start = if start == 0 {
+                0
+            } else {
+                (start..first.start).find(|&i| chars[i - 1].is_whitespace()).unwrap_or(start)
+            };
+            let mut s: String = chars[start..].iter().take(max_chars).collect();
+            if start > 0 {
+                s.insert(0, '…');
+            }
+            return s;
+        }
+    }
+    snippet_of(md, max_chars)
+}
+
 /// A note's lines with text, as plain text, trimmed.
 fn plain_lines(md: &str) -> impl Iterator<Item = String> + '_ {
     // The open code block's fence, closed (as in `from_markdown`) only by a

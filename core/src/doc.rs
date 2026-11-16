@@ -1099,9 +1099,92 @@ pub fn tag_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     }
     out
 }
+
+/// Text folded for case-insensitive search, character by character, so
+/// positions in it are positions in `s` (whole-string lowercasing would
+/// turn a final Σ into ς; the few characters that lowercase to two are
+/// kept as they are).
+pub fn fold_case(s: &str) -> Vec<char> {
+    s.chars()
+        .flat_map(|c| {
+            let l: Vec<char> = c.to_lowercase().collect();
+            if l.len() == 1 {
+                l
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// The char ranges of `text` where any of `words` matches (case
+/// insensitive), merged where they touch or overlap.
+pub fn match_ranges(text: &str, words: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let t = fold_case(text);
+    let mut hits: Vec<std::ops::Range<usize>> = Vec::new();
+    for w in words {
+        let q = fold_case(w);
+        if q.is_empty() || q.len() > t.len() {
+            continue;
+        }
+        for i in 0..=t.len() - q.len() {
+            if t[i..i + q.len()] == q[..] {
+                hits.push(i..i + q.len());
+            }
+        }
+    }
+    hits.sort_by_key(|r| r.start);
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    for r in hits {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    merged
+}
+
+/// `text` in parts, each marked if it's a match of one of `words`: for
+/// showing search results with the matches in bold.
+pub fn highlight_parts(text: &str, words: &[&str]) -> Vec<(String, bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    for r in match_ranges(text, words) {
+        if r.start > at {
+            out.push((chars[at..r.start].iter().collect(), false));
+        }
+        out.push((chars[r.clone()].iter().collect(), true));
+        at = r.end;
+    }
+    if at < chars.len() || out.is_empty() {
+        out.push((chars[at..].iter().collect(), false));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_matches_are_found_case_insensitively_and_merged() {
+        assert_eq!(match_ranges("Straße and STRASSE", &["straße"]), [0..6]);
+        assert_eq!(match_ranges("ΟΔΟΣ", &["οδοσ"]), [0..4]);
+        // Overlapping and touching matches of different words become one.
+        assert_eq!(match_ranges("milkshake", &["milk", "shake", "lks"]), [0..9]);
+        assert_eq!(
+            highlight_parts("Buy Milk and more milk", &["milk"]),
+            [
+                ("Buy ".to_owned(), false),
+                ("Milk".to_owned(), true),
+                (" and more ".to_owned(), false),
+                ("milk".to_owned(), true)
+            ]
+        );
+        assert_eq!(highlight_parts("nothing", &["x"]), [("nothing".to_owned(), false)]);
+        assert_eq!(highlight_parts("", &["x"]), [(String::new(), false)]);
+    }
 
     #[test]
     fn shared_text_writes_out_lists_checkboxes_and_tables() {

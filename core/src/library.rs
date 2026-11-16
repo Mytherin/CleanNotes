@@ -374,7 +374,19 @@ impl Library {
             _ => notes.sort_by(|a, b| key(b).cmp(&key(a))),
         }
         if searching {
-            return vec![(String::new(), notes.iter().map(|n| n.id.clone()).collect())];
+            // As in Apple Notes: notes whose title matches first, as Top Hits.
+            let title_hit = |n: &Note| {
+                let t = n.title().to_lowercase();
+                words.iter().all(|w| t.contains(w.as_str()))
+            };
+            let (top, rest): (Vec<&Note>, Vec<&Note>) = notes.iter().copied().partition(|n| title_hit(n));
+            let mut out = Vec::new();
+            for (name, group) in [("Top Hits", top), ("Notes", rest)] {
+                if !group.is_empty() {
+                    out.push((name.to_owned(), group.iter().map(|n| n.id.clone()).collect()));
+                }
+            }
+            return out;
         }
         let mut sections: Vec<(String, Vec<String>)> = Vec::new();
         let mut push = |name: String, id: &str| match sections.last_mut() {
@@ -430,6 +442,20 @@ impl Library {
             locked,
             deleted: n.deleted.is_some(),
         })
+    }
+
+    /// A search result's title and snippet, in parts with the matches of
+    /// the search's words marked (to show them in bold); the snippet is the
+    /// line where the words are found. `None` when not searching.
+    pub fn search_parts(&self, id: &str, search: &str) -> Option<(Vec<(String, bool)>, Vec<(String, bool)>)> {
+        let words: Vec<&str> = search.split_whitespace().collect();
+        if words.is_empty() {
+            return None;
+        }
+        let n = self.store.note(id)?;
+        let row = self.note_row(id, &Location::All, false)?;
+        let snippet = if row.locked || row.empty { row.snippet } else { markdown::search_snippet_of(&n.body, &words, 120) };
+        Some((crate::doc::highlight_parts(&row.title, &words), crate::doc::highlight_parts(&snippet, &words)))
     }
 
     /// Whether a list at `loc` shows each note's folder (All Notes, tags and
@@ -1466,6 +1492,30 @@ mod tests {
         lib.settings.last_folder = Some(home.clone());
         lib.settings.last_note = Some(there);
         assert_eq!(lib.initial_location(), (Location::Folder(home), Some(here)));
+    }
+
+    #[test]
+    fn search_puts_title_matches_first_and_shows_where_the_words_are() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let shopping = add(&mut lib, &home, "# Shopping\nmilk, bread\n");
+        let recipe = add(&mut lib, &home, "# Pancakes\nBeat the eggs in a large bowl with a fork, then pour in the milk slowly\n");
+        add(&mut lib, &home, "# Other\nnothing here\n");
+        let loc = Location::Folder(home);
+        let sections = lib.list_sections(&loc, "MILK");
+        assert_eq!(sections, [("Notes".to_owned(), vec![recipe.clone(), shopping.clone()])]);
+        let sections = lib.list_sections(&loc, "shop milk");
+        assert_eq!(sections, [("Notes".to_owned(), vec![shopping.clone()])], "every word must match");
+        let sections = lib.list_sections(&loc, "pan");
+        assert_eq!(sections, [("Top Hits".to_owned(), vec![recipe.clone()])]);
+
+        let (title, snippet) = lib.search_parts(&recipe, "milk pour").unwrap();
+        assert_eq!(title, [("Pancakes".to_owned(), false)]);
+        let text: String = snippet.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(text.starts_with("…bowl with a fork, then pour"), "cut a little before the match: {text}");
+        let bold: Vec<&str> = snippet.iter().filter(|(_, m)| *m).map(|(t, _)| t.as_str()).collect();
+        assert_eq!(bold, ["pour", "milk"]);
+        assert!(lib.search_parts(&recipe, "  ").is_none());
     }
 
     #[test]

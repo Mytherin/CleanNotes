@@ -760,21 +760,8 @@ impl Editing {
 
     /// Matches of `query` (case-insensitive) as (block, char range).
     pub fn matches(&self, query: &str) -> Vec<(usize, std::ops::Range<usize>)> {
-        // Query and text are folded the same way, character by character
-        // (whole-string lowercasing would turn a final Σ into ς, say).
-        let fold = |s: &str| -> Vec<char> {
-            s.chars()
-                .flat_map(|c| {
-                    let l: Vec<char> = c.to_lowercase().collect();
-                    // Keep char positions aligned (a few characters lowercase to two).
-                    if l.len() == 1 {
-                        l
-                    } else {
-                        vec![c]
-                    }
-                })
-                .collect()
-        };
+        // Query and text are folded the same way, character by character.
+        let fold = crate::doc::fold_case;
         let q = fold(query);
         if q.is_empty() {
             return vec![];
