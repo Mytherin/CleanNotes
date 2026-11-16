@@ -62,14 +62,20 @@ impl AccountSnapshot {
 
     /// Anything to upload.
     pub fn has_local_changes(&self) -> bool {
-        let s = self.as_store();
-        !self.tombstones.is_empty()
-            || self.notes.iter().any(|n| n.sync.dirty || n.sync.remote_id.is_none())
-            || self
-                .folders
-                .iter()
-                .any(|f| f.sync.remote_id.is_none() || f.sync.synced_path.as_ref() != Some(&s.folder_path(&f.id)))
+        has_local_changes(&self.as_store(), &self.account) || !self.tombstones.is_empty()
     }
+}
+
+/// Whether an account has anything to upload, read straight from the store
+/// (nothing copied: the app asks this every frame).
+pub fn has_local_changes(store: &Store, account: &str) -> bool {
+    store.tombstones.iter().any(|t| t.account == account)
+        || store.notes.iter().any(|n| n.account == account && (n.sync.dirty || n.sync.remote_id.is_none()))
+        || store
+            .folders
+            .iter()
+            .filter(|f| f.account == account)
+            .any(|f| f.sync.remote_id.is_none() || f.sync.synced_path.as_ref() != Some(&store.folder_path(&f.id)))
 }
 
 /// What a sync made of the account.

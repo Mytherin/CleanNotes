@@ -92,7 +92,7 @@ impl App {
         let full = ui.max_rect();
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
-        let sections = self.list_sections();
+        let sections = self.cached_sections();
         self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
         self.list_header(ui, p, bar, bar.right() - 30.0);
 
@@ -129,6 +129,15 @@ impl App {
 
     fn note_row(&mut self, ui: &mut Ui, p: &Palette, id: &str, show_folder: bool, separator: bool) {
         let Some(n) = self.store.note(id) else { return };
+        // Off screen: only its space (reading its title and snippet for
+        // every note, every frame, made the whole window slow).
+        let folder_known = show_folder && self.store.folder(&n.folder).is_some();
+        let h = if folder_known { ROW_H + 16.0 } else { ROW_H };
+        let next = Rect::from_min_size(ui.cursor().min, Vec2::new(ui.available_width(), h));
+        if !ui.is_rect_visible(next) && !(self.scroll_list && self.is_selected(id)) {
+            ui.allocate_exact_size(next.size(), Sense::hover());
+            return;
+        }
         let title = n.title();
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let locked = crate::lock::is_locked(&n.body);
@@ -137,7 +146,6 @@ impl App {
         let when = if n.deleted.is_some() && matches!(self.location, Location::Deleted(_)) { n.deleted.unwrap() } else if self.settings.sort_by == crate::settings::SortBy::Created { n.created } else { n.modified };
         let time = list_time(when);
         let folder = show_folder.then(|| self.store.folder(&n.folder).map(|f| f.name.clone())).flatten();
-        let h = if folder.is_some() { ROW_H + 16.0 } else { ROW_H };
         let selected = self.is_selected(id);
         let active = selected && self.focus == Pane::List;
 
@@ -286,7 +294,7 @@ impl App {
         let full = ui.max_rect();
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
-        let sections = self.list_sections();
+        let sections = self.cached_sections();
         self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
         let left = self.search_control(ui, p, bar.right() - 14.0, bar.center().y);
         if glass_button(ui, p, Pos2::new(left - 28.0, bar.center().y), Icon::Compose, "New Note (Ctrl+N)", true).clicked() {
@@ -312,6 +320,9 @@ impl App {
                 }
                 for chunk in ids.chunks(cols) {
                     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), card_h + 56.0), Sense::hover());
+                    if !ui.is_rect_visible(row) {
+                        continue;
+                    }
                     for (i, id) in chunk.iter().enumerate() {
                         let r = Rect::from_min_size(Pos2::new(left + i as f32 * (card_w + gap), row.top() + 8.0), Vec2::new(card_w, card_h));
                         self.card(ui, p, id, r);

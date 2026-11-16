@@ -127,9 +127,17 @@ impl App {
                 (f.id.clone(), depth, f.name.clone(), f.default, has_kids)
             })
             .collect();
+        // Notes per folder, counted in one pass (not one per folder).
+        let counts: Vec<usize> = {
+            let mut m: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for n in self.store.notes.iter().filter(|n| n.deleted.is_none() && n.account == account) {
+                *m.entry(n.folder.as_str()).or_default() += 1;
+            }
+            tree.iter().map(|(id, ..)| m.get(id.as_str()).copied().unwrap_or(0)).collect()
+        };
         // Hide folders inside collapsed ones.
         let mut hidden_below: Option<usize> = None;
-        for (id, depth, name, default, has_kids) in tree {
+        for ((id, depth, name, default, has_kids), count) in tree.into_iter().zip(counts) {
             if let Some(d) = hidden_below {
                 if depth > d {
                     continue;
@@ -140,7 +148,6 @@ impl App {
             if folded && has_kids {
                 hidden_below = Some(depth);
             }
-            let count = self.store.notes.iter().filter(|n| n.folder == id && n.deleted.is_none()).count();
             self.folder_row(ui, p, &id, depth, &name, default, has_kids.then_some(folded), count);
         }
         let deleted = self.store.notes.iter().filter(|n| n.account == account && n.deleted.is_some()).count();
@@ -272,18 +279,10 @@ impl App {
     }
 
     fn tags_section(&mut self, ui: &mut Ui, p: &Palette) {
-        let mut tags: Vec<String> = Vec::new();
-        for n in self.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)) {
-            for t in n.tags() {
-                if !tags.contains(&t) {
-                    tags.push(t);
-                }
-            }
-        }
+        let tags = self.all_tags();
         if tags.is_empty() {
             return;
         }
-        tags.sort();
         let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
         ui.painter().text(Pos2::new(rect.left() + 16.0, rect.center().y + 2.0), Align2::LEFT_CENTER, "Tags", theme::bold_font(12.0), p.secondary);
         ui.add_space(4.0);

@@ -119,6 +119,11 @@ pub struct App {
     redo_deletes: Vec<Deletion>,
     /// Locked notes: the password this session, unlocked notes' text.
     pub lock: locked::LockState,
+    /// The tags in the notes, and the notes' fingerprint they were found
+    /// for (finding them reads every note).
+    tag_cache: Option<(u64, Vec<String>)>,
+    /// The notes list's sections, and what they were worked out for.
+    sections_cache: Option<(u64, Vec<(String, Vec<String>)>)>,
     /// The browser engine Standard Notes requests go through (as in its own
     /// apps), if it could be started.
     #[cfg(any(windows, target_os = "macos"))]
@@ -209,6 +214,8 @@ impl App {
             undo_deletes: Vec::new(),
             redo_deletes: Vec::new(),
             lock: Default::default(),
+            tag_cache: None,
+            sections_cache: None,
             #[cfg(any(windows, target_os = "macos"))]
             web: None,
         }
@@ -286,6 +293,65 @@ impl App {
         self.store.account(id).is_some_and(|a| a.enabled)
     }
 
+    /// A cheap fingerprint of the notes (no text is read): what's derived
+    /// from all of them is worked out again only when it changes.
+    fn notes_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.store.notes.len().hash(&mut h);
+        for a in &self.store.accounts {
+            (&a.id, a.enabled).hash(&mut h);
+        }
+        for n in &self.store.notes {
+            (&n.id, n.version, n.body.len(), n.modified, n.created, n.deleted, n.pinned, &n.folder, &n.account).hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// [`App::list_sections`], from a cache while nothing it depends on
+    /// changes (the list is drawn every frame).
+    pub fn cached_sections(&mut self) -> Vec<(String, Vec<String>)> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.notes_fingerprint().hash(&mut h);
+        self.search.hash(&mut h);
+        format!("{:?}", self.location).hash(&mut h);
+        format!("{:?}", self.settings.sort_by).hash(&mut h);
+        self.settings.group_by_date.hash(&mut h);
+        Local::now().date_naive().hash(&mut h);
+        let key = h.finish();
+        if let Some((k, sections)) = &self.sections_cache {
+            if *k == key {
+                return sections.clone();
+            }
+        }
+        let sections = self.list_sections();
+        self.sections_cache = Some((key, sections.clone()));
+        sections
+    }
+
+    /// Every tag in the notes shown (sorted), from a cache.
+    pub fn all_tags(&mut self) -> Vec<String> {
+        let fp = self.notes_fingerprint();
+        if let Some((cached, tags)) = &self.tag_cache {
+            if *cached == fp {
+                return tags.clone();
+            }
+        }
+        let mut tags: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        for n in self.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)) {
+            for t in n.tags() {
+                if seen.insert(t.clone()) {
+                    tags.push(t);
+                }
+            }
+        }
+        tags.sort();
+        self.tag_cache = Some((fp, tags.clone()));
+        tags
+    }
+
     // ---- Notes list ---------------------------------------------------------
 
     /// The notes the list shows, in order.
@@ -328,9 +394,12 @@ impl App {
             }
         };
         match self.settings.sort_by {
-            SortBy::Title if !deleted_view => notes.sort_by(|a, b| {
-                crate::model::natural_cmp(&a.title(), &b.title()).then_with(|| b.modified.cmp(&a.modified))
-            }),
+            SortBy::Title if !deleted_view => {
+                // Each title read once, not at every comparison.
+                let mut titled: Vec<(String, &Note)> = notes.iter().map(|n| (n.title(), *n)).collect();
+                titled.sort_by(|(ta, a), (tb, b)| crate::model::natural_cmp(ta, tb).then_with(|| b.modified.cmp(&a.modified)));
+                notes = titled.into_iter().map(|(_, n)| n).collect();
+            }
             _ => notes.sort_by(|a, b| key(b).cmp(&key(a))),
         }
         if searching {
@@ -349,8 +418,9 @@ impl App {
         }
         let grouped = self.settings.group_by_date && self.settings.sort_by != SortBy::Title;
         let today = Local::now().date_naive();
+        let any_pinned = pinned_first && notes.iter().any(|n| n.pinned);
         for n in notes.iter().filter(|n| !(pinned_first && n.pinned)) {
-            let name = if grouped { date_group(key(n), today) } else if pinned_first && notes.iter().any(|n| n.pinned) { "Notes".into() } else { String::new() };
+            let name = if grouped { date_group(key(n), today) } else if any_pinned { "Notes".into() } else { String::new() };
             push(name, &n.id);
         }
         sections
@@ -890,7 +960,7 @@ impl App {
                 Some(s) => {
                     let changed = quiet
                         && s > StdDuration::from_secs(5)
-                        && AccountSnapshot::of(&self.store, &id).has_local_changes();
+                        && engine::has_local_changes(&self.store, &id);
                     // Standard Notes' own apps look for changes every 30
                     // seconds (and are told of them at once, see
                     // `live_changes`); asking costs one small request.
@@ -1436,7 +1506,37 @@ impl eframe::App for StartupError {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let started = std::time::Instant::now();
+        self.frame(ctx, frame);
+        slow_frame(started.elapsed(), self.store.notes.len());
+    }
+}
+
+/// Notes slow frames (they make moving the window lag) in `frames.log`
+/// in the data folder, at most once a second.
+fn slow_frame(took: std::time::Duration, notes: usize) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    if took < std::time::Duration::from_millis(30) {
+        return;
+    }
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|l| l.elapsed() < std::time::Duration::from_secs(1)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    let path = crate::db::data_dir().join("frames.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1_000_000) {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{} slow frame: {:.1} ms ({notes} notes)", Local::now().format("%Y-%m-%d %H:%M:%S"), took.as_secs_f64() * 1000.0);
+    }
+}
+
+impl App {
+    fn frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply_style(ctx);
         let p = Palette::get(ctx);
         #[cfg(any(windows, target_os = "macos"))]
@@ -1548,6 +1648,39 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, p: &Palette, add: impl FnOnce(&mu
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn cached_list_and_tags_follow_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::for_test(dir.path());
+        let folder = app.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+        let a = Note::new(crate::model::LOCAL, &folder, "# A\n#one\n");
+        let b = Note::new(crate::model::LOCAL, &folder, "# B\n");
+        let (ia, ib) = (a.id.clone(), b.id.clone());
+        app.store.notes.extend([a, b]);
+        app.go_to(Location::Folder(folder.clone()));
+        let check = |app: &mut App| assert_eq!(app.cached_sections(), app.list_sections());
+        check(&mut app);
+        assert_eq!(app.all_tags(), vec!["one".to_owned()]);
+        // Pinned, deleted, edited, searched, moved: never a stale list.
+        app.toggle_pin(&ib);
+        check(&mut app);
+        app.store.notes.iter_mut().find(|n| n.id == ia).unwrap().deleted = Some(Utc::now());
+        check(&mut app);
+        assert!(app.all_tags().is_empty(), "a deleted note's tags go");
+        let n = app.store.notes.iter_mut().find(|n| n.id == ib).unwrap();
+        n.body = "# B\n#two\n".into();
+        n.touch();
+        check(&mut app);
+        assert_eq!(app.all_tags(), vec!["two".to_owned()]);
+        app.search = "zzz".into();
+        check(&mut app);
+        assert!(app.cached_sections().iter().all(|(_, ids)| ids.is_empty()));
+        app.search.clear();
+        let other = app.store.ensure_folder_at(crate::model::LOCAL, &["Other".into()]);
+        app.store.notes.iter_mut().find(|n| n.id == ib).unwrap().folder = other;
+        check(&mut app);
+    }
 
     #[test]
     fn all_notes_shows_every_folder_once_there_are_two() {
