@@ -76,7 +76,6 @@ pub enum Object {
 /// Reads an object. `stem` is its name without `.md`, `modified` its last
 /// change in S3 (used for files without front matter).
 pub fn read(text: &str, stem: &str, modified: DateTime<Utc>) -> Object {
-    let text = text.replace("\r\n", "\n");
     let fallback = |body: String| NoteData {
         id: format!("s3-{stem}"),
         folder: vec![crate::model::DEFAULT_FOLDER.to_owned()],
@@ -86,16 +85,28 @@ pub fn read(text: &str, stem: &str, modified: DateTime<Utc>) -> Object {
         pinned: false,
         deleted: None,
     };
-    let Some(rest) = text.strip_prefix("---\n") else { return Object::Note(fallback(text)) };
-    let Some(end) = rest.find("\n---\n").map(|i| i + 1).or_else(|| rest.strip_suffix("---").map(|r| r.len())) else {
-        return Object::Note(fallback(text));
-    };
-    let header = &rest[..end];
-    let body = rest[end..].strip_prefix("---").unwrap_or("").strip_prefix('\n').unwrap_or("").to_owned();
+    // A hand-written file is read the same on every device, so its line
+    // endings may be tidied; a note's own text is kept byte for byte.
+    let hand_written = || Object::Note(fallback(text.replace("\r\n", "\n")));
+    let Some(rest) = text.strip_prefix("---\n").or_else(|| text.strip_prefix("---\r\n")) else { return hand_written() };
+    // The front matter ends at a line that is just `---` (in whatever line
+    // endings it was saved with).
+    let mut at = 0;
+    let mut end = None;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches('\n').trim_end_matches('\r') == "---" {
+            end = Some((at, at + line.len()));
+            break;
+        }
+        at += line.len();
+    }
+    let Some((header_end, body_start)) = end else { return hand_written() };
+    let header = &rest[..header_end];
+    let body = rest[body_start..].to_owned();
     // Ours starts with an id; anything else is part of a hand-written file.
     let has_id = header.lines().next().and_then(|l| l.split_once(':')).is_some_and(|(k, v)| k.trim() == "id" && !unquote(v.trim()).is_empty());
     if !has_id {
-        return Object::Note(fallback(text));
+        return hand_written();
     }
     let mut n = fallback(body);
     for line in header.lines() {
@@ -185,6 +196,18 @@ mod tests {
         assert!(text.starts_with("---\nid: 6f1c0d3e-0000-4000-8000-000000000001\nfolder: [Notes, \"Recipes, \\\"best\\\"\", \"true\"]\n"));
         assert!(text.contains("tags: [baking]\n"));
         assert_eq!(read(&text, "x", Utc::now()), Object::Note(n));
+    }
+
+    #[test]
+    fn the_text_comes_back_exactly() {
+        // Windows line endings in a note's text stay as they are (else
+        // every line differs from the device that saved it, and merges
+        // fail); front matter edited on Windows is still read.
+        let n = note(&["Notes"], "# A\r\nb\r\n");
+        assert_eq!(read(&write(&n), "x", Utc::now()), Object::Note(n.clone()));
+        let crlf = write(&n).replacen("---\n", "---\r\n", 1).replace("Z\n", "Z\r\n");
+        let Object::Note(m) = read(&crlf, "x", Utc::now()) else { panic!() };
+        assert_eq!((m.id, m.created), (n.id, n.created));
     }
 
     #[test]
