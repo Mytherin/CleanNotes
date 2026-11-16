@@ -35,7 +35,7 @@ On Windows, `build.rs` embeds `assets/CleanNotes.ico` and version information in
 
 ## iPhone app
 
-`ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps keep notes the same way; the iPhone app has no sync accounts of its own yet.
+`ios/` is the iPhone app: native SwiftUI and UIKit for the screens, so it looks, scrolls and responds like Apple Notes. It shares everything else with the desktop app through the Rust core (`core/`), which it calls through [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings (`ffi/`). That includes the notes, folders and accounts, the list and its sections, Markdown, the editing engine behind the text view, locked notes, storage and sync. Both apps read and write the same notes, and sync with each other through an S3 account.
 
 ### Building
 
@@ -54,7 +54,7 @@ Run `build-rust.sh` once before `xcodegen`, since the project includes the gener
 - **Folders:** each account's folders with note counts (nested, collapsible accounts), Recently Deleted, tags, and All Notes once there are several folders. New Folder and the compose button are in the bottom toolbar. Swipe a folder to delete it, or touch and hold to rename it or add a subfolder. Search there looks through every note.
 - **Notes list:** large title, date sections (Pinned, Today, Yesterday, Previous 7 Days, …), each note's title, time, first line and (in mixed lists) folder. Swipe right to pin. Swipe left to delete or move. Touch and hold for a preview and a menu (pin, lock, share, move, duplicate, delete). The "…" menu switches to the gallery view, selects several notes (Move, Delete, Recover All in Recently Deleted), and sets sort and grouping. The bottom toolbar shows the note count and the compose button. Pull down to sync; **shake to undo** deleting notes.
 - **Note:** the date on top, then the rich text with the same paragraph styles as the desktop: titles, headings, lists, checklists you tick by tapping the circle, quotes and monospaced. While typing, undo, redo and Done are in the navigation bar, and the keyboard bar has Aa, checklist, indent and link. **Aa** replaces the keyboard with the format panel (styles, B I U S, lists, indents). The usual iOS editing works: autocorrect, dictation, the edit menu, ⌘B/⌘I/⌘U and ⌘Z on a keyboard, and shake to undo typing. "…" has Find in Note (the system find bar), Move, Pin, Lock and Delete. Recently Deleted notes can be read and recovered but not edited. Swipe from the left edge to go back.
-- **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, and the accounts. Syncing (S3 and SQLite) is only in the desktop app for now: on the iPhone, notes are kept on the device.
+- **Locked notes** with the same password and encryption as the desktop. **Settings** has the same options, and the accounts: **Add S3 Account** checks the bucket as the desktop does (optionally with an encryption key), and **Change Access Key** gives an account new keys. SQLite syncing is only in the desktop app, since a database file needs a shared folder.
 
 ### How the text view uses the shared editor
 

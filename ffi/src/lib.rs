@@ -7,6 +7,8 @@
 //!   everything done to them ([`cleannotes_core::library::Library`]).
 //! - [`NoteEditor`]: an open note ([`cleannotes_core::editing::Editing`]),
 //!   with positions in UTF-16 code units as `UITextView` counts them.
+//! - [`check_s3`]: checking an S3 bucket before adding it as a sync account
+//!   (blocking: call it off the main thread).
 //!
 //! Only what Swift needs to see crosses over: plain records and enums, made
 //! from the core's own types here.
@@ -18,7 +20,8 @@ use cleannotes_core::db::Secrets;
 use cleannotes_core::doc::{self, Attr, Doc, Kind, Pos};
 use cleannotes_core::editing::{Command, Editing};
 use cleannotes_core::library::{self, BodySet, Library, Location};
-use cleannotes_core::model::LOCAL;
+use cleannotes_core::model::{new_id, LOCAL};
+use cleannotes_core::sync::{s3, BackendConfig};
 use cleannotes_core::settings::{SortBy, StartWith, TEXT_SIZES};
 use cleannotes_core::{dates, lock};
 
@@ -138,6 +141,47 @@ pub struct AccountItem {
     /// Its folders, depth first.
     pub folders: Vec<FolderItem>,
     pub deleted_count: u32,
+    /// An S3 account's bucket and folder.
+    pub s3: Option<S3Settings>,
+}
+
+/// Where an S3 account keeps its notes (no keys: those are in the
+/// keychain).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct S3Settings {
+    pub bucket: String,
+    pub region: String,
+    /// The folder in the bucket; empty for its top.
+    pub folder: String,
+    /// An S3-compatible service's address; `None` for Amazon S3.
+    pub endpoint: Option<String>,
+    /// The folder's notes are encrypted with a key of the user's own.
+    pub encrypted: bool,
+}
+
+impl S3Settings {
+    fn of(c: &s3::Config) -> S3Settings {
+        S3Settings { bucket: c.bucket.clone(), region: c.region.clone(), folder: c.prefix.clone(), endpoint: c.endpoint.clone(), encrypted: c.encrypted }
+    }
+
+    fn config(&self) -> s3::Config {
+        let endpoint = self.endpoint.as_deref().map(|e| e.trim().trim_end_matches('/')).filter(|e| !e.is_empty());
+        s3::Config {
+            bucket: self.bucket.trim().to_owned(),
+            region: if self.region.trim().is_empty() { s3::DEFAULT_REGION.to_owned() } else { self.region.trim().to_owned() },
+            prefix: self.folder.trim().trim_matches('/').to_owned(),
+            endpoint: endpoint.map(str::to_owned),
+            encrypted: self.encrypted,
+        }
+    }
+}
+
+/// A bucket that passed [`check_s3`]: the settings to add the account with,
+/// and the secret for the keychain.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct S3Checked {
+    pub settings: S3Settings,
+    pub secret: String,
 }
 
 /// Everything the folders screen shows.
@@ -344,6 +388,10 @@ impl NotesCore {
                     needs_sign_in: lib.needs_sign_in.contains(&a.id),
                     folders,
                     deleted_count: lib.deleted_count(&a.id) as u32,
+                    s3: match &a.backend {
+                        BackendConfig::S3(c) => Some(S3Settings::of(c)),
+                        _ => None,
+                    },
                 }
             })
             .collect();
@@ -651,6 +699,45 @@ impl NotesCore {
     pub fn remove_account(&self, id: String) {
         self.lib().remove_account(&id);
     }
+
+    /// Adds an S3 account after [`check_s3`], or with `again` (an
+    /// account's id) gives it the new keys, keeping its notes and sync
+    /// state. Returns its id.
+    pub fn add_s3_account(&self, again: Option<String>, name: String, checked: S3Checked) -> String {
+        let mut lib = self.lib();
+        let id = again.unwrap_or_else(new_id);
+        let name = match (name.trim(), lib.store.account(&id)) {
+            ("", Some(a)) => a.name.clone(),
+            ("", None) => "S3".to_owned(),
+            (n, _) => n.to_owned(),
+        };
+        let account = lib.account_for(&id, name, BackendConfig::S3(checked.settings.config()));
+        lib.add_account(account, Some(checked.secret));
+        id
+    }
+}
+
+/// Checks an S3 bucket and access key (blocking: call it off the main
+/// thread): it must be writable and honour conditional writes. With a
+/// passphrase, the folder's notes are encrypted (set up now, or unlocked if
+/// they are already); a folder that is encrypted needs it.
+#[uniffi::export]
+pub fn check_s3(settings: S3Settings, access_key_id: String, secret_access_key: String, passphrase: Option<String>) -> Result<S3Checked, CoreError> {
+    let keys = s3::Keys { access_key_id: access_key_id.trim().to_owned(), secret_access_key: secret_access_key.trim().to_owned(), encryption_key: None };
+    let (config, secret) = s3::check(&settings.config(), &keys, passphrase.as_deref()).map_err(|e| failed(format!("{e:#}")))?;
+    Ok(S3Checked { settings: S3Settings::of(&config), secret })
+}
+
+/// The region new S3 accounts start with.
+#[uniffi::export]
+pub fn default_s3_region() -> String {
+    s3::DEFAULT_REGION.to_owned()
+}
+
+/// The folder in the bucket new S3 accounts start with.
+#[uniffi::export]
+pub fn default_s3_folder() -> String {
+    s3::DEFAULT_PREFIX.to_owned()
 }
 
 fn item(r: library::NoteRow) -> NoteItem {
@@ -1066,6 +1153,37 @@ mod tests {
         let lib = Library::open(dir.path(), Secrets::Memory, || {}).unwrap();
         let _ = Quiet.sync_replied();
         (Arc::new(NotesCore { lib: Mutex::new(lib) }), dir)
+    }
+
+    #[test]
+    fn s3_accounts_are_added_and_get_new_keys() {
+        let (core, _dir) = core();
+        let settings = |folder: &str| S3Settings {
+            bucket: " notes ".into(),
+            region: "".into(),
+            folder: format!("/{folder}/"),
+            // Nothing listens there: the first sync just fails.
+            endpoint: Some("http://127.0.0.1:9/".into()),
+            encrypted: true,
+        };
+        let id = core.add_s3_account(None, "  ".into(), S3Checked { settings: settings("Work"), secret: "k1".into() });
+        let s3_of = |core: &NotesCore| core.overview().accounts.into_iter().find(|a| a.id == id).unwrap();
+        let a = s3_of(&core);
+        assert_eq!((a.name.as_str(), a.kind.as_str(), a.synced), ("S3", "S3", true));
+        assert_eq!(
+            a.s3,
+            Some(S3Settings { bucket: "notes".into(), region: s3::DEFAULT_REGION.into(), folder: "Work".into(), endpoint: Some("http://127.0.0.1:9".into()), encrypted: true })
+        );
+        assert_eq!(core.lib().db.secret(&id).as_deref(), Some("k1"));
+        assert!(core.overview().accounts.iter().find(|a| a.id == local_account_id()).unwrap().s3.is_none());
+
+        // New keys: the same account, its name kept.
+        core.lib().store.accounts.iter_mut().find(|a| a.id == id).unwrap().name = "Work notes".into();
+        let again = core.add_s3_account(Some(id.clone()), "".into(), S3Checked { settings: settings("Work"), secret: "k2".into() });
+        assert_eq!(again, id);
+        assert_eq!(s3_of(&core).name, "Work notes");
+        assert_eq!(core.lib().db.secret(&id).as_deref(), Some("k2"));
+        assert_eq!(core.overview().accounts.len(), 2);
     }
 
     fn editor(md: &str) -> Arc<NoteEditor> {

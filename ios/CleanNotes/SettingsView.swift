@@ -22,6 +22,7 @@ struct SettingsView: View {
                             LabeledContent(a.name, value: a.synced ? a.kind : "")
                         }
                     }
+                    NavigationLink("Add S3 Account") { S3AccountView(again: nil) }
                 }
                 if overview.accounts.count > 1 {
                     Section {
@@ -131,6 +132,15 @@ struct AccountDetailView: View {
                     if a.synced {
                         LabeledContent("Service", value: a.kind)
                     }
+                    if let s3 = a.s3 {
+                        LabeledContent("Bucket", value: s3.bucket)
+                        LabeledContent("Region", value: s3.region)
+                        LabeledContent("Folder", value: s3.folder.isEmpty ? "Top of the Bucket" : s3.folder)
+                        if let endpoint = s3.endpoint {
+                            LabeledContent("Endpoint", value: endpoint)
+                        }
+                        LabeledContent("Encryption", value: s3.encrypted ? "On" : "Off")
+                    }
                 }
                 if a.synced {
                     Section {
@@ -150,6 +160,9 @@ struct AccountDetailView: View {
                         }
                         Button("Sync Now") { store.perform { $0.syncNow(account: a.id) } }
                             .disabled(a.syncing)
+                        if a.s3 != nil {
+                            NavigationLink("Change Access Key") { S3AccountView(again: a) }
+                        }
                     }
                     Section {
                         Button("Remove Account", role: .destructive) { confirmRemove = true }
@@ -168,6 +181,149 @@ struct AccountDetailView: View {
             }
         } else {
             ContentUnavailableView("No Account", systemImage: "person.crop.circle.badge.questionmark")
+        }
+    }
+}
+
+/// Adding an S3 account (Amazon S3, or an S3-compatible service such as
+/// Cloudflare R2 or MinIO), or giving one a new access key. The bucket is
+/// checked before the account is added, as on the desktop.
+struct S3AccountView: View {
+    @EnvironmentObject private var store: NotesStore
+    @Environment(\.dismiss) private var dismiss
+    /// Giving this account a new access key (its bucket and folder fixed).
+    let again: AccountItem?
+
+    @State private var name = ""
+    @State private var bucket = ""
+    @State private var region = defaultS3Region()
+    @State private var folder = defaultS3Folder()
+    @State private var endpoint = ""
+    @State private var accessKeyId = ""
+    @State private var secretAccessKey = ""
+    @State private var passphrase = ""
+    @State private var encrypted = false
+    @State private var busy = false
+    @State private var error: String?
+
+    private var ready: Bool {
+        let e = endpoint.trimmingCharacters(in: .whitespaces)
+        return !bucket.trimmingCharacters(in: .whitespaces).isEmpty
+            && !accessKeyId.trimmingCharacters(in: .whitespaces).isEmpty
+            && !secretAccessKey.trimmingCharacters(in: .whitespaces).isEmpty
+            && (e.isEmpty || e.hasPrefix("http"))
+            && (!encrypted || !passphrase.isEmpty)
+    }
+
+    var body: some View {
+        Form {
+            if again == nil {
+                Section {
+                    TextField("S3", text: $name, prompt: Text("Name (Optional)"))
+                } footer: {
+                    Text("Each note is a Markdown file in the folder's notes/ subfolder, so the desktop app and other tools can read it.")
+                }
+                Section("Bucket") {
+                    TextField("Bucket", text: $bucket, prompt: Text("my-notes-bucket"))
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    LabeledContent("Region") {
+                        TextField("Region", text: $region, prompt: Text("us-east-1"))
+                            .multilineTextAlignment(.trailing)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    }
+                    LabeledContent("Folder") {
+                        TextField("Folder", text: $folder, prompt: Text("Top of the Bucket"))
+                            .multilineTextAlignment(.trailing)
+                            .textInputAutocapitalization(.never).autocorrectionDisabled()
+                    }
+                }
+                Section {
+                    TextField("Endpoint", text: $endpoint, prompt: Text("Empty for Amazon S3"))
+                        .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                } header: {
+                    Text("S3-Compatible Service")
+                } footer: {
+                    Text("For Cloudflare R2, MinIO and others, their address (R2's region is “auto”).")
+                }
+            }
+            Section {
+                TextField("Access Key ID", text: $accessKeyId, prompt: Text("AKIA…"))
+                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                SecureField("Secret Access Key", text: $secretAccessKey)
+            } header: {
+                Text("Access Key")
+            } footer: {
+                Text("Use an IAM user that can only list, read, write and delete in this bucket. The key is kept in the keychain.")
+            }
+            Section {
+                SecureField(encrypted ? "Encryption Key" : "Encryption Key (Optional)", text: $passphrase)
+            } footer: {
+                Text(encrypted
+                    ? "This folder's notes are encrypted: enter the key used on your other devices."
+                    : "With a key, notes are encrypted on this iPhone before they're uploaded, and every device needs the same key. Without it they can't be read, so keep it safe. For a folder that's encrypted already, enter its key.")
+            }
+            if let error {
+                Section { Text(error).foregroundStyle(.red) }
+            }
+            Section {
+                Button {
+                    check()
+                } label: {
+                    HStack {
+                        Text(again == nil ? "Add Account" : "Save")
+                        if busy { Spacer(); ProgressView() }
+                    }
+                }
+                .disabled(busy || !ready)
+            }
+        }
+        .disabled(busy)
+        .navigationTitle(again == nil ? "Add S3 Account" : "Change Access Key")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear(perform: prefill)
+    }
+
+    private func prefill() {
+        guard let a = again, let s3 = a.s3 else { return }
+        name = a.name
+        bucket = s3.bucket
+        region = s3.region
+        folder = s3.folder
+        endpoint = s3.endpoint ?? ""
+        encrypted = s3.encrypted
+    }
+
+    private func check() {
+        busy = true
+        error = nil
+        let e = endpoint.trimmingCharacters(in: .whitespaces)
+        let settings = S3Settings(bucket: bucket, region: region, folder: folder, endpoint: e.isEmpty ? nil : e, encrypted: encrypted)
+        let (keyId, secret, passphrase) = (accessKeyId, secretAccessKey, self.passphrase)
+        // The check talks to S3 (and making an encryption key takes a
+        // moment): not on the main thread.
+        Task.detached {
+            let result: Result<S3Checked, Error>
+            do {
+                result = .success(try checkS3(settings: settings, accessKeyId: keyId, secretAccessKey: secret, passphrase: passphrase.isEmpty ? nil : passphrase))
+            } catch {
+                result = .failure(error)
+            }
+            await MainActor.run { finish(result) }
+        }
+    }
+
+    private func finish(_ result: Result<S3Checked, Error>) {
+        busy = false
+        switch result {
+        case let .failure(e):
+            error = message(e)
+        case let .success(checked):
+            store.saveEditor()
+            _ = store.core.addS3Account(again: again?.id, name: name, checked: checked)
+            secretAccessKey = ""
+            passphrase = ""
+            store.changed()
+            dismiss()
         }
     }
 }
