@@ -222,7 +222,7 @@ fn a_service_that_rejects_conditional_writes_is_refused() {
     // says so instead of adding the account.
     let server = FakeS3::start();
     server.state().reject_conditions = true;
-    let e = check(&config(&server), &keys()).unwrap_err();
+    let e = check(&config(&server), &keys(), None).unwrap_err();
     assert!(format!("{e:#}").contains("NotImplemented"), "{e:#}");
 }
 
