@@ -28,6 +28,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use eframe::egui;
 use serde_json::{json, Value};
+#[cfg(not(windows))]
 use wry::dpi::{LogicalPosition, LogicalSize};
 
 use crate::sync::standardnotes::api::{self, Answer, Transport};
@@ -278,10 +279,100 @@ impl Transport for WebFetch {
 }
 
 /// The WebView, on the window's thread.
+/// On Windows, the browser engine gets a hidden window of its own: inside
+/// the app's window (as a child window) it slowed down moving the app's
+/// window, which is drawn with OpenGL. The same window shows Cloudflare's
+/// browser check when there is one.
+#[cfg(windows)]
+mod own_window {
+    use std::num::NonZeroIsize;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SetForegroundWindow, ShowWindow, CW_USEDEFAULT, SW_HIDE,
+        SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    };
+    use wry::raw_window_handle::{HandleError, HasWindowHandle, RawWindowHandle, Win32WindowHandle, WindowHandle};
+
+    /// Set when the user closes the window (as "Done" with the check).
+    pub static CLOSED: AtomicBool = AtomicBool::new(false);
+
+    pub struct OwnWindow(HWND);
+
+    unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if msg == WM_CLOSE {
+            // Hidden, not destroyed: the engine lives on in it.
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+            }
+            CLOSED.store(true, Ordering::Relaxed);
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+
+    impl OwnWindow {
+        pub fn new() -> anyhow::Result<OwnWindow> {
+            unsafe {
+                let instance = GetModuleHandleW(None)?;
+                let class = w!("CleanNotesBrowserEngine");
+                let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance.into(), lpszClassName: class, ..Default::default() };
+                // (Fails harmlessly if registered already.)
+                RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    w!("Standard Notes \u{2013} browser check"),
+                    WS_OVERLAPPEDWINDOW,
+                    CW_USEDEFAULT,
+                    CW_USEDEFAULT,
+                    980,
+                    760,
+                    None,
+                    None,
+                    Some(instance.into()),
+                    None,
+                )?;
+                Ok(OwnWindow(hwnd))
+            }
+        }
+
+        pub fn show(&self, on: bool) {
+            unsafe {
+                let _ = ShowWindow(self.0, if on { SW_SHOWNORMAL } else { SW_HIDE });
+                if on {
+                    let _ = SetForegroundWindow(self.0);
+                }
+            }
+        }
+    }
+
+    impl HasWindowHandle for OwnWindow {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            let h = NonZeroIsize::new(self.0 .0 as isize).ok_or(HandleError::Unavailable)?;
+            Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Win32(Win32WindowHandle::new(h))) })
+        }
+    }
+
+    impl Drop for OwnWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+}
+
 pub struct WebHost {
     webview: wry::WebView,
     /// Kept for as long as the WebView.
     _context: wry::WebContext,
+    /// The engine's own window (Windows); dropped after the WebView.
+    #[cfg(windows)]
+    window: own_window::OwnWindow,
     page_url: String,
     jobs: Receiver<Job>,
     queued: Vec<Job>,
@@ -333,14 +424,23 @@ impl WebHost {
         // The engine's own data (cookies, cache) in the app's data folder, not
         // next to the exe (which may be somewhere read-only, like Program Files).
         let mut context = wry::WebContext::new(Some(dir.join("WebView")));
-        let webview = wry::WebViewBuilder::new_with_web_context(&mut context)
+        let builder = wry::WebViewBuilder::new_with_web_context(&mut context)
             .with_on_page_load_handler(on_load)
             .with_url(&page_url)
+            // It mustn't take the keyboard from the app's window.
+            .with_focused(false);
+        #[cfg(windows)]
+        let window = own_window::OwnWindow::new()?;
+        // In its own hidden window, filling it.
+        #[cfg(windows)]
+        let built = builder.build(&window);
+        // Elsewhere: hidden inside the app's window.
+        #[cfg(not(windows))]
+        let built = builder
             .with_visible(false)
-            // Hidden, it mustn't take the keyboard from the app's window.
-            .with_focused(false)
             .with_bounds(wry::Rect { position: LogicalPosition::new(0.0, 0.0).into(), size: LogicalSize::new(1.0, 1.0).into() })
-            .build_as_child(cc)
+            .build_as_child(cc);
+        let webview = built
             .map_err(|e| {
                 log(&format!("the browser engine didn't start: {e}"));
                 anyhow!("starting the browser engine: {e}")
@@ -361,6 +461,8 @@ impl WebHost {
         let host = WebHost {
             webview,
             _context: context,
+            #[cfg(windows)]
+            window,
             page_url,
             jobs,
             queued: Vec::new(),
@@ -374,7 +476,7 @@ impl WebHost {
             changed: Arc::new(AtomicBool::new(false)),
             ctx,
         };
-        let _ = host.webview.focus_parent();
+        host.give_back_focus();
         Ok((host, fetch))
     }
 
@@ -434,7 +536,7 @@ impl WebHost {
         }
         if self.give_back_focus {
             self.give_back_focus = false;
-            let _ = self.webview.focus_parent();
+            self.give_back_focus();
         }
         for job in self.queued.drain(..) {
             log(&format!("request {}: handed to the page", job.id));
@@ -452,27 +554,52 @@ impl WebHost {
         self.check_needed.load(Ordering::Relaxed) && !self.checking
     }
 
-    /// Shows Standard Notes' server in the WebView, over `area` (in points),
-    /// for the user to complete Cloudflare's check.
+    /// The keyboard back to the app's window. (On Windows the engine has a
+    /// window of its own, hidden, which doesn't take it.)
+    fn give_back_focus(&self) {
+        #[cfg(not(windows))]
+        let _ = self.webview.focus_parent();
+    }
+
+    /// Whether the user closed the check's window (as "Done").
+    pub fn check_window_closed(&self) -> bool {
+        #[cfg(windows)]
+        return own_window::CLOSED.swap(false, Ordering::Relaxed);
+        #[cfg(not(windows))]
+        return false;
+    }
+
+    /// Shows Standard Notes' server in the WebView for the user to complete
+    /// Cloudflare's check: in its own window on Windows, else over `area`
+    /// (in points) of the app's window.
     pub fn show_check(&mut self, area: egui::Rect) {
         if !self.checking {
             self.checking = true;
             self.ready.store(false, Ordering::Relaxed);
             let _ = self.webview.load_url(api::base(crate::sync::standardnotes::DEFAULT_SERVER).as_str());
+            #[cfg(windows)]
+            self.window.show(true);
         }
-        let _ = self.webview.set_bounds(wry::Rect {
-            position: LogicalPosition::new(area.min.x as f64, area.min.y as f64).into(),
-            size: LogicalSize::new(area.width() as f64, area.height() as f64).into(),
-        });
-        let _ = self.webview.set_visible(true);
+        #[cfg(not(windows))]
+        {
+            let _ = self.webview.set_bounds(wry::Rect {
+                position: LogicalPosition::new(area.min.x as f64, area.min.y as f64).into(),
+                size: LogicalSize::new(area.width() as f64, area.height() as f64).into(),
+            });
+            let _ = self.webview.set_visible(true);
+        }
+        let _ = area;
     }
 
     /// Hides the WebView again after the check, back on the local page.
     pub fn end_check(&mut self) {
         self.checking = false;
         self.check_needed.store(false, Ordering::Relaxed);
+        #[cfg(windows)]
+        self.window.show(false);
+        #[cfg(not(windows))]
         let _ = self.webview.set_visible(false);
-        let _ = self.webview.focus_parent();
+        self.give_back_focus();
         let _ = self.webview.load_url(&self.page_url);
         self.give_back_focus = true;
         // Reloading the page closed the live notifications.

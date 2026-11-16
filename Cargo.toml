@@ -49,3 +49,8 @@ opt-level = 2
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 wry = "0.57.2"
 
+# A hidden window of its own for the browser engine (see webfetch.rs); the
+# version wry uses.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }
+

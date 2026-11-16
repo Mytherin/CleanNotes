@@ -1394,13 +1394,18 @@ impl App {
         let mut done = false;
         let bar = egui::TopBottomPanel::top("browser-check").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it below, then click Done.");
+                ui.label(if cfg!(windows) {
+                    "Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it in the window that opened, then click Done."
+                } else {
+                    "Standard Notes' server wants a quick browser check before it lets CleanNotes sync. Complete it below, then click Done."
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     done = ui.button("Done").clicked();
                 });
             });
         });
-        if done {
+        // (Closing the check's own window counts as Done.)
+        if done || web.check_window_closed() {
             web.end_check();
             // Try again now.
             self.sync_started.clear();

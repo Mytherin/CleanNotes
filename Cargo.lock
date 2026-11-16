@@ -858,6 +858,7 @@ dependencies = [
  "ttf-parser",
  "unicode-segmentation",
  "uuid",
+ "windows 0.62.2",
  "wry",
 ]
 
