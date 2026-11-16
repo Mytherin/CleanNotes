@@ -236,6 +236,15 @@ impl App {
                 self.duplicate_note(id);
                 ui.close_menu();
             }
+            // Locks those not locked yet; hidden once they all are.
+            let to_lock = ids.iter().filter(|i| self.can_lock(i)).count();
+            if to_lock > 0 {
+                let label = if to_lock > 1 { format!("Lock {to_lock} Notes") } else { "Lock Note".to_owned() };
+                if ui.button(label).clicked() {
+                    self.lock_notes(&ids);
+                    ui.close_menu();
+                }
+            }
             if ui.button("Copy as Markdown").clicked() {
                 let text: Vec<String> = ids.iter().filter_map(|i| self.plain_body(i)).collect();
                 ui.ctx().copy_text(text.join("

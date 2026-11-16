@@ -40,9 +40,9 @@ pub struct LockState {
 
 pub enum Sheet {
     /// Choose the password (the first time a note is locked).
-    Set { password: String, verify: String, hint: String, then_lock: Option<String>, error: Option<String> },
-    /// Enter the password to lock a note.
-    Enter { password: String, then_lock: Option<String>, error: Option<String> },
+    Set { password: String, verify: String, hint: String, then_lock: Vec<String>, error: Option<String> },
+    /// Enter the password to lock notes.
+    Enter { password: String, then_lock: Vec<String>, error: Option<String> },
     /// Settings → Change Password.
     Change { old: String, password: String, verify: String, hint: String, error: Option<String> },
 }
@@ -152,27 +152,44 @@ impl App {
 
     /// "Lock Note": asks for (or to choose) the password first if needed.
     pub fn lock_note(&mut self, id: &str) {
-        if self.is_locked(id) {
+        self.lock_notes(&[id.to_owned()]);
+    }
+
+    /// "Lock Notes" with several notes selected: the password is asked for
+    /// once, then every one of them not locked yet (nor deleted) is locked.
+    pub fn lock_notes(&mut self, ids: &[String]) {
+        let ids: Vec<String> = ids.iter().filter(|id| self.can_lock(id)).cloned().collect();
+        if ids.is_empty() {
             return;
         }
         if self.settings.lock_check.is_none() {
-            self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Some(id.to_owned()), error: None });
+            self.lock.sheet = Some(Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: ids, error: None });
             return;
         }
         let Some((k, salt)) = self.current_keys() else {
-            self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: Some(id.to_owned()), error: None });
+            self.lock.sheet = Some(Sheet::Enter { password: String::new(), then_lock: ids, error: None });
             return;
         };
         self.flush_editor();
-        let Some(text) = self.plain_body(id) else { return };
-        let env = lock::seal(&k, &salt, &text);
-        if let Some(n) = self.store.note_mut(id) {
-            n.body = lock::locked_body(&text, &env);
-            n.touch();
+        let mut locked = 0;
+        for id in &ids {
+            let Some(text) = self.plain_body(id) else { continue };
+            let env = lock::seal(&k, &salt, &text);
+            if let Some(n) = self.store.note_mut(id) {
+                n.body = lock::locked_body(&text, &env);
+                n.touch();
+            }
+            self.lock.unlocked.insert(id.clone(), text);
+            self.unsaved.insert(id.clone());
+            locked += 1;
         }
-        self.lock.unlocked.insert(id.to_owned(), text);
-        self.unsaved.insert(id.to_owned());
-        self.push_notice("Note locked. Choose Lock Now to close locked notes.".into());
+        let what = if locked == 1 { "Note locked".to_owned() } else { format!("{locked} notes locked") };
+        self.push_notice(format!("{what}. Choose Lock Now to close locked notes."));
+    }
+
+    /// A note that "Lock Note" applies to: there, not deleted, not locked.
+    pub fn can_lock(&self, id: &str) -> bool {
+        self.store.note(id).is_some_and(|n| n.deleted.is_none() && !lock::is_locked(&n.body))
     }
 
     /// The current password's keys and salt (those of the settings' check).
@@ -418,17 +435,13 @@ impl App {
                 self.settings.lock_check = Some(lock::encode(&check));
                 self.settings.lock_hint = hint;
                 self.lock.current = Some(password);
-                if let Some(id) = then_lock {
-                    self.lock_note(&id);
-                }
+                self.lock_notes(&then_lock);
                 Ok(())
             }
             SheetAction::Enter(password, then_lock) => {
                 self.check_password(&password)?;
                 self.lock.current = Some(password);
-                if let Some(id) = then_lock {
-                    self.lock_note(&id);
-                }
+                self.lock_notes(&then_lock);
                 Ok(())
             }
             SheetAction::Change(old, password, hint) => {
@@ -483,14 +496,14 @@ impl App {
         self.lock.sheet = Some(if self.settings.lock_check.is_some() {
             Sheet::Change { old: String::new(), password: String::new(), verify: String::new(), hint: self.settings.lock_hint.clone(), error: None }
         } else {
-            Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: None, error: None }
+            Sheet::Set { password: String::new(), verify: String::new(), hint: String::new(), then_lock: Vec::new(), error: None }
         });
     }
 }
 
 enum SheetAction {
-    Set(String, String, Option<String>),
-    Enter(String, Option<String>),
+    Set(String, String, Vec<String>),
+    Enter(String, Vec<String>),
     Change(String, String, String),
 }
 
@@ -530,7 +543,7 @@ mod tests {
     fn set_password(app: &mut App, id: &str, pw: &str) {
         app.lock_note(id);
         assert!(matches!(app.lock.sheet, Some(Sheet::Set { .. })), "the first lock asks for a password");
-        app.sheet_action(SheetAction::Set(pw.into(), "the usual".into(), Some(id.to_owned()))).unwrap();
+        app.sheet_action(SheetAction::Set(pw.into(), "the usual".into(), vec![id.to_owned()])).unwrap();
         app.lock.sheet = None;
     }
 
@@ -597,6 +610,47 @@ mod tests {
     }
 
     #[test]
+    fn locking_several_notes_asks_for_the_password_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, a) = app_with_note(dir.path(), "# A\nsecret a\n");
+        let folder = app.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+        let add = |app: &mut App, body: &str| {
+            let n = Note::new(crate::model::LOCAL, &folder, body);
+            let id = n.id.clone();
+            app.store.notes.push(n);
+            id
+        };
+        let b = add(&mut app, "# B\nsecret b\n");
+        let c = add(&mut app, "# C\nsecret c\n");
+        let ids = vec![a.clone(), b.clone(), c.clone()];
+        // The first time: one sheet to choose the password, then all lock.
+        app.lock_notes(&ids);
+        let Some(Sheet::Set { then_lock, .. }) = &app.lock.sheet else { panic!("asks for a password") };
+        assert_eq!(*then_lock, ids);
+        app.sheet_action(SheetAction::Set("pw".into(), String::new(), ids.clone())).unwrap();
+        app.lock.sheet = None;
+        for id in &ids {
+            let body = &app.store.note(id).unwrap().body;
+            assert!(lock::is_locked(body) && !body.contains("secret"), "{body}");
+        }
+        // After Lock Now, a mixed selection: one Enter sheet, and only the
+        // note not locked yet is sealed (the others are left as they are).
+        let d = add(&mut app, "# D\nsecret d\n");
+        let before = app.store.note(&a).unwrap().body.clone();
+        app.lock_now();
+        app.lock_notes(&[a.clone(), d.clone()]);
+        let Some(Sheet::Enter { then_lock, .. }) = &app.lock.sheet else { panic!("asks for the password") };
+        assert_eq!(*then_lock, vec![d.clone()]);
+        app.sheet_action(SheetAction::Enter("pw".into(), vec![d.clone()])).unwrap();
+        assert!(app.is_locked(&d));
+        assert_eq!(app.store.note(&a).unwrap().body, before);
+        // Nothing left to lock: no sheet.
+        app.lock.sheet = None;
+        app.lock_notes(&ids);
+        assert!(app.lock.sheet.is_none());
+    }
+
+    #[test]
     fn a_sync_never_leaves_stale_text_in_an_unlocked_note() {
         let dir = tempfile::tempdir().unwrap();
         let (mut app, id) = app_with_note(dir.path(), "# A\nv1\n");
@@ -624,7 +678,7 @@ mod tests {
         let (mut app, id) = app_with_note(dir.path(), "# A\nsecret\n");
         set_password(&mut app, &id, "pw");
         assert!(app.has_unlocked());
-        app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: None, error: None });
+        app.lock.sheet = Some(Sheet::Enter { password: "half-typed".into(), then_lock: Vec::new(), error: None });
         app.lock.last_input = Instant::now().checked_sub(AUTO_LOCK + std::time::Duration::from_secs(60));
         // The first frame back carries input (focus, the mouse moving).
         let ctx = egui::Context::default();
