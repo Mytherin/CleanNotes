@@ -17,6 +17,7 @@ pub mod bitwarden;
 pub mod cloudkit;
 pub mod engine;
 pub mod merge;
+pub mod s3;
 pub mod sqlite;
 pub mod standardnotes;
 pub mod worker;
@@ -36,6 +37,8 @@ pub enum BackendConfig {
     CloudKit(cloudkit::Config),
     /// Encrypted items in a Standard Notes account.
     StandardNotes(standardnotes::Config),
+    /// Markdown files in a folder of an S3 bucket.
+    S3(s3::Config),
 }
 
 impl BackendConfig {
@@ -46,6 +49,7 @@ impl BackendConfig {
             BackendConfig::Sqlite(_) => "SQLite",
             BackendConfig::CloudKit(_) => "CloudKit",
             BackendConfig::StandardNotes(_) => "Standard Notes",
+            BackendConfig::S3(_) => "S3",
         }
     }
 }
@@ -185,5 +189,6 @@ pub fn open(config: &BackendConfig, secret: Option<String>) -> anyhow::Result<Bo
         BackendConfig::Sqlite(c) => Ok(Box::new(sqlite::SqliteBackend::open(c)?)),
         BackendConfig::CloudKit(c) => Ok(Box::new(cloudkit::CloudKitBackend::open(c, secret)?)),
         BackendConfig::StandardNotes(c) => Ok(Box::new(standardnotes::StandardNotesBackend::open(c, secret)?)),
+        BackendConfig::S3(c) => Ok(Box::new(s3::S3Backend::open(c, secret)?)),
     }
 }
