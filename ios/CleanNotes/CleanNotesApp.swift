@@ -1,7 +1,9 @@
 import SwiftUI
+import UIKit
 
 @main
 struct CleanNotesApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = NotesStore()
     @Environment(\.scenePhase) private var phase
 
@@ -19,7 +21,9 @@ struct CleanNotesApp: App {
         }
         .onChange(of: phase) { _, phase in
             switch phase {
-            case .active: store.becameActive()
+            case .active:
+                store.becameActive()
+                UIApplication.shared.shortcutItems = store.startupError == nil ? QuickAction.items : []
             case .background, .inactive: store.resignedActive()
             @unknown default: break
             }
@@ -33,6 +37,7 @@ struct RootView: View {
     @EnvironmentObject private var store: NotesStore
     @State private var path: [Route] = []
     @State private var restored = false
+    @ObservedObject private var quickActions = QuickActionCenter.shared
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -51,7 +56,23 @@ struct RootView: View {
             guard !restored else { return }
             restored = true
             path = [.list(store.core.initialPlace())]
+            // Launched from the quick action.
+            handleQuickAction()
         }
+        .onChange(of: quickActions.pending) { _, _ in
+            if restored { handleQuickAction() }
+        }
+    }
+
+    /// New Note from the Home Screen: a note in the default folder, open with
+    /// the keyboard up, over that folder's list.
+    private func handleQuickAction() {
+        guard let action = quickActions.pending else { return }
+        quickActions.pending = nil
+        guard action == QuickAction.newNote else { return }
+        store.saveEditor()
+        let n = store.core.newNote(place: .folder(id: store.core.defaultFolder()))
+        path = [.list(n.place), .note(id: n.id, isNew: true)]
     }
 }
 
