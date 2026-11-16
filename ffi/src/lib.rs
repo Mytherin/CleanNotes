@@ -98,6 +98,8 @@ pub struct NoteItem {
     pub id: String,
     pub title: String,
     pub snippet: String,
+    /// Nothing after the title (the snippet is "No additional text").
+    pub empty: bool,
     pub time: String,
     /// The note's folder, when the list mixes folders.
     pub folder: Option<String>,
@@ -466,6 +468,13 @@ impl NotesCore {
         self.lib().store.note(&id).map(|n| dates::note_header_time(n.modified)).unwrap_or_default()
     }
 
+    /// The folder new notes go to when none is chosen (the compose button on
+    /// the Folders screen): the default account's Notes folder, or the
+    /// local one if that account is unavailable.
+    pub fn default_folder(&self) -> String {
+        self.lib().new_note_target(&Location::All).1
+    }
+
     /// A new note from `place`, with its editor (the first paragraph in the
     /// "New notes start with" style).
     pub fn new_note(&self, place: Place) -> NewNote {
@@ -752,6 +761,7 @@ fn item(r: library::NoteRow) -> NoteItem {
         id: r.id,
         title: r.title,
         snippet: r.snippet,
+        empty: r.empty,
         time: r.time,
         folder: r.folder,
         pinned: r.pinned,
@@ -812,6 +822,9 @@ pub struct Paragraph {
     pub checked: bool,
     /// A numbered item's number.
     pub number: u32,
+    /// The list marker as text ("•", "–", "3.", "☐", "☑"; empty if not a
+    /// list item), for drawing it and for printing.
+    pub marker: String,
     pub runs: Vec<TextRun>,
 }
 
@@ -829,6 +842,9 @@ pub struct EditorState {
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct Formatting {
     pub style: ParagraphStyle,
+    /// A list item (bulleted, dashed, numbered or checklist): it can move
+    /// up and down.
+    pub is_list: bool,
     pub checked: bool,
     pub indent: u32,
     pub number: u32,
@@ -1014,6 +1030,7 @@ impl NoteEditor {
         let (checklist_has_checked, checklist_has_unchecked) = e.checklist_state().unwrap_or((false, false));
         Formatting {
             style: ParagraphStyle::of(b.kind),
+            is_list: b.kind.is_list(),
             checked: b.kind == Kind::Checklist(true),
             indent: b.indent as u32,
             number: e.doc.list_numbers()[e.sel.caret.block.min(e.doc.blocks.len() - 1)],
@@ -1114,6 +1131,7 @@ fn paragraph(b: &doc::Block, number: u32) -> Paragraph {
         indent: b.indent as u32,
         checked: b.kind == Kind::Checklist(true),
         number,
+        marker: b.kind.list_marker(number),
         runs,
     }
 }
@@ -1274,6 +1292,30 @@ mod tests {
         assert_eq!(core.lock_note(n.id.clone()), LockOutcome::Locked);
         core.lock_now();
         assert_eq!(core.shared_text(n.id.clone()), None, "a closed locked note isn't shared");
+    }
+
+    #[test]
+    fn the_core_decides_markers_empty_notes_and_the_default_folder() {
+        let e = editor("- [ ] a\n- [x] b\n1. one\n2. two\n* dot\nplain\n");
+        let markers: Vec<String> = e.state().paragraphs.into_iter().map(|p| p.marker).collect();
+        assert_eq!(markers, ["☐", "☑", "1.", "2.", "•", ""]);
+        e.select(0, 0);
+        assert!(e.formatting().is_list);
+        e.select(30, 30);
+        assert!(!e.formatting().is_list, "the plain paragraph");
+
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.lib().default_folder_id(LOCAL) };
+        let n = core.new_note(home.clone());
+        core.lib().set_body(&n.id, "# Only a title\n");
+        let row = core.note(n.id.clone(), home.clone()).unwrap();
+        assert!(row.empty && row.snippet == "No additional text");
+        core.lib().set_body(&n.id, "# Title\nmore\n");
+        assert!(!core.note(n.id.clone(), home).unwrap().empty);
+
+        // A default account that's gone: new notes go to the local Notes folder.
+        core.lib().settings.default_account = "gone".into();
+        assert_eq!(core.default_folder(), core.lib().default_folder_id(LOCAL));
     }
 
     #[test]

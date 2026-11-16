@@ -22,21 +22,17 @@ final class ParagraphMark: NSObject {
     let style: ParagraphStyle
     let indent: Int
     let checked: Bool
-    let number: Int
+    /// The core's marker ("•", "–", "3.", "☐"); empty if not a list item.
+    let marker: String
 
     init(_ p: Paragraph) {
         style = p.style
         indent = Int(p.indent)
         checked = p.checked
-        number = Int(p.number)
+        marker = p.marker
     }
 
-    var isList: Bool {
-        switch style {
-        case .bulleted, .dashed, .numbered, .checklist: return true
-        default: return false
-        }
-    }
+    var isList: Bool { !marker.isEmpty }
 }
 
 /// Turns the engine's paragraphs into attributed text.
@@ -151,15 +147,8 @@ enum NoteTextRenderer {
         let out = NSMutableAttributedString()
         for (i, p) in paragraphs.enumerated() {
             let line = NSMutableAttributedString(attributedString: attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count))
-            let marker: String?
-            switch p.style {
-            case .bulleted: marker = "•"
-            case .dashed: marker = "–"
-            case .numbered: marker = "\(p.number)."
-            case .checklist: marker = p.checked ? "☑" : "☐"
-            default: marker = nil
-            }
-            if let marker, let para = paragraphStyle(p, textSize: textSize).mutableCopy() as? NSMutableParagraphStyle {
+            let marker = p.marker
+            if !marker.isEmpty, let para = paragraphStyle(p, textSize: textSize).mutableCopy() as? NSMutableParagraphStyle {
                 // The marker hangs to the left of the text, as on screen.
                 para.firstLineHeadIndent = CGFloat(p.indent) * indentStep(bodySize(textSize))
                 para.tabStops = [NSTextTab(textAlignment: .left, location: para.headIndent)]
@@ -269,14 +258,8 @@ final class NotesLayoutManager: NSLayoutManager {
             }
             image?.draw(in: rect)
         default:
-            let label: String
-            switch mark.style {
-            case .bulleted: label = "•"
-            case .dashed: label = "–"
-            default: label = "\(mark.number)."
-            }
             let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: UIColor.label]
-            let s = NSAttributedString(string: label, attributes: attrs)
+            let s = NSAttributedString(string: mark.marker, attributes: attrs)
             let size = s.size()
             // Numbers line up on their right, bullets sit in the middle.
             let x = mark.style == .numbered ? x0 + width - size.width - body * 0.35 : x0 + (width - size.width) / 2 - body * 0.2
@@ -736,8 +719,7 @@ struct NoteEditorView: UIViewRepresentable {
                 self?.onLink()
             }
             var mine: [UIMenuElement] = [format, link]
-            let lists: [ParagraphStyle] = [.bulleted, .dashed, .numbered, .checklist]
-            if let style = f?.style, lists.contains(style) {
+            if f?.isList == true {
                 mine.append(action("Move Up", "arrow.up", false, .moveUp))
                 mine.append(action("Move Down", "arrow.down", false, .moveDown))
             }

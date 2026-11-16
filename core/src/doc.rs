@@ -43,6 +43,21 @@ impl Kind {
         matches!(self, Kind::Cell { .. })
     }
 
+    /// What a list item shows before its text, as text: "•", "–", "3.",
+    /// "☐" or "☑" (`number` is a numbered item's); empty for other kinds.
+    /// The apps draw a checklist's circle themselves; this is its text form
+    /// (sharing, printing).
+    pub fn list_marker(self, number: u32) -> String {
+        match self {
+            Kind::Bulleted => "•".to_owned(),
+            Kind::Dashed => "–".to_owned(),
+            Kind::Numbered => format!("{number}."),
+            Kind::Checklist(true) => "☑".to_owned(),
+            Kind::Checklist(false) => "☐".to_owned(),
+            _ => String::new(),
+        }
+    }
+
     /// A table cell of an Apple Notes-style table (no headers).
     pub fn cell(cols: usize) -> Kind {
         Kind::Cell { cols: cols as u16, header_row: false, header_col: false }
@@ -444,15 +459,9 @@ impl Doc {
                 continue;
             }
             let pad = "    ".repeat(b.indent as usize);
-            let marker = match b.kind {
-                Kind::Bulleted => "• ".to_owned(),
-                Kind::Dashed => "– ".to_owned(),
-                Kind::Numbered => format!("{}. ", numbers[i]),
-                Kind::Checklist(true) => "☑ ".to_owned(),
-                Kind::Checklist(false) => "☐ ".to_owned(),
-                _ => String::new(),
-            };
-            lines.push(format!("{pad}{marker}{}", b.text));
+            let marker = b.kind.list_marker(numbers[i]);
+            let sep = if marker.is_empty() { "" } else { " " };
+            lines.push(format!("{pad}{marker}{sep}{}", b.text));
             i += 1;
         }
         lines.join("\n").trim_end_matches('\n').to_owned()

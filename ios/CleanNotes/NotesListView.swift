@@ -441,7 +441,7 @@ private struct GalleryCard: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
-                    Text(note.snippet == "No additional text" ? note.title : "\(note.title)\n\(note.snippet)")
+                    Text(note.empty ? note.title : "\(note.title)\n\(note.snippet)")
                         .font(.system(size: 9))
                         .foregroundStyle(.primary)
                         .padding(10)

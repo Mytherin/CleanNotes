@@ -55,7 +55,7 @@ struct FoldersView: View {
                 .accessibilityLabel("New Folder")
                 Spacer()
                 Button {
-                    let n = store.core.newNote(place: .folder(id: defaultFolder(overview)))
+                    let n = store.core.newNote(place: .folder(id: store.core.defaultFolder()))
                     path = [.list(n.place), .note(id: n.id, isNew: true)]
                 } label: {
                     Image(systemName: "square.and.pencil")
@@ -177,12 +177,6 @@ struct FoldersView: View {
             Divider()
             Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
         }
-    }
-
-    private func defaultFolder(_ overview: Overview) -> String {
-        let settings = store.core.settings()
-        let account = overview.accounts.first { $0.id == settings.defaultAccount } ?? overview.accounts.first
-        return account?.folders.first { $0.isDefault }?.id ?? ""
     }
 
     private func newFolder(account: String, parent: String?) {
