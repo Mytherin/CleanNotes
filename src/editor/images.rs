@@ -63,9 +63,12 @@ impl ImageCache {
                 let (dir, key, shared, ctx) = (self.dir.clone(), name.to_owned(), self.slots.clone(), ctx.clone());
                 std::thread::spawn(move || {
                     // A locked note's picture is decrypted here, in memory.
-                    let slot = match attachments::load(&dir, &key).and_then(|b| decode(&b)) {
-                        Some((img, size)) => Slot::Decoded(img, size),
-                        None => Slot::Unreadable,
+                    // (A decoder that panics on a damaged file, from another
+                    // device, makes it unreadable, not loading forever.)
+                    let loaded = std::panic::catch_unwind(|| attachments::load(&dir, &key).and_then(|b| decode(&b)));
+                    let slot = match loaded {
+                        Ok(Some((img, size))) => Slot::Decoded(img, size),
+                        _ => Slot::Unreadable,
                     };
                     shared.lock().unwrap_or_else(|e| e.into_inner()).insert(key, slot);
                     ctx.request_repaint();
