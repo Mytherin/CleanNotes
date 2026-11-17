@@ -11,6 +11,11 @@ use crate::theme::{self, Palette};
 #[derive(Clone, Debug)]
 pub struct NoteDrag(pub Vec<String>);
 
+/// The folder being dragged into another folder, or onto an account (to its
+/// top level).
+#[derive(Clone, Debug)]
+pub struct FolderDrag(pub String);
+
 const ROW_H: f32 = 32.0;
 /// The gap around the floating sidebar panel.
 const INSET: f32 = 8.0;
@@ -61,6 +66,51 @@ impl App {
             }
             self.tags_section(ui, p);
         });
+        self.folder_drag_preview(ui, p);
+    }
+
+    /// The folder being dragged, following the pointer.
+    fn folder_drag_preview(&self, ui: &Ui, p: &Palette) {
+        let Some(drag) = egui::DragAndDrop::payload::<FolderDrag>(ui.ctx()) else { return };
+        let (Some(pos), Some(f)) = (ui.ctx().pointer_latest_pos(), self.lib.store.folder(&drag.0)) else { return };
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, ui.id().with("folder drag")));
+        let galley = painter.layout_no_wrap(f.name.clone(), theme::font(14.0), p.text);
+        let rect = Rect::from_min_size(pos + Vec2::new(12.0, 6.0), Vec2::new(galley.size().x + 44.0, ROW_H - 4.0));
+        painter.rect(rect, 10.0, p.popover, egui::Stroke::new(1.0_f32, p.glass_edge));
+        icons::paint(&painter, Icon::Folder, Rect::from_center_size(Pos2::new(rect.left() + 18.0, rect.center().y), Vec2::splat(16.0)), p.text);
+        painter.galley(Pos2::new(rect.left() + 34.0, rect.center().y - galley.size().y / 2.0), galley, p.text);
+    }
+
+    /// The right-click menu's "Move To": an account's top level, or one of
+    /// its folders.
+    fn folder_move_to_menu(&mut self, ui: &mut Ui, id: &str) {
+        let accounts: Vec<(String, String)> =
+            self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let mut chosen: Option<(String, Option<String>)> = None;
+        for (i, (account, name)) in accounts.iter().enumerate() {
+            if i > 0 {
+                ui.separator();
+            }
+            let top = ui
+                .add_enabled(self.lib.can_move_folder(id, account, None), egui::Button::new(egui::RichText::new(name).strong()))
+                .on_hover_text(format!("The top level of “{name}”"));
+            if top.clicked() {
+                chosen = Some((account.clone(), None));
+            }
+            let tree: Vec<(String, String, usize)> =
+                self.lib.store.folder_tree(account).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
+            for (fid, fname, depth) in tree {
+                let label = format!("{}{fname}", "    ".repeat(depth + 1));
+                if ui.add_enabled(self.lib.can_move_folder(id, account, Some(&fid)), egui::Button::new(label)).clicked() {
+                    chosen = Some((account.clone(), Some(fid)));
+                }
+            }
+        }
+        if let Some((account, parent)) = chosen {
+            self.move_folder(id, &account, parent.as_deref());
+            ui.close_menu();
+            ui.memory_mut(|m| m.close_popup());
+        }
     }
 
     fn account_section(&mut self, ui: &mut Ui, p: &Palette, account: &str, name: &str) {
@@ -98,6 +148,13 @@ impl App {
             } else {
                 self.lib.settings.collapsed.push(account.to_owned());
             }
+        }
+        // A folder dropped on the account goes to its top level.
+        if resp.dnd_hover_payload::<FolderDrag>().is_some_and(|d| self.lib.can_move_folder(&d.0, account, None)) {
+            ui.painter().rect_stroke(rect.shrink2(Vec2::new(6.0, 1.0)), 10.0, egui::Stroke::new(2.0_f32, p.folder_selection));
+        }
+        if let Some(d) = resp.dnd_release_payload::<FolderDrag>() {
+            self.move_folder(&d.0, account, None);
         }
         let synced = self.lib.store.account(account).is_some_and(|a| a.synced());
         resp.context_menu(|ui| {
@@ -223,10 +280,28 @@ impl App {
             self.move_notes(&drag.0, id);
         }
         let account = self.lib.store.folder(id).map(|f| f.account.clone());
+        // Folders can be dragged into other folders (not the default one,
+        // which stays where it is).
+        if !default {
+            resp.dnd_set_drag_payload(FolderDrag(id.to_owned()));
+        }
+        if let Some(acc) = &account {
+            if resp.dnd_hover_payload::<FolderDrag>().is_some_and(|d| self.lib.can_move_folder(&d.0, acc, Some(id))) {
+                ui.painter().rect_stroke(resp.rect.shrink2(Vec2::new(6.0, 1.0)), 10.0, egui::Stroke::new(2.0_f32, p.folder_selection));
+            }
+            if let Some(d) = resp.dnd_release_payload::<FolderDrag>() {
+                self.move_folder(&d.0, acc, Some(id));
+            }
+        }
         resp.context_menu(|ui| {
             if ui.button("New Folder").clicked() {
                 self.new_folder(account.clone(), Some(id.to_owned()));
                 ui.close_menu();
+            }
+            if default {
+                ui.add_enabled(false, egui::Button::new("Move To"));
+            } else {
+                ui.menu_button("Move To", |ui| self.folder_move_to_menu(ui, id));
             }
             if ui.add_enabled(!default, egui::Button::new("Rename Folder")).clicked() {
                 self.rename = Some(Rename { folder: id.to_owned(), text: name.to_owned(), focus: true });
@@ -242,7 +317,8 @@ impl App {
     /// A sidebar row: icon, name, count, selection highlight.
     #[allow(clippy::too_many_arguments)]
     fn row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
+        // Draggable too: folder rows can be dragged into other folders.
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click_and_drag());
         let inner = rect.shrink2(Vec2::new(6.0, 1.0));
         let painter = ui.painter();
         let drop_hover = resp.dnd_hover_payload::<NoteDrag>().is_some();

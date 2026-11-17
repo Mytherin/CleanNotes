@@ -851,6 +851,96 @@ impl Library {
         Ok(())
     }
 
+    /// Whether a folder can be moved into `parent` (a folder, or `None` for
+    /// the top level of `account`): not an account's "Notes" folder, not
+    /// into itself or a folder inside it, and not to where it already is.
+    pub fn can_move_folder(&self, id: &str, account: &str, parent: Option<&str>) -> bool {
+        let Some(f) = self.store.folder(id) else { return false };
+        if f.default || self.store.account(account).is_none() {
+            return false;
+        }
+        if let Some(p) = parent {
+            match self.store.folder(p) {
+                Some(pf) if pf.account == account => {}
+                _ => return false,
+            }
+            if self.store.folder_and_descendants(id).iter().any(|d| d == p) {
+                return false;
+            }
+        }
+        !(f.account == account && f.parent.as_deref() == parent)
+    }
+
+    /// Moves a folder, with the folders and notes in it, into `parent` (or
+    /// the top level of `account`), possibly in another account. A name
+    /// already used there gets a number ("Work 2"). Returns whether it moved.
+    pub fn move_folder(&mut self, id: &str, account: &str, parent: Option<&str>) -> bool {
+        if !self.can_move_folder(id, account, parent) {
+            return false;
+        }
+        let f = self.store.folder(id).cloned().unwrap();
+        // A free name among its new siblings (not counting itself).
+        let name = {
+            let taken = |n: &str| {
+                self.store.folders.iter().any(|o| {
+                    o.id != f.id && o.account == account && o.parent.as_deref() == parent && o.name.eq_ignore_ascii_case(n)
+                })
+            };
+            if taken(&f.name) {
+                (2..).map(|i| format!("{} {i}", f.name)).find(|n| !taken(n)).unwrap()
+            } else {
+                f.name.clone()
+            }
+        };
+        if f.account == account {
+            // In the same account it's a change of path, synced like a rename.
+            let m = self.store.folder_mut(id).unwrap();
+            m.parent = parent.map(str::to_owned);
+            m.name = name;
+        } else {
+            // Into another account: its notes move as notes moved there do
+            // (gone from the old account, new in the new one), and its folders
+            // are deleted from the old account and made new in the new one.
+            let ids = self.store.folder_and_descendants(id);
+            let old_default = self.default_folder_id(&f.account);
+            let notes: Vec<(String, bool)> =
+                self.store.notes.iter().filter(|n| ids.contains(&n.folder)).map(|n| (n.id.clone(), n.deleted.is_some())).collect();
+            // Folders first, so the notes find them in the new account.
+            for fid in &ids {
+                let path = self.store.folder_path(fid);
+                let fo = self.store.folder(fid).unwrap();
+                if let Some(remote_id) = fo.sync.remote_id.clone() {
+                    let path = fo.sync.synced_path.clone().unwrap_or(path);
+                    self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
+                }
+            }
+            for fid in &ids {
+                let m = self.store.folder_mut(fid).unwrap();
+                m.account = account.to_owned();
+                m.sync = Default::default();
+                if fid == id {
+                    m.parent = parent.map(str::to_owned);
+                    m.name = name.clone();
+                }
+            }
+            for (nid, deleted) in notes {
+                if deleted {
+                    // Recently Deleted stays with the old account.
+                    let n = self.store.note_mut(&nid).unwrap();
+                    n.folder = old_default.clone();
+                    n.touch();
+                    self.unsaved.insert(nid);
+                } else {
+                    let folder = self.store.note(&nid).unwrap().folder.clone();
+                    self.move_one(&nid, &folder);
+                }
+            }
+        }
+        // Where it went opens up to show it.
+        self.settings.collapsed.retain(|c| Some(c.as_str()) != parent && c != account);
+        true
+    }
+
     /// Deletes a folder and the folders in it; their notes go to Recently
     /// Deleted. Returns the folders deleted. A default folder itself stays
     /// (notes with nowhere else to go still land in it), just out of the
@@ -1891,6 +1981,66 @@ mod tests {
         // As does making a folder called Notes, for good.
         assert_eq!(lib.new_folder(LOCAL, None, Some("notes")), notes);
         assert_eq!(shown(&lib), ["Notes", "Work"]);
+    }
+
+    #[test]
+    fn folders_move_into_other_folders() {
+        let (mut lib, _d) = lib();
+        let work = lib.new_folder(LOCAL, None, Some("Work"));
+        let plans = lib.new_folder(LOCAL, None, Some("Plans"));
+        let inner = lib.new_folder(LOCAL, Some(&plans), Some("2026"));
+        let n = add(&mut lib, &inner, "# Trip\n");
+        lib.settings.collapsed.push(work.clone());
+        assert!(lib.move_folder(&plans, LOCAL, Some(&work)));
+        assert_eq!(lib.store.folder_path(&inner), ["Work", "Plans", "2026"]);
+        assert_eq!(lib.store.note(&n).unwrap().folder, inner, "notes stay in their folder");
+        assert!(!lib.settings.collapsed.contains(&work), "the new parent opens up");
+        // Not into itself or a folder inside it, nor where it already is.
+        assert!(!lib.move_folder(&plans, LOCAL, Some(&plans)));
+        assert!(!lib.move_folder(&plans, LOCAL, Some(&inner)));
+        assert!(!lib.move_folder(&plans, LOCAL, Some(&work)));
+        // The default folder stays put.
+        let home = lib.default_folder_id(LOCAL);
+        assert!(!lib.move_folder(&home, LOCAL, Some(&work)));
+        // Back to the top, where a folder of the same name gets a number.
+        let other = lib.new_folder(LOCAL, None, Some("plans"));
+        assert!(lib.move_folder(&plans, LOCAL, None));
+        assert_eq!(lib.store.folder(&plans).unwrap().parent, None);
+        assert_eq!(lib.store.folder(&plans).unwrap().name, "Plans 2");
+        assert_eq!(lib.store.folder(&other).unwrap().name, "plans");
+    }
+
+    #[test]
+    fn a_folder_moved_to_another_account_takes_its_notes() {
+        let (mut lib, _d) = lib();
+        let mut acc = lib.store.accounts[0].clone();
+        acc.id = "other".into();
+        acc.name = "Other".into();
+        lib.store.accounts.push(acc);
+        lib.store.ensure_local();
+        let plans = lib.new_folder(LOCAL, None, Some("Plans"));
+        let inner = lib.new_folder(LOCAL, Some(&plans), Some("2026"));
+        lib.store.folder_mut(&plans).unwrap().sync =
+            model::FolderSync { remote_id: Some("r1".into()), synced_path: Some(vec!["Plans".into()]), revision: None };
+        let kept = add(&mut lib, &inner, "# Trip\n");
+        lib.store.note_mut(&kept).unwrap().sync.remote_id = Some("n1".into());
+        let gone = add(&mut lib, &plans, "# Old\n");
+        lib.store.note_mut(&gone).unwrap().deleted = Some(Utc::now());
+        assert!(lib.move_folder(&plans, "other", None));
+        for f in [&plans, &inner] {
+            let f = lib.store.folder(f).unwrap();
+            assert_eq!(f.account, "other");
+            assert!(f.sync.remote_id.is_none(), "made new in the new account");
+        }
+        let n = lib.store.note(&kept).unwrap();
+        assert_eq!((n.account.as_str(), n.folder.as_str()), ("other", inner.as_str()));
+        assert!(n.sync.remote_id.is_none());
+        let t = &lib.store.tombstones;
+        assert!(t.iter().any(|t| t.account == LOCAL && !t.note && t.remote_id == "r1"), "the folder goes from the old account");
+        assert!(t.iter().any(|t| t.account == LOCAL && t.note && t.remote_id == "n1"), "so does the note");
+        // Recently Deleted stays behind.
+        let g = lib.store.note(&gone).unwrap();
+        assert_eq!((g.account.as_str(), g.folder.clone()), (LOCAL, lib.default_folder_id(LOCAL)));
     }
 
     #[test]

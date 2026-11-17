@@ -147,7 +147,11 @@ struct FoldersView: View {
                         .swipeActions(edge: .trailing) {
                             Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
                         }
-                        .contextMenu { folderMenu(f, account: account) }
+                        .contextMenu { folderMenu(f, account: account, accounts: overview.accounts) }
+                        .folderDrag(f)
+                        .dropDestination(for: String.self) { items, _ in
+                            dropFolders(items, account: account.id, parent: f.id)
+                        }
                     }
                     if account.deletedCount > 0 {
                         NavigationLink(value: Route.list(.deleted(account: account.id))) {
@@ -155,7 +159,11 @@ struct FoldersView: View {
                         }
                     }
                 } header: {
+                    // A folder dropped on the account goes to its top level.
                     AccountHeader(account: account)
+                        .dropDestination(for: String.self) { items, _ in
+                            dropFolders(items, account: account.id, parent: nil)
+                        }
                 }
             }
             if !overview.smartFolders.isEmpty {
@@ -199,7 +207,7 @@ struct FoldersView: View {
     }
 
     @ViewBuilder
-    private func folderMenu(_ f: FolderItem, account: AccountItem) -> some View {
+    private func folderMenu(_ f: FolderItem, account: AccountItem, accounts: [AccountItem]) -> some View {
         if !f.isDefault {
             Button {
                 folderName = f.name
@@ -216,8 +224,43 @@ struct FoldersView: View {
                 Label(collapsed.contains(f.id) ? "Show Subfolders" : "Hide Subfolders", systemImage: "chevron.down")
             }
         }
+        if !f.isDefault {
+            Menu {
+                ForEach(accounts) { a in
+                    Section(a.name) {
+                        Button("Top Level") { moveFolder(f.id, account: a.id, parent: nil) }
+                            .disabled(!store.core.canMoveFolder(id: f.id, account: a.id, parent: nil))
+                        ForEach(a.folders) { t in
+                            Button(String(repeating: "\u{2003}", count: Int(t.depth)) + t.name) {
+                                moveFolder(f.id, account: a.id, parent: t.id)
+                            }
+                            .disabled(!store.core.canMoveFolder(id: f.id, account: a.id, parent: t.id))
+                        }
+                    }
+                }
+            } label: { Label("Move", systemImage: "folder") }
+        }
         Divider()
         Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
+    }
+
+    /// Folders dragged onto a folder (or onto an account: `parent` nil) move
+    /// into it.
+    private func dropFolders(_ items: [String], account: String, parent: String?) -> Bool {
+        var moved = false
+        for item in items where item.hasPrefix(folderDragPrefix) {
+            moved = moveFolder(String(item.dropFirst(folderDragPrefix.count)), account: account, parent: parent) || moved
+        }
+        return moved
+    }
+
+    @discardableResult
+    private func moveFolder(_ id: String, account: String, parent: String?) -> Bool {
+        guard store.core.moveFolder(id: id, account: account, parent: parent) else { return false }
+        // Where it went opens up to show it.
+        collapsed.remove(parent ?? account)
+        store.changed()
+        return true
     }
 
     private func newFolder(account: String, parent: String?) {
@@ -378,6 +421,24 @@ struct SmartFolderEditor: View {
         store.changed()
         dismiss()
         saved(id)
+    }
+}
+
+/// What a dragged folder carries: its id, marked so text dragged in from
+/// elsewhere isn't taken for one.
+private let folderDragPrefix = "cleannotes-folder:"
+
+private extension View {
+    /// Folders other than "Notes" can be dragged into other folders.
+    @ViewBuilder
+    func folderDrag(_ f: FolderItem) -> some View {
+        if f.isDefault {
+            self
+        } else {
+            draggable(folderDragPrefix + f.id) {
+                FolderRow(name: f.name, icon: "folder", count: nil)
+            }
+        }
     }
 }
 
