@@ -85,7 +85,10 @@ struct NotesListView: View {
     }
 
     private func list(_ sections: [NoteSection]) -> some View {
-        List(selection: $selection) {
+        // Selection only while selecting notes: otherwise a tap would also
+        // select the note it opens, and it would stay highlighted when you
+        // come back to the list (Apple Notes clears it).
+        List(selection: editMode.isEditing ? $selection : nil) {
             ForEach(sections, id: \.title) { section in
                 Section {
                     if section.title.isEmpty || !collapsed.contains(section.title) {

@@ -5,6 +5,7 @@ use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Ui, Vec2};
 
 use super::{App, Confirm, Location, Pane, Rename, TOOLBAR_H};
 use crate::icons::{self, Icon};
+use crate::menu;
 use crate::theme::{self, Palette};
 
 /// The notes being dragged onto a folder.
@@ -113,10 +114,12 @@ impl App {
         let mut chosen: Option<(String, Option<String>)> = None;
         for (i, (account, name)) in accounts.iter().enumerate() {
             if i > 0 {
-                ui.separator();
+                menu::separator(ui);
             }
-            let top = ui
-                .add_enabled(self.lib.can_move_folder(id, account, None), egui::Button::new(egui::RichText::new(name).strong()))
+            let top = menu::item(name)
+                .icon(Icon::Notes)
+                .enabled(self.lib.can_move_folder(id, account, None))
+                .show(ui)
                 .on_hover_text(format!("The top level of “{name}”"));
             if top.clicked() {
                 chosen = Some((account.clone(), None));
@@ -124,8 +127,8 @@ impl App {
             let tree: Vec<(String, String, usize)> =
                 self.lib.store.folder_tree(account).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
             for (fid, fname, depth) in tree {
-                let label = format!("{}{fname}", "    ".repeat(depth + 1));
-                if ui.add_enabled(self.lib.can_move_folder(id, account, Some(&fid)), egui::Button::new(label)).clicked() {
+                let item = menu::item(&fname).icon(Icon::Folder).indent(depth + 1);
+                if item.enabled(self.lib.can_move_folder(id, account, Some(&fid))).show(ui).clicked() {
                     chosen = Some((account.clone(), Some(fid)));
                 }
             }
@@ -182,17 +185,15 @@ impl App {
         }
         let synced = self.lib.store.account(account).is_some_and(|a| a.synced());
         resp.context_menu(|ui| {
-            if ui.button("New Folder").clicked() {
+            menu::begin(ui, 200.0);
+            if menu::item("New Folder").icon(Icon::FolderPlus).show(ui).clicked() {
                 self.new_folder(Some(account.to_owned()), None);
-                ui.close_menu();
             }
-            if synced && ui.button("Sync Now").clicked() {
+            if synced && menu::item("Sync Now").icon(Icon::Sync).show(ui).clicked() {
                 self.sync_now(account);
-                ui.close_menu();
             }
-            if ui.button("Account Settings…").clicked() {
+            if menu::item("Account Settings…").icon(Icon::Gear).show(ui).clicked() {
                 self.settings_ui.open_account(account);
-                ui.close_menu();
             }
         });
         if collapsed {
@@ -252,9 +253,9 @@ impl App {
                 self.focus = Pane::Sidebar;
             }
             resp.context_menu(|ui| {
-                if ui.button("Empty Recently Deleted…").clicked() {
+                menu::begin(ui, 200.0);
+                if menu::item("Empty Recently Deleted…").icon(Icon::Trash).show(ui).clicked() {
                     self.confirm = Some(Confirm::EmptyDeleted(account.to_owned()));
-                    ui.close_menu();
                 }
             });
         }
@@ -373,22 +374,17 @@ impl App {
             }
         }
         resp.context_menu(|ui| {
-            if ui.button("New Folder").clicked() {
+            menu::begin(ui, 200.0);
+            if menu::item("New Folder").icon(Icon::FolderPlus).show(ui).clicked() {
                 self.new_folder(account.clone(), Some(id.to_owned()));
-                ui.close_menu();
             }
-            if default {
-                ui.add_enabled(false, egui::Button::new("Move To"));
-            } else {
-                ui.menu_button("Move To", |ui| self.folder_move_to_menu(ui, id));
-            }
-            if ui.add_enabled(!default, egui::Button::new("Rename Folder")).clicked() {
+            menu::submenu(ui, "Move To", Some(Icon::Folder), !default, |ui| self.folder_move_to_menu(ui, id));
+            if menu::item("Rename Folder").icon(Icon::Rename).enabled(!default).show(ui).clicked() {
                 self.rename = Some(Rename { folder: id.to_owned(), text: name.to_owned(), focus: true });
-                ui.close_menu();
             }
-            if ui.button("Delete Folder").clicked() {
+            menu::separator(ui);
+            if menu::item("Delete Folder").icon(Icon::Trash).show(ui).clicked() {
                 self.confirm = Some(Confirm::DeleteFolder(id.to_owned()));
-                ui.close_menu();
             }
         });
     }

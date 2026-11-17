@@ -6,6 +6,7 @@ use eframe::egui::{self, Align2, Pos2, Rect, Sense, Ui, Vec2};
 use super::sidebar::{glass_button, menu_look, popover_frame, submenu, tool_button, truncate, NoteDrag};
 use super::{list_time, App, Confirm, Location, Pane, TOOLBAR_H};
 use crate::icons::Icon;
+use crate::menu;
 use crate::markdown;
 use crate::settings::ListView;
 use crate::theme::{self, Palette};
@@ -215,44 +216,39 @@ impl App {
         let several = ids.len() > 1;
         let noun = if several { "Notes" } else { "Note" };
         resp.context_menu(|ui| {
-            ui.set_min_width(190.0);
+            menu::begin(ui, 200.0);
             if n.deleted.is_some() {
-                if ui.button("Recover").clicked() {
+                if menu::item("Recover").show(ui).clicked() {
                     for id in &ids {
                         self.recover_note(id);
                     }
-                    ui.close_menu();
                 }
-                if ui.button("Delete Permanently…").clicked() {
+                if menu::item("Delete Permanently…").icon(Icon::Trash).show(ui).clicked() {
                     self.confirm = Some(Confirm::DeleteNotesForever(ids.clone()));
-                    ui.close_menu();
                 }
                 return;
             }
             let all_pinned = ids.iter().all(|i| self.lib.store.note(i).is_some_and(|n| n.pinned));
-            if ui.button(format!("{} {noun}", if all_pinned { "Unpin" } else { "Pin" })).clicked() {
+            if menu::item(&format!("{} {noun}", if all_pinned { "Unpin" } else { "Pin" })).icon(Icon::Pin).show(ui).clicked() {
                 for id in &ids {
                     if self.lib.store.note(id).is_some_and(|n| n.pinned == all_pinned) {
                         self.toggle_pin(id);
                     }
                 }
-                ui.close_menu();
             }
-            ui.menu_button("Move to", |ui| self.move_to_menu(ui, &ids));
-            if !several && ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
+            menu::submenu(ui, "Move to", Some(Icon::Folder), true, |ui| self.move_to_menu(ui, &ids));
+            if !several && menu::item("Duplicate Note").icon(Icon::Copy).shortcut(cmd_key!("D")).show(ui).clicked() {
                 self.duplicate_note(id);
-                ui.close_menu();
             }
             // Locks those not locked yet; hidden once they all are.
             let to_lock = ids.iter().filter(|i| self.can_lock(i)).count();
             if to_lock > 0 {
                 let label = if to_lock > 1 { format!("Lock {to_lock} Notes") } else { "Lock Note".to_owned() };
-                if ui.button(label).clicked() {
+                if menu::item(&label).icon(Icon::LockOutline).show(ui).clicked() {
                     self.lock_notes(&ids);
-                    ui.close_menu();
                 }
             }
-            if ui.button("Copy as Markdown").clicked() {
+            if menu::item("Copy as Markdown").show(ui).clicked() {
                 let text: Vec<String> = ids.iter().filter_map(|i| self.plain_body(i)).collect();
                 ui.ctx().copy_text(text.join("
 
@@ -261,11 +257,10 @@ impl App {
 "));
                 ui.close_menu();
             }
-            ui.separator();
+            menu::separator(ui);
             let label = if several { format!("Delete {} Notes", ids.len()) } else { "Delete".to_owned() };
-            if ui.add(egui::Button::new(label).shortcut_text(cmd_key!("Backspace"))).clicked() {
+            if menu::item(&label).icon(Icon::Trash).shortcut(cmd_key!("Backspace")).show(ui).clicked() {
                 self.delete_notes(ids.clone());
-                ui.close_menu();
             }
         });
     }
@@ -276,14 +271,13 @@ impl App {
         let several = accounts.len() > 1;
         for (aid, aname) in accounts {
             if several {
-                ui.label(egui::RichText::new(aname).small().strong());
+                menu::header(ui, &aname);
             }
             let folders: Vec<(String, String, usize)> =
                 self.lib.store.folder_tree(&aid).into_iter().map(|(f, d)| (f.id.clone(), f.name.clone(), d)).collect();
             for (fid, fname, depth) in folders {
-                let label = format!("{}{}", "    ".repeat(depth), fname);
                 let all_there = ids.iter().all(|i| self.lib.store.note(i).is_some_and(|n| n.folder == fid));
-                if ui.add_enabled(!all_there, egui::Button::new(label)).clicked() {
+                if menu::item(&fname).icon(Icon::Folder).indent(depth).enabled(!all_there).show(ui).clicked() {
                     self.move_notes(ids, &fid);
                     ui.close_menu();
                     ui.memory_mut(|m| m.close_popup());

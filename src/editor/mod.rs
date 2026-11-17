@@ -14,6 +14,8 @@ use std::ops::{Deref, DerefMut};
 use eframe::egui::{self, text::CCursor, Event, Key, Modifiers, Pos2, Rect, Sense, Vec2};
 
 use crate::doc::{Attr, FileView, Kind, Pos, Selection};
+use crate::icons::Icon;
+use crate::menu;
 use crate::theme::{self, Palette};
 pub use cleannotes_core::editing::{Command, Editing};
 
@@ -92,7 +94,8 @@ enum MenuChoice {
     File(FileAction),
     View(FileView),
     Rename,
-    Delete,
+    Cut,
+    Paste,
 }
 
 /// The "Add Link" sheet.
@@ -1038,74 +1041,82 @@ impl Editor {
     }
 
     /// What an attached file's menu shows for the card of paragraph
-    /// `block`: "PDF Document · 211 KB", whether Quick Look is there, and
-    /// its view (`None`: no View As, for a file that isn't a PDF).
-    fn menu_info(&self, opts: &Options, block: usize) -> Option<(String, bool, Option<FileView>)> {
+    /// `block`: whether Quick Look is there, and its view (`None`: no View
+    /// As, for a file that isn't a PDF).
+    fn menu_info(&self, block: usize) -> Option<(bool, Option<FileView>)> {
         let f = self.laid.get(block)?.file.as_ref()?;
-        let kind = cards::kind_name(&f.ext);
-        let header = match opts.pdfs.file_size(&f.reference) {
-            Some(n) => format!("{kind} · {}", cards::size_text(n)),
-            None => kind,
-        };
         let readable = f.pdf && (f.view != FileView::Small || !f.pages.is_empty());
         let view = f.pdf.then(|| self.doc.file_view(block));
-        Some((header, readable, view))
+        Some((readable, view))
     }
 
     /// An attached file's menu, as in Apple Notes (less Markup; Share… is
     /// Save As…: Windows has no share sheet to hand a file to).
-    fn attachment_menu(ui: &mut egui::Ui, header: &str, quick_look: bool, view: Option<FileView>, editable: bool) -> Option<MenuChoice> {
-        ui.set_min_width(220.0);
+    fn attachment_menu(ui: &mut egui::Ui, quick_look: bool, view: Option<FileView>, editable: bool) -> Option<MenuChoice> {
+        menu::begin(ui, 220.0);
         let mut choice = None;
-        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, c: MenuChoice| {
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+        let mut item = |ui: &mut egui::Ui, label: &str, icon: Icon, enabled: bool, c: MenuChoice| {
+            if menu::item(label).icon(icon).enabled(enabled).show(ui).clicked() {
                 choice = Some(c);
-                ui.close_menu();
             }
         };
-        ui.label(egui::RichText::new(header).size(12.5).color(ui.visuals().weak_text_color()));
-        ui.separator();
-        item(ui, "Quick Look Attachment", quick_look, MenuChoice::File(FileAction::QuickLook));
-        item(ui, "Open Attachment", true, MenuChoice::File(FileAction::Open));
-        ui.separator();
+        item(ui, "Cut", Icon::Cut, editable, MenuChoice::Cut);
+        item(ui, "Copy", Icon::Copy, true, MenuChoice::File(FileAction::Copy));
+        item(ui, "Paste", Icon::Paste, editable, MenuChoice::Paste);
+        menu::separator(ui);
+        item(ui, "Save As…", Icon::Share, true, MenuChoice::File(FileAction::SaveAs));
+        menu::separator(ui);
         if let Some(current) = view {
-            ui.add_enabled_ui(editable, |ui| {
-                ui.menu_button("View As", |ui| {
-                    for (label, v) in [("Small", FileView::Small), ("Medium", FileView::Medium), ("Large", FileView::Large)] {
-                        if ui.add(egui::Button::new(label).selected(v == current)).clicked() {
-                            choice = Some(MenuChoice::View(v));
-                            ui.close_menu();
-                        }
+            let chosen = menu::submenu(ui, "View As", Some(Icon::ViewAs), editable, |ui| {
+                menu::begin(ui, 120.0);
+                let mut chosen = None;
+                for (label, v) in [("Small", FileView::Small), ("Medium", FileView::Medium), ("Large", FileView::Large)] {
+                    if menu::item(label).checked(v == current).show(ui).clicked() {
+                        chosen = Some(MenuChoice::View(v));
                     }
-                });
+                }
+                chosen
             });
-        }
-        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, c: MenuChoice| {
-            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+            if let Some(Some(c)) = chosen {
                 choice = Some(c);
-                ui.close_menu();
+            }
+        }
+        let mut item = |ui: &mut egui::Ui, label: &str, icon: Icon, enabled: bool, c: MenuChoice| {
+            if menu::item(label).icon(icon).enabled(enabled).show(ui).clicked() {
+                choice = Some(c);
             }
         };
-        item(ui, "Rename Attachment…", editable, MenuChoice::Rename);
-        ui.separator();
-        item(ui, "Copy", true, MenuChoice::File(FileAction::Copy));
-        item(ui, "Save As…", true, MenuChoice::File(FileAction::SaveAs));
-        ui.separator();
-        item(ui, "Delete", editable, MenuChoice::Delete);
+        item(ui, "Rename Attachment…", Icon::Rename, editable, MenuChoice::Rename);
+        menu::separator(ui);
+        item(ui, "Quick Look Attachment", Icon::Eye, quick_look, MenuChoice::File(FileAction::QuickLook));
+        item(ui, "Open Attachment", Icon::OpenApp, true, MenuChoice::File(FileAction::Open));
         choice
     }
 
     /// Does what was chosen in the menu of the attached file of paragraph
     /// `block`.
-    fn apply_menu_choice(&mut self, block: usize, choice: MenuChoice, opts: &Options, out: &mut Output) {
+    fn apply_menu_choice(&mut self, ctx: &egui::Context, block: usize, choice: MenuChoice, opts: &Options, out: &mut Output) {
         let Some(f) = self.laid.get(block).and_then(|l| l.file.as_ref()) else { return };
         let (reference, label) = (f.reference.clone(), f.label.clone());
         let editable = !opts.read_only;
         match choice {
             MenuChoice::File(action) => out.file_action = Some((action, reference, label)),
+            // The file on the clipboard (pasting it attaches it again), and
+            // gone from the note.
+            MenuChoice::Cut if editable => {
+                out.file_action = Some((FileAction::Copy, reference, label));
+                self.command(Command::DeleteFile { block });
+            }
+            // On the line after the card, where the caret goes after
+            // attaching a file.
+            MenuChoice::Paste if editable => {
+                let at = if block + 1 < self.doc.blocks.len() { Pos::new(block + 1, 0) } else { Pos::new(block, self.doc.blocks[block].len()) };
+                self.sel = Selection::caret(at);
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                out.paste_image = opts.can_attach;
+            }
             MenuChoice::View(view) if editable => self.command(Command::SetFileView { block, view }),
             MenuChoice::Rename if editable => self.rename_sheet = Some(RenameSheet { block, label, focus: true }),
-            MenuChoice::Delete if editable => self.command(Command::DeleteFile { block }),
             _ => out.blocked_edit = true,
         }
     }
@@ -1115,13 +1126,14 @@ impl Editor {
         let editable = !opts.read_only;
         let buttons: Vec<(usize, Rect)> = self.laid.iter().enumerate().filter_map(|(i, l)| l.file.as_ref().map(|f| (i, f.menu))).collect();
         for (block, rect) in buttons {
-            let Some((header, quick_look, view)) = self.menu_info(opts, block) else { continue };
+            let Some((quick_look, view)) = self.menu_info(block) else { continue };
             // (Drawn by the card: the button is only where it's clicked.)
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("file-menu", block)));
             let button = egui::Button::new("").frame(false).min_size(rect.size());
-            let chosen = egui::menu::menu_custom_button(&mut child, button, |ui| Self::attachment_menu(ui, &header, quick_look, view, editable));
+            let chosen = egui::menu::menu_custom_button(&mut child, button, |ui| Self::attachment_menu(ui, quick_look, view, editable));
             if let Some(Some(choice)) = chosen.inner {
-                self.apply_menu_choice(block, choice, opts, out);
+                let ctx = ui.ctx().clone();
+                self.apply_menu_choice(&ctx, block, choice, opts, out);
             }
         }
     }
@@ -1129,14 +1141,14 @@ impl Editor {
     fn context_menu(&mut self, resp: &egui::Response, opts: &Options, ctx: &egui::Context, out: &mut Output) {
         // Right-clicked on an attached file's card: its menu.
         if let Some(block) = self.file_menu {
-            let Some((header, quick_look, view)) = self.menu_info(opts, block) else {
+            let Some((quick_look, view)) = self.menu_info(block) else {
                 self.file_menu = None;
                 return;
             };
             let mut chosen = None;
-            resp.context_menu(|ui| chosen = Self::attachment_menu(ui, &header, quick_look, view, !opts.read_only));
+            resp.context_menu(|ui| chosen = Self::attachment_menu(ui, quick_look, view, !opts.read_only));
             if let Some(choice) = chosen {
-                self.apply_menu_choice(block, choice, opts, out);
+                self.apply_menu_choice(ctx, block, choice, opts, out);
                 self.file_menu = None;
             }
             return;
@@ -1144,96 +1156,78 @@ impl Editor {
         let has_sel = !self.sel.is_empty();
         let editable = !opts.read_only;
         resp.context_menu(|ui| {
-            ui.set_min_width(200.0);
-            let item = |ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool| {
-                ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked()
-            };
-            if item(ui, "Cut", cmd_key!("X"), has_sel && editable) {
+            menu::begin(ui, 220.0);
+            if menu::item("Cut").icon(Icon::Cut).shortcut(cmd_key!("X")).enabled(has_sel && editable).show(ui).clicked() {
                 self.copy(ctx, out);
                 self.delete_selected();
-                ui.close_menu();
             }
-            if item(ui, "Copy", cmd_key!("C"), has_sel) {
+            if menu::item("Copy").icon(Icon::Copy).shortcut(cmd_key!("C")).enabled(has_sel).show(ui).clicked() {
                 self.copy(ctx, out);
-                ui.close_menu();
             }
-            if item(ui, "Paste", cmd_key!("V"), editable) {
+            if menu::item("Paste").icon(Icon::Paste).shortcut(cmd_key!("V")).enabled(editable).show(ui).clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                 // (A picture on the clipboard is the app's to paste.)
                 out.paste_image = opts.can_attach;
-                ui.close_menu();
             }
-            if item(ui, "Copy as Markdown", "", true) {
+            if menu::item("Copy as Markdown").show(ui).clicked() {
                 self.copy_markdown(ctx);
-                ui.close_menu();
             }
-            ui.separator();
-            if item(ui, "Select All", cmd_key!("A"), true) {
+            menu::separator(ui);
+            if menu::item("Select All").shortcut(cmd_key!("A")).show(ui).clicked() {
                 self.command(Command::SelectAll);
-                ui.close_menu();
             }
-            ui.separator();
-            ui.add_enabled_ui(editable, |ui| {
-                ui.menu_button("Font", |ui| {
-                    for (label, a, sc) in [
-                        ("Bold", Attr::Bold, cmd_key!("B")),
-                        ("Italic", Attr::Italic, cmd_key!("I")),
-                        ("Underline", Attr::Underline, cmd_key!("U")),
-                        ("Strikethrough", Attr::Strike, cmd_key!("Shift+X")),
-                    ] {
-                        if ui.add(egui::Button::new(label).shortcut_text(sc).selected(self.has_attr(a))).clicked() {
-                            self.command(Command::ToggleAttr(a));
-                            ui.close_menu();
-                        }
+            menu::separator(ui);
+            menu::submenu(ui, "Font", Some(Icon::Format), editable, |ui| {
+                menu::begin(ui, 180.0);
+                for (label, a, sc) in [
+                    ("Bold", Attr::Bold, cmd_key!("B")),
+                    ("Italic", Attr::Italic, cmd_key!("I")),
+                    ("Underline", Attr::Underline, cmd_key!("U")),
+                    ("Strikethrough", Attr::Strike, cmd_key!("Shift+X")),
+                ] {
+                    if menu::item(label).shortcut(sc).checked(self.has_attr(a)).show(ui).clicked() {
+                        self.command(Command::ToggleAttr(a));
                     }
-                });
-                if item(ui, "Add Link…", cmd_key!("K"), true) {
-                    self.command(Command::EditLink);
-                    ui.close_menu();
-                }
-                if item(ui, "Attach Image…", "", opts.can_attach) {
-                    out.attach_image = true;
-                    ui.close_menu();
-                }
-                if item(ui, "Attach File…", "", opts.can_attach) {
-                    out.attach_file = true;
-                    ui.close_menu();
-                }
-                let block = self.sel.caret.block;
-                if let Kind::Cell { header_row, header_col, .. } = self.doc.blocks[block].kind {
-                    ui.separator();
-                    for (label, c) in [
-                        ("Add Row Above", Command::AddRowAbove),
-                        ("Add Row Below", Command::AddRowBelow),
-                        ("Add Column Before", Command::AddColumnBefore),
-                        ("Add Column After", Command::AddColumnAfter),
-                    ] {
-                        if item(ui, label, "", true) {
-                            self.command(c);
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    for (label, c) in [("Delete Row", Command::DeleteRow), ("Delete Column", Command::DeleteColumn), ("Delete Table", Command::DeleteTable)] {
-                        if item(ui, label, "", true) {
-                            self.command(c);
-                            ui.close_menu();
-                        }
-                    }
-                    ui.separator();
-                    if ui.add(egui::Button::new("Header Row").selected(header_row)).clicked() {
-                        self.command(Command::ToggleHeaderRow);
-                        ui.close_menu();
-                    }
-                    if ui.add(egui::Button::new("Header Column").selected(header_col)).clicked() {
-                        self.command(Command::ToggleHeaderColumn);
-                        ui.close_menu();
-                    }
-                } else if item(ui, "Table", cmd_key!("Alt+T"), true) {
-                    self.command(Command::InsertTable);
-                    ui.close_menu();
                 }
             });
+            if menu::item("Add Link…").icon(Icon::Link).shortcut(cmd_key!("K")).enabled(editable).show(ui).clicked() {
+                self.command(Command::EditLink);
+            }
+            if menu::item("Attach Image…").icon(Icon::Photo).enabled(editable && opts.can_attach).show(ui).clicked() {
+                out.attach_image = true;
+            }
+            if menu::item("Attach File…").icon(Icon::Paperclip).enabled(editable && opts.can_attach).show(ui).clicked() {
+                out.attach_file = true;
+            }
+            let block = self.sel.caret.block;
+            if let Kind::Cell { header_row, header_col, .. } = self.doc.blocks[block].kind {
+                menu::separator(ui);
+                for (label, c) in [
+                    ("Add Row Above", Command::AddRowAbove),
+                    ("Add Row Below", Command::AddRowBelow),
+                    ("Add Column Before", Command::AddColumnBefore),
+                    ("Add Column After", Command::AddColumnAfter),
+                ] {
+                    if menu::item(label).enabled(editable).show(ui).clicked() {
+                        self.command(c);
+                    }
+                }
+                menu::separator(ui);
+                for (label, c) in [("Delete Row", Command::DeleteRow), ("Delete Column", Command::DeleteColumn), ("Delete Table", Command::DeleteTable)] {
+                    if menu::item(label).enabled(editable).show(ui).clicked() {
+                        self.command(c);
+                    }
+                }
+                menu::separator(ui);
+                if menu::item("Header Row").checked(header_row).enabled(editable).show(ui).clicked() {
+                    self.command(Command::ToggleHeaderRow);
+                }
+                if menu::item("Header Column").checked(header_col).enabled(editable).show(ui).clicked() {
+                    self.command(Command::ToggleHeaderColumn);
+                }
+            } else if menu::item("Table").icon(Icon::Table).shortcut(cmd_key!("Alt+T")).enabled(editable).show(ui).clicked() {
+                self.command(Command::InsertTable);
+            }
         });
     }
 }
@@ -1490,19 +1484,27 @@ mod tests {
         let opts_cache = (images::ImageCache::new(dir.path().to_owned()), pdfs::PdfCache::new(dir.path().to_owned()));
         let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &opts_cache.0, pdfs: &opts_cache.1, can_attach: true };
         let mut out = Output::default();
-        e.apply_menu_choice(1, MenuChoice::View(FileView::Large), &opts, &mut out);
+        e.apply_menu_choice(&egui::Context::default(), 1, MenuChoice::View(FileView::Large), &opts, &mut out);
         assert!(e.take_markdown().unwrap().contains(&format!("[trip.pdf](attachments/{name} \"large\")")));
-        e.apply_menu_choice(2, MenuChoice::File(FileAction::Copy), &opts, &mut out);
+        e.apply_menu_choice(&egui::Context::default(), 2, MenuChoice::File(FileAction::Copy), &opts, &mut out);
         assert_eq!(out.file_action, Some((FileAction::Copy, doc.clone(), "notes.docx".to_owned())));
-        e.apply_menu_choice(2, MenuChoice::Rename, &opts, &mut out);
+        e.apply_menu_choice(&egui::Context::default(), 2, MenuChoice::Rename, &opts, &mut out);
         assert!(e.rename_sheet.as_ref().is_some_and(|s| s.block == 2 && s.label == "notes.docx"));
-        e.apply_menu_choice(2, MenuChoice::Delete, &opts, &mut out);
+        // Paste: on the line after the card.
+        let ctx = egui::Context::default();
+        let mut out = Output::default();
+        e.apply_menu_choice(&ctx, 1, MenuChoice::Paste, &opts, &mut out);
+        assert!(out.paste_image && e.sel == Selection::caret(Pos::new(2, 0)));
+        // Cut: the file on the clipboard, and gone.
+        let mut out = Output::default();
+        e.apply_menu_choice(&ctx, 2, MenuChoice::Cut, &opts, &mut out);
+        assert_eq!(out.file_action, Some((FileAction::Copy, doc.clone(), "notes.docx".to_owned())));
         assert!(!e.take_markdown().unwrap().contains("notes.docx"));
         // Not in a deleted note.
         let ro = Options { read_only: true, ..opts };
         let mut out = Output::default();
-        e.apply_menu_choice(1, MenuChoice::Delete, &ro, &mut out);
-        assert!(out.blocked_edit && e.take_markdown().is_none());
+        e.apply_menu_choice(&ctx, 1, MenuChoice::Cut, &ro, &mut out);
+        assert!(out.blocked_edit && out.file_action.is_none() && e.take_markdown().is_none());
     }
 
     #[test]

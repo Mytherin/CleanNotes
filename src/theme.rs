@@ -202,7 +202,21 @@ pub fn apply_style(ctx: &egui::Context) {
         s.visuals.panel_fill = p.bg;
         s.visuals.window_fill = p.popover;
         s.visuals.window_rounding = egui::Rounding::same(12.0);
-        s.visuals.menu_rounding = egui::Rounding::same(8.0);
+        // Menus as macOS 26's: well rounded, a hairline edge lighter than
+        // them in dark mode, a soft shadow (see `crate::menu` for their rows).
+        s.visuals.menu_rounding = egui::Rounding::same(11.0);
+        s.spacing.menu_margin = egui::Margin::same(5.0);
+        s.visuals.window_stroke = if p.dark {
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(0x52, 0x52, 0x55))
+        } else {
+            egui::Stroke::new(1.0_f32, Color32::from_rgb(0xD2, 0xD2, 0xD4))
+        };
+        s.visuals.popup_shadow = egui::epaint::Shadow {
+            offset: egui::vec2(0.0, 8.0),
+            blur: 28.0,
+            spread: 0.0,
+            color: Color32::from_black_alpha(if p.dark { 120 } else { 50 }),
+        };
         s.visuals.selection.bg_fill = p.text_selection;
         s.visuals.selection.stroke.color = p.text;
         s.visuals.hyperlink_color = BLUE;
