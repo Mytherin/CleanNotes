@@ -558,6 +558,19 @@ impl NotesCore {
         self.lib().rename_folder(&id, &name).map_err(failed)
     }
 
+    /// Whether a folder can go into `parent` (`None`: the top level of
+    /// `account`): not a "Notes" folder, not into itself or its subfolders.
+    pub fn can_move_folder(&self, id: String, account: String, parent: Option<String>) -> bool {
+        self.lib().can_move_folder(&id, &account, parent.as_deref())
+    }
+
+    /// Moves a folder, with its subfolders and notes, into `parent` (`None`:
+    /// the top level of `account`), possibly in another account. Returns
+    /// whether it moved.
+    pub fn move_folder(&self, id: String, account: String, parent: Option<String>) -> bool {
+        self.lib().move_folder(&id, &account, parent.as_deref())
+    }
+
     /// Deletes a folder and its subfolders; their notes go to Recently
     /// Deleted.
     pub fn delete_folder(&self, id: String) {

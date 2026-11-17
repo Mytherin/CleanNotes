@@ -505,6 +505,13 @@ impl App {
         self.focus = Pane::Sidebar;
     }
 
+    /// Moves a folder (and what's in it) into another folder, or to the top
+    /// level of an account.
+    pub fn move_folder(&mut self, id: &str, account: &str, parent: Option<&str>) {
+        self.flush_editor();
+        self.lib.move_folder(id, account, parent);
+    }
+
     /// Finishes naming a folder (a name that's taken says so instead).
     pub fn finish_rename(&mut self) {
         let Some(r) = self.rename.take() else { return };

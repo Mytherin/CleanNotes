@@ -197,6 +197,37 @@ fn folders_and_moves_sync() {
 }
 
 #[test]
+fn a_folder_moved_into_another_syncs() {
+    let (_d, mut laptop, mut phone) = pair();
+    let id = laptop.add("in plans");
+    let plans = laptop.store.ensure_folder_at(ACC, &["Plans".into(), "2026".into()]);
+    let work = laptop.store.ensure_folder_at(ACC, &["Work".into()]);
+    laptop.store.note_mut(&id).unwrap().folder = plans.clone();
+    laptop.sync();
+    phone.sync();
+
+    // Into a folder the phone has: it moves there, with what's inside it.
+    let top = laptop.store.folder(&plans).unwrap().parent.clone().unwrap();
+    laptop.store.folder_mut(&top).unwrap().parent = Some(work.clone());
+    laptop.sync();
+    phone.sync();
+    let pf = phone.store.note(&id).unwrap().folder.clone();
+    assert_eq!(phone.store.folder_path(&pf), vec!["Work", "Plans", "2026"]);
+    assert!(phone.store.folder_at(ACC, &["Plans".into()]).is_none());
+
+    // Into a folder made at the same time.
+    let archive = laptop.store.ensure_folder_at(ACC, &["Archive".into()]);
+    laptop.store.folder_mut(&top).unwrap().parent = Some(archive);
+    laptop.sync();
+    phone.sync();
+    let pf = phone.store.note(&id).unwrap().folder.clone();
+    assert_eq!(phone.store.folder_path(&pf), vec!["Archive", "Plans", "2026"]);
+    let mut paths: Vec<Vec<String>> = phone.store.folders.iter().filter(|f| f.account == ACC).map(|f| phone.store.folder_path(&f.id)).collect();
+    paths.sort();
+    assert_eq!(paths.iter().filter(|p| p.as_slice() == ["Archive"]).count(), 1, "one Archive: {paths:?}");
+}
+
+#[test]
 fn deleting_a_folder_syncs() {
     let (_d, mut laptop, mut phone) = pair();
     let work = laptop.store.ensure_folder_at(ACC, &["Work".into()]);
