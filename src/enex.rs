@@ -334,6 +334,9 @@ fn read_notes(xml: &str) -> Result<Vec<RawNote>> {
     let mut resource: Option<Resource> = None;
     let mut seen_export = false;
     let mut buf = String::new();
+    // The open elements: a value counts only where it belongs (a note's
+    // tasks and reminders have titles and dates of their own).
+    let mut open: Vec<String> = Vec::new();
     for t in Lexer::new(xml) {
         match t {
             Tok::Start { name, empty, .. } => {
@@ -344,13 +347,25 @@ fn read_notes(xml: &str) -> Result<Vec<RawNote>> {
                     "resource" if note.is_some() && !empty => resource = Some(Resource::default()),
                     _ => {}
                 }
+                if !empty {
+                    open.push(name);
+                }
             }
             Tok::Text(s) => buf.push_str(&s),
             Tok::CData(s) => buf.push_str(s),
             Tok::End(name) => {
                 let value = std::mem::take(&mut buf);
+                // Closes the innermost element of that name (and any left
+                // open inside it).
+                if let Some(at) = open.iter().rposition(|o| *o == name) {
+                    open.truncate(at);
+                }
+                let parent = open.last().map(String::as_str);
                 let Some(n) = note.as_mut() else { continue };
                 if let Some(r) = resource.as_mut() {
+                    if !matches!(parent, Some("resource" | "resource-attributes")) && name != "resource" {
+                        continue;
+                    }
                     match name.as_str() {
                         "data" => {
                             let b64: String = value.chars().filter(|c| !c.is_whitespace()).collect();
@@ -368,6 +383,9 @@ fn read_notes(xml: &str) -> Result<Vec<RawNote>> {
                         }
                         _ => {}
                     }
+                    continue;
+                }
+                if parent != Some("note") && name != "note" {
                     continue;
                 }
                 match name.as_str() {
@@ -952,6 +970,18 @@ mod tests {
 
     fn md(title: &str, enml: &str) -> String {
         import(&export(&[note(title, enml, &["F"])])).remove(0).body
+    }
+
+    #[test]
+    fn tasks_and_reminders_dont_take_the_notes_title_or_dates() {
+        // Evernote 10 puts a note's tasks inside it, with titles and dates
+        // of their own (after the note's).
+        let task = "<task><title>Buy milk</title><created>20240101T000000Z</created><updated>20240102T000000Z</updated><taskStatus>open</taskStatus><reminder><created>20240103T000000Z</created></reminder></task>";
+        let xml = export(&[note("Groceries", "<div>list</div>", &[]).replace("</note>", &format!("{task}</note>"))]);
+        let n = import(&xml).remove(0);
+        assert!(n.body.starts_with("# Groceries\n"), "{}", n.body);
+        assert_eq!(n.created, parse_date("20190424T204749Z").unwrap());
+        assert_eq!(n.modified, parse_date("20190517T172450Z").unwrap());
     }
 
     #[test]
