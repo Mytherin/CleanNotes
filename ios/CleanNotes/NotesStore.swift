@@ -7,6 +7,10 @@ import SwiftUI
 /// Screens read straight from `core` while they draw (it's quick); `revision`
 /// goes up whenever something changed, which redraws them.
 final class NotesStore: ObservableObject {
+    /// The app's notes: the screens', and Shortcuts' and Siri's while the
+    /// app runs (or was started for them, in the background).
+    static let shared = NotesStore(publishing: true)
+
     let core: NotesCore
     /// Goes up when notes, folders, accounts or settings change.
     @Published private(set) var revision = 0
@@ -25,10 +29,13 @@ final class NotesStore: ObservableObject {
 
     private var timer: Timer?
     private var noticeTask: Task<Void, Never>?
+    /// Tells the system about the notes (Spotlight, Siri's note names): the
+    /// app's own store does, the tests' don't.
+    private let publishing: Bool
 
     /// The notes in `directory` (Application Support/CleanNotes; the tests
     /// give a folder of their own).
-    init(directory: URL? = nil) {
+    init(directory: URL? = nil, publishing: Bool = false) {
         let listener = SyncListener()
         var failure: String?
         var opened: NotesCore?
@@ -42,6 +49,7 @@ final class NotesStore: ObservableObject {
         // Without its notes the app can only say why.
         self.core = opened ?? NotesStore.fallbackCore(listener: listener)
         self.startupError = opened == nil ? failure : nil
+        self.publishing = publishing && opened != nil
         listener.store = self
         let core = self.core
         NoteImages.shared.data = { name in core.attachmentData(name: name) }
@@ -68,6 +76,7 @@ final class NotesStore: ObservableObject {
     /// The app came to the foreground.
     func becameActive() {
         tick()
+        publish()
         core.syncAll()
         timer?.invalidate()
         // Fires on the main run loop.
@@ -82,6 +91,8 @@ final class NotesStore: ObservableObject {
         core.saveNow()
         timer?.invalidate()
         timer = nil
+        // What was typed since.
+        publish()
     }
 
     /// Sync replies, syncs that are due, saving, auto-lock.
@@ -110,6 +121,7 @@ final class NotesStore: ObservableObject {
     /// Something changed: screens redraw.
     func changed() {
         revision &+= 1
+        publish()
         if let n = core.takeNotices().last {
             show(n)
         }
@@ -121,6 +133,24 @@ final class NotesStore: ObservableObject {
         noticeTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(4))
             if !Task.isCancelled { self.notice = nil }
+        }
+    }
+
+    /// Notes changed outside the screens (Shortcuts, Siri): saved, the open
+    /// note shows the change, and the screens redraw.
+    func changedOutside() {
+        core.saveNow()
+        changed()
+        for f in onSyncChange.values { f() }
+    }
+
+    /// Spotlight and Siri hear of the notes as they are now (a moment from
+    /// now: changes come in bursts).
+    private func publish() {
+        guard publishing else { return }
+        SpotlightIndex.shared.update(core) {
+            // The note names Siri knows, for "Open <note>".
+            NotesShortcuts.updateAppShortcutParameters()
         }
     }
 

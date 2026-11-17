@@ -74,6 +74,41 @@ pub struct NoteRow {
     pub deleted: bool,
 }
 
+/// A note for the system's search (Spotlight on the iPhone).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndexedNote {
+    pub id: String,
+    /// The title, or "New Note".
+    pub title: String,
+    /// The text after the title, without markup. Empty for a locked note:
+    /// only its title is ever shown outside the app.
+    pub text: String,
+    /// The folder's name.
+    pub folder: String,
+    pub tags: Vec<String>,
+    pub modified: DateTime<Utc>,
+    pub locked: bool,
+}
+
+/// Why text couldn't be added to a note ([`Library::add_text`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddTextError {
+    NotFound,
+    /// In Recently Deleted: recover it first.
+    Deleted,
+    Locked,
+}
+
+impl std::fmt::Display for AddTextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AddTextError::NotFound => "The note can't be found.",
+            AddTextError::Deleted => "The note is in Recently Deleted.",
+            AddTextError::Locked => "Locked notes can't be changed from outside the app.",
+        })
+    }
+}
+
 /// What became of an editor's changes ([`Library::set_body`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodySet {
@@ -554,6 +589,84 @@ impl Library {
         }
         tags.sort();
         tags
+    }
+
+    // ---- From outside the app (the system's search, Shortcuts) ----------------
+
+    /// The notes the system's search should find: those in All Notes (not
+    /// Recently Deleted, in accounts that are on), but not new notes still
+    /// empty. Locked notes give their titles, never their text, even while
+    /// unlocked.
+    pub fn indexed_notes(&self) -> Vec<IndexedNote> {
+        self.store
+            .notes
+            .iter()
+            .filter(|n| n.deleted.is_none() && self.account_enabled(&n.account) && !n.body.trim().is_empty())
+            .map(|n| {
+                let locked = lock::is_locked(&n.body);
+                let title = n.title();
+                IndexedNote {
+                    id: n.id.clone(),
+                    title: if title.is_empty() { "New Note".to_owned() } else { title },
+                    text: if locked { String::new() } else { markdown::text_after_title(&n.body) },
+                    folder: self.store.folder(&n.folder).map(|f| f.name.clone()).unwrap_or_default(),
+                    tags: if locked { Vec::new() } else { n.tags() },
+                    modified: n.modified,
+                    locked,
+                }
+            })
+            .collect()
+    }
+
+    /// Where a note is listed: its folder, or its account's Recently Deleted.
+    pub fn note_location(&self, id: &str) -> Option<Location> {
+        let n = self.store.note(id).filter(|n| self.account_enabled(&n.account))?;
+        Some(if n.deleted.is_some() { Location::Deleted(n.account.clone()) } else { Location::Folder(n.folder.clone()) })
+    }
+
+    /// A note with `text` (plain text: its first line is the title, in the
+    /// "New notes start with" style), in `folder` or else where new notes go.
+    /// Returns its id and folder.
+    pub fn create_note(&mut self, folder: Option<&str>, text: &str) -> (String, String) {
+        let loc = match folder {
+            Some(f) if self.location_exists(&Location::Folder(f.to_owned())) => Location::Folder(f.to_owned()),
+            _ => Location::Folder(self.new_note_target(&Location::All).1),
+        };
+        let (id, _, _) = self.new_note(&loc);
+        let body = self.store.note(&id).map(|n| n.body.clone()).unwrap_or_default();
+        let mut e = crate::editing::Editing::new_note(&id, &body, self.settings.start_with.kind());
+        e.paste(text);
+        if let Some(md) = e.take_markdown() {
+            self.set_body(&id, &md);
+        }
+        let folder = self.store.note(&id).map(|n| n.folder.clone()).unwrap_or_default();
+        (id, folder)
+    }
+
+    /// Adds `text` (plain text) to the end of a note, on a line of its own.
+    /// Not to a locked note, even an unlocked one: Shortcuts and Siri can run
+    /// without anyone at the phone.
+    pub fn add_text(&mut self, id: &str, text: &str) -> Result<(), AddTextError> {
+        let n = self.store.note(id).filter(|n| self.account_enabled(&n.account)).ok_or(AddTextError::NotFound)?;
+        if n.deleted.is_some() {
+            return Err(AddTextError::Deleted);
+        }
+        if lock::is_locked(&n.body) {
+            return Err(AddTextError::Locked);
+        }
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut e = crate::editing::Editing::new(id, &n.body);
+        let end = e.doc.end();
+        e.set_selection(end, end);
+        let last_empty = e.doc.blocks.last().is_none_or(|b| b.len() == 0);
+        e.paste(&if last_empty { text.to_owned() } else { format!("\n{text}") });
+        if let Some(md) = e.take_markdown() {
+            self.set_body(id, &md);
+        }
+        Ok(())
     }
 
     // ---- Notes ------------------------------------------------------------------
@@ -2452,5 +2565,67 @@ mod tests {
         assert_eq!((r.title.as_str(), r.snippet.as_str()), ("Trip", "Pack the bags"));
         let r = lib.note_row(&empty, &loc, false).unwrap();
         assert_eq!((r.title.as_str(), r.snippet.as_str()), ("New Note", "No additional text"));
+    }
+
+    #[test]
+    fn the_system_search_sees_titles_and_text_but_not_locked_text() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let trip = add(&mut lib, &home, "# Trip\n- Pack the **bags**\nBook #travel\n");
+        let secret = add(&mut lib, &home, "# Bank\nPIN 1234 #money\n");
+        let gone = add(&mut lib, &home, "# Gone\n");
+        add(&mut lib, &home, "");
+        lib.store.note_mut(&gone).unwrap().deleted = Some(Utc::now());
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&secret), LockNote::Locked);
+
+        let found = lib.indexed_notes();
+        assert_eq!(found.len(), 2, "not Recently Deleted, not an empty new note");
+        let t = found.iter().find(|n| n.id == trip).unwrap();
+        assert_eq!((t.title.as_str(), t.text.as_str(), t.folder.as_str()), ("Trip", "Pack the bags\nBook #travel", "Notes"));
+        assert_eq!(t.tags, vec!["travel".to_owned()]);
+        let s = found.iter().find(|n| n.id == secret).unwrap();
+        assert!(s.locked);
+        assert_eq!(s.title, "Bank");
+        assert!(s.text.is_empty() && s.tags.is_empty(), "a locked note's text stays in the app, unlocked or not");
+
+        assert_eq!(lib.note_location(&trip), Some(Location::Folder(home)));
+        assert_eq!(lib.note_location(&gone), Some(Location::Deleted(LOCAL.to_owned())));
+        assert_eq!(lib.note_location("nope"), None);
+    }
+
+    #[test]
+    fn notes_are_made_and_added_to_from_outside() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let work = lib.store.ensure_folder_at(LOCAL, &["Work".into()]);
+
+        let (id, folder) = lib.create_note(Some(&work), "Groceries\n# eggs, not a heading\nmilk");
+        assert_eq!(folder, work);
+        let body = lib.store.note(&id).unwrap().body.clone();
+        assert_eq!(markdown::title_of(&body), "Groceries");
+        assert_eq!(markdown::text_after_title(&body), "# eggs, not a heading\nmilk", "plain text stays as written");
+        assert!(!lib.leave_note(&id), "a note with text isn't thrown away");
+        let (_, folder) = lib.create_note(Some("no such folder"), "Elsewhere");
+        assert_eq!(folder, home, "a folder that's gone: where new notes go");
+
+        lib.add_text(&id, "bread\n").unwrap();
+        lib.add_text(&id, "").unwrap();
+        let body = lib.store.note(&id).unwrap().body.clone();
+        assert_eq!(markdown::text_after_title(&body), "# eggs, not a heading\nmilk\nbread");
+
+        // Into a checklist: the new line is a checklist item too, as
+        // typing Return there makes one.
+        let list = add(&mut lib, &home, "# To do\n- [ ] call\n");
+        lib.add_text(&list, "write").unwrap();
+        assert_eq!(lib.store.note(&list).unwrap().body, "# To do\n- [ ] call\n- [ ] write\n");
+
+        let gone = add(&mut lib, &home, "# Gone\n");
+        lib.store.note_mut(&gone).unwrap().deleted = Some(Utc::now());
+        assert_eq!(lib.add_text(&gone, "x"), Err(AddTextError::Deleted));
+        assert_eq!(lib.add_text("nope", "x"), Err(AddTextError::NotFound));
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&id), LockNote::Locked);
+        assert_eq!(lib.add_text(&id, "x"), Err(AddTextError::Locked));
     }
 }

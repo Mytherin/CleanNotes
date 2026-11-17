@@ -832,6 +832,12 @@ pub fn title_of(md: &str) -> String {
     plain_lines(md).next().unwrap_or_default()
 }
 
+/// The text after the title, line by line, without markup (what the
+/// system's search finds a note by).
+pub fn text_after_title(md: &str) -> String {
+    plain_lines(md).skip(1).collect::<Vec<_>>().join("\n")
+}
+
 /// The text after the title, for the notes list: the following lines with
 /// text, without markup, joined with spaces.
 pub fn snippet_of(md: &str, max_chars: usize) -> String {
