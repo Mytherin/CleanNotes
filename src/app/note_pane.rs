@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{capsule_item, glass, glass_button, menu_look, popover_frame, tool_button};
+use super::sidebar::{capsule_item, glass, glass_button, menu_look, popover_frame, submenu, tool_button};
 use super::{modal, note_header_time, App, Confirm, Pane, TOOLBAR_H};
 use crate::doc::{Attr, Kind};
 use crate::editor::{Command, Options};
@@ -287,7 +287,7 @@ impl App {
                         }
                         close = true;
                     }
-                    ui.menu_button("Move to", |ui| self.move_to_menu(ui, &ids));
+                    submenu(ui, p, "Move to", |ui| self.move_to_menu(ui, &ids));
                     if ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
                         self.duplicate_note(&note.id);
                         close = true;
