@@ -508,7 +508,22 @@ impl Doc {
     /// the new caret.
     pub fn insert_image(&mut self, p: Pos, name: &str) -> Pos {
         let style = Style { image: Some(Arc::from(name)), ..Style::default() };
-        let obj = crate::attachments::OBJECT.to_string();
+        self.insert_line_of(p, &crate::attachments::OBJECT.to_string(), &style)
+    }
+
+    /// Inserts an attached file at `p`, as [`Doc::insert_image`] does a
+    /// picture: its name (`label`) on a line of its own, linked to the
+    /// attachment (`attachments/<reference>`). Returns the new caret.
+    pub fn insert_file(&mut self, p: Pos, reference: &str, label: &str) -> Pos {
+        let style = Style { link: Some(Arc::from(format!("{}{reference}", crate::attachments::URL_PREFIX))), ..Style::default() };
+        let label: String = label.chars().map(|c| if c.is_control() || c == crate::attachments::OBJECT { ' ' } else { c }).collect();
+        let label = if label.trim().is_empty() { "Attachment" } else { label.trim() };
+        self.insert_line_of(p, label, &style)
+    }
+
+    /// `text` in `style` at `p`, in a body paragraph of its own (below the
+    /// table if `p` is in one). Returns the start of the paragraph after it.
+    fn insert_line_of(&mut self, p: Pos, text: &str, style: &Style) -> Pos {
         let mut p = p;
         if let Some((r, _)) = self.table_of(p.block) {
             // (There's always a paragraph after a table.)
@@ -530,7 +545,7 @@ impl Doc {
         if matches!(b.kind, Kind::Title | Kind::Heading | Kind::Subheading | Kind::Monospaced) {
             b.kind = Kind::Body;
         }
-        b.insert(0, &obj, &style);
+        b.insert(0, text, style);
         if !rest {
             self.blocks.insert(p.block + 1, Block::default());
         }

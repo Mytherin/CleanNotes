@@ -45,8 +45,12 @@ pub struct Output {
     pub open_url: Option<String>,
     /// A picture was double-clicked: its file, to open.
     pub open_image: Option<std::path::PathBuf>,
+    /// An attached file's link was clicked: its reference and name.
+    pub open_file: Option<(String, String)>,
     /// "Attach Image…" was chosen.
     pub attach_image: bool,
+    /// "Attach File…" was chosen.
+    pub attach_file: bool,
     /// Paste was asked for: a picture on the clipboard is the app's to
     /// paste (egui only brings text).
     pub paste_image: bool,
@@ -732,7 +736,14 @@ impl Editor {
         }
         if resp.clicked() && !shift {
             if let (Some(url), true) = (hover_link, self.sel.is_empty()) {
-                out.open_url = Some(url);
+                match cleannotes_core::attachments::file_link_ref(&url) {
+                    // An attached file: opened by the app, with its name.
+                    Some(r) => {
+                        let label = pointer.map(|pt| self.link_text_at(pt)).unwrap_or_default();
+                        out.open_file = Some((r.to_owned(), label));
+                    }
+                    None => out.open_url = Some(url),
+                }
             }
         }
         self.context_menu(&resp, opts, &ctx, &mut out);
@@ -761,17 +772,33 @@ impl Editor {
     }
 
     /// The link (explicit or a plain URL) under a point.
-    fn link_at(&self, pt: Pos2) -> Option<String> {
+    /// The paragraph and character under the pointer, if it's over text.
+    fn char_at(&self, pt: Pos2) -> Option<(usize, usize)> {
         let i = self.laid.iter().position(|l| l.rect.contains(pt))?;
         let l = &self.laid[i];
         if !l.galley.rect.translate(l.origin.to_vec2()).contains(pt) {
             return None;
         }
         let c = l.galley.cursor_from_pos(pt - l.origin).ccursor.index;
-        let b = &self.doc.blocks[i];
         // The character under the pointer is left or right of the cursor.
         let r = l.galley.pos_from_ccursor(CCursor::new(c)).translate(l.origin.to_vec2());
-        let ci = if pt.x < r.left() && c > 0 { c - 1 } else { c };
+        Some((i, if pt.x < r.left() && c > 0 { c - 1 } else { c }))
+    }
+
+    /// The text of the link under the pointer (an attached file's name).
+    fn link_text_at(&self, pt: Pos2) -> String {
+        let Some((i, ci)) = self.char_at(pt) else { return String::new() };
+        let b = &self.doc.blocks[i];
+        let Some(link) = b.styles.get(ci).and_then(|s| s.link.clone()) else { return String::new() };
+        let same = |j: &usize| b.styles[*j].link.as_ref() == Some(&link);
+        let start = (0..=ci).rev().take_while(same).last().unwrap_or(ci);
+        let end = (ci..b.styles.len()).take_while(same).last().map_or(ci, |j| j + 1);
+        b.text.chars().skip(start).take(end - start).collect()
+    }
+
+    fn link_at(&self, pt: Pos2) -> Option<String> {
+        let (i, ci) = self.char_at(pt)?;
+        let b = &self.doc.blocks[i];
         if let Some(url) = b.styles.get(ci).and_then(|s| s.link.as_deref()) {
             return Some(url.to_owned());
         }
@@ -831,6 +858,10 @@ impl Editor {
                 }
                 if item(ui, "Attach Image…", "", opts.can_attach) {
                     out.attach_image = true;
+                    ui.close_menu();
+                }
+                if item(ui, "Attach File…", "", opts.can_attach) {
+                    out.attach_file = true;
                     ui.close_menu();
                 }
                 let block = self.sel.caret.block;

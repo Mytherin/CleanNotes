@@ -57,6 +57,10 @@ pub enum Command {
     /// Puts an image (an attachment's name, saved already) at the caret,
     /// in place of the selection.
     InsertImage(String),
+    /// Puts an attached file (a PDF, …; its attachment's reference, saved
+    /// already, and the name to show) at the caret, in place of the
+    /// selection: a link to it on a line of its own.
+    InsertFile { reference: String, label: String },
 }
 
 /// Text from outside (typed, pasted from another app) can't hold images:
@@ -541,6 +545,15 @@ impl Editing {
                 let p = self.doc.insert_image(at, &name);
                 self.sel = Selection::caret(p);
             }
+            Command::InsertFile { reference, label } => {
+                if !crate::attachments::is_ref(&reference) {
+                    return;
+                }
+                self.checkpoint(None);
+                let at = self.delete_selection();
+                let p = self.doc.insert_file(at, &reference, &label);
+                self.sel = Selection::caret(p);
+            }
             Command::AddRowAbove
             | Command::AddRowBelow
             | Command::AddColumnBefore
@@ -831,7 +844,7 @@ impl Editing {
 /// A typed link address made into a URL ("example.com" → "https://example.com").
 pub fn normalize_url(u: &str) -> String {
     let u = u.trim();
-    if u.contains("://") || u.starts_with("mailto:") {
+    if u.contains("://") || u.starts_with("mailto:") || crate::attachments::file_link_ref(u).is_some() {
         u.to_owned()
     } else if u.contains('@') && !u.contains('/') {
         format!("mailto:{u}")
@@ -1069,6 +1082,26 @@ mod tests {
         // A name that isn't an attachment's does nothing.
         e.command(Command::InsertImage("../../x.png".into()));
         assert!(e.doc.images().is_empty());
+    }
+
+    #[test]
+    fn inserting_files() {
+        let name = crate::attachments::name_for(b"%PDF", "pdf");
+        let mut e = Editing::new("n", "# Trip\nday one\n");
+        e.set_caret(Pos::new(1, 3), false);
+        e.command(Command::InsertFile { reference: name.clone(), label: "boarding [pass].pdf".into() });
+        let md = e.take_markdown().unwrap();
+        assert_eq!(md, format!("# Trip\nday\n[boarding \\[pass\\].pdf](attachments/{name})\n one\n"));
+        assert_eq!(e.sel.caret, Pos::new(3, 0));
+        assert_eq!(crate::attachments::refs_in(&md), vec![name.clone()]);
+        // Read back, it's the same link.
+        let again = Editing::new("n", &md);
+        assert_eq!(again.doc.blocks[2].styles[0].link.as_deref(), Some(format!("attachments/{name}").as_str()));
+        // Its link isn't made a web address when edited.
+        assert_eq!(normalize_url(&format!("attachments/{name}")), format!("attachments/{name}"));
+        // A name that isn't an attachment's does nothing.
+        e.command(Command::InsertFile { reference: "../x.pdf".into(), label: "x".into() });
+        assert!(e.take_markdown().is_none());
     }
 
     #[test]

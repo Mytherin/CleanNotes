@@ -183,6 +183,7 @@ impl Library {
         let mut lib = Library::with(db, store, settings, Worker::spawn(on_sync_reply));
         lib.upgrade_file_links();
         lib.purge_expired();
+        lib.clear_opened_files();
         Ok(lib)
     }
 
@@ -1223,27 +1224,59 @@ impl Library {
         }
     }
 
+    /// Saves a file (not shown as a picture: a PDF, …) to attach to the
+    /// note `id`, `file_name` being the name it had: encrypted, with a key
+    /// of its own, if the note is locked. Returns its reference, for
+    /// [`crate::editing::Command::InsertFile`].
+    pub fn add_file_to(&self, id: &str, data: &[u8], file_name: &str) -> anyhow::Result<String> {
+        if self.is_locked(id) {
+            crate::attachments::save_sealed_file(&self.attachments_dir(), data)
+        } else {
+            crate::attachments::save_file(&self.attachments_dir(), data, file_name)
+        }
+    }
+
+    /// Where attached files are copied to be opened in other apps.
+    fn opened_files_dir() -> PathBuf {
+        std::env::temp_dir().join("CleanNotes Attachments")
+    }
+
+    /// An attached file (its reference and the name it's shown with) copied
+    /// out to open in the system's app for it; see
+    /// [`crate::attachments::open_copy`]. A locked note's file is decrypted
+    /// into the copy, which is removed again on [`Library::lock_now`] and
+    /// the next start.
+    pub fn open_attachment(&self, reference: &str, label: &str) -> anyhow::Result<PathBuf> {
+        crate::attachments::open_copy(&self.attachments_dir(), reference, label, &Self::opened_files_dir())
+    }
+
+    /// Removes the copies [`Library::open_attachment`] made (those still
+    /// open in an app may stay).
+    pub fn clear_opened_files(&self) {
+        let _ = std::fs::remove_dir_all(Self::opened_files_dir());
+    }
+
     /// An image's bytes by reference (decrypted in memory if it's a locked
     /// note's), if this device has it.
     pub fn attachment_data(&self, reference: &str) -> Option<Vec<u8>> {
         crate::attachments::load(&self.attachments_dir(), reference)
     }
 
-    /// `md` with its pictures encrypted (`seal`: for a locked note) or
+    /// `md` with its attachments encrypted (`seal`: for a locked note) or
     /// decrypted (for a plain one), as files of their own; and whether all
     /// of them could be (those not on this device yet are left as they are).
     fn convert_refs(&mut self, md: &str, seal: bool) -> (String, bool) {
         let dir = self.attachments_dir();
         let cache = &mut self.lock.refs;
         let mut all = true;
-        let out = crate::attachments::replace_refs(md, |r| {
+        let out = crate::attachments::replace_refs(md, |r, label| {
             if crate::attachments::is_sealed_ref(r) == seal {
                 return None;
             }
             if let Some(other) = cache.get(r) {
                 return Some(other.clone());
             }
-            let made = if seal { crate::attachments::seal(&dir, r) } else { crate::attachments::unseal(&dir, r) };
+            let made = if seal { crate::attachments::seal(&dir, r) } else { crate::attachments::unseal(&dir, r, label) };
             match made {
                 Ok(other) => {
                     cache.insert(r.to_owned(), other.clone());
@@ -1655,6 +1688,8 @@ impl Library {
         self.lock.keys.clear();
         self.lock.refs.clear();
         self.lock.current = None;
+        // Locked notes' files opened in other apps were copied out decrypted.
+        self.clear_opened_files();
         any
     }
 
@@ -2087,6 +2122,46 @@ mod tests {
         assert_eq!(lib.attachment_data(&attachments::name_for(PIC2, "png")).unwrap(), PIC2);
         // An editor still showing the encrypted ones saves the plain ones.
         assert_eq!(lib.set_body(&id, &md), BodySet::Unchanged);
+    }
+
+    #[test]
+    fn locked_notes_keep_their_files_encrypted() {
+        use crate::attachments;
+        const PDF: &[u8] = b"%PDF-1.7 boarding pass";
+        const DOC: &[u8] = b"PK\x03\x04 a document";
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let id = add(&mut lib, &home, "# Trip\n");
+        let name = lib.add_file_to(&id, PDF, "boarding-pass.pdf").unwrap();
+        assert_eq!(name, attachments::name_for(PDF, "pdf"));
+        let plain_md = format!("# Trip\n[boarding-pass.pdf](attachments/{name})\n");
+        assert_eq!(lib.set_body(&id, &plain_md), BodySet::Changed);
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&id), LockNote::Locked);
+
+        // Stored encrypted, as pictures are.
+        let body = lib.store.note(&id).unwrap().body.clone();
+        assert!(!body.contains(&name) && !body.contains("boarding"), "{body}");
+        let refs = attachments::refs_in_body(&body);
+        assert!(refs.len() == 1 && refs[0].ends_with(".enc"));
+        let md = lib.plain_body_now(&id).unwrap();
+        let sealed = attachments::image_refs_in(&md).pop().unwrap();
+        assert!(md.contains(&format!("[boarding-pass.pdf](attachments/{sealed})")), "{md}");
+        assert_eq!(lib.attachment_data(&sealed).unwrap(), PDF);
+
+        // Files added to a locked note are encrypted from the start.
+        let added = lib.add_file_to(&id, DOC, "plan.docx").unwrap();
+        assert!(attachments::is_sealed_ref(&added));
+        assert!(!attachments::exists(&lib.attachments_dir(), &attachments::name_for(DOC, "docx")));
+        let md = format!("{md}[plan.docx](attachments/{added})\n");
+        assert_eq!(lib.set_body(&id, &md), BodySet::Changed);
+
+        // Remove Lock: plain files again, under their names' extensions.
+        lib.remove_lock(&id);
+        let body = lib.store.note(&id).unwrap().body.clone();
+        let docx = attachments::name_for(DOC, "docx");
+        assert_eq!(body, format!("# Trip\n[boarding-pass.pdf](attachments/{name})\n[plan.docx](attachments/{docx})\n"));
+        assert_eq!(lib.attachment_data(&docx).unwrap(), DOC);
     }
 
     #[test]
