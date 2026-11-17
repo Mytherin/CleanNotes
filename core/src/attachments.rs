@@ -228,6 +228,74 @@ pub fn refs_in_body(body: &str) -> Vec<String> {
     }
 }
 
+/// `md` with the pictures that early versions of the Evernote import linked
+/// to as files (`[photo.jpg](file:///…/Attachments/<md5>.jpg)`) made the
+/// note's own images (`![](attachments/<sha256>.jpg)`), each saved in `dir`
+/// under its proper name. `None` if there were none. Only links to a file
+/// of `dir` that is a picture are changed; other links stay as they are.
+pub fn upgrade_file_links(md: &str, dir: &Path) -> Option<String> {
+    const SCHEME: &str = "](file://";
+    if !md.contains(SCHEME) {
+        return None;
+    }
+    let mut out = String::with_capacity(md.len());
+    let mut last = 0;
+    let mut from = 0;
+    while let Some(i) = md[from..].find(SCHEME) {
+        let close_text = from + i;
+        let url_start = close_text + 2;
+        let Some(len) = md[url_start..].find(')') else { break };
+        let url_end = url_start + len;
+        from = url_end;
+        let line_start = md[..close_text].rfind('\n').map_or(0, |p| p + 1);
+        let Some(open) = md[line_start..close_text].rfind('[').map(|p| line_start + p) else { continue };
+        if open < last {
+            continue;
+        }
+        let Some(name) = attachment_file_of_url(&md[url_start..url_end]) else { continue };
+        let file = dir.join(&name);
+        let Ok(data) = std::fs::read(&file) else { continue };
+        if image_ext(&data).is_none() {
+            continue;
+        }
+        let Ok(saved) = save(dir, &data) else { continue };
+        let start = if open > 0 && md.as_bytes()[open - 1] == b'!' { open - 1 } else { open };
+        out.push_str(&md[last..start]);
+        out.push_str(&markdown(&saved));
+        last = url_end + 1;
+    }
+    if last == 0 {
+        return None;
+    }
+    out.push_str(&md[last..]);
+    Some(out)
+}
+
+/// The file name a `file://` URL names, if it is a plain name in a folder
+/// called [`DIR`] (where the import saved its files).
+fn attachment_file_of_url(url: &str) -> Option<String> {
+    let path = url.strip_prefix("file://")?;
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let path = String::from_utf8(decoded).ok()?.replace('\\', "/");
+    let mut parts = path.rsplit('/');
+    let name = parts.next()?;
+    let folder = parts.next()?;
+    let plain = !name.is_empty() && !name.starts_with('.') && !name.contains(['/', ':']);
+    (folder.eq_ignore_ascii_case(DIR) && plain).then(|| name.to_owned())
+}
+
 /// `md` with each image reference `f` gives another for replaced.
 pub fn replace_refs(md: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(md.len());
@@ -314,6 +382,32 @@ mod tests {
     use super::*;
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest of a png";
+
+    #[test]
+    fn imported_file_links_become_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0123abcd.png"), PNG).unwrap();
+        std::fs::write(dir.join("ffff.pdf"), b"%PDF-1.4").unwrap();
+        let url = |f: &str| format!("file:///C:/Users/A%20B/AppData/Roaming/CleanNotes/Attachments/{f}");
+        let md = format!(
+            "# T\n\n[p1-1.png]({})\n\nsee [doc.pdf]({}) and [gone.jpg]({}) [x](https://e.com)\n",
+            url("0123abcd.png"),
+            url("ffff.pdf"),
+            url("gone.jpg")
+        );
+        let up = upgrade_file_links(&md, &dir).unwrap();
+        let name = name_for(PNG, "png");
+        assert_eq!(
+            up,
+            format!("# T\n\n![](attachments/{name})\n\nsee [doc.pdf]({}) and [gone.jpg]({}) [x](https://e.com)\n", url("ffff.pdf"), url("gone.jpg"))
+        );
+        assert!(exists(&dir, &name));
+        // Nothing to do again, nor for links elsewhere.
+        assert_eq!(upgrade_file_links(&up, &dir), None);
+        assert_eq!(upgrade_file_links("[a](file:///C:/Other/0123abcd.png)", &dir), None);
+    }
 
     #[test]
     fn names_are_checked_strictly() {

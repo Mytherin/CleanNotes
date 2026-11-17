@@ -181,6 +181,7 @@ impl Library {
     pub fn open(dir: &Path, secrets: Secrets, on_sync_reply: impl Fn() + Send + Sync + 'static) -> anyhow::Result<Library> {
         let (db, store, settings) = Db::open(dir, secrets)?;
         let mut lib = Library::with(db, store, settings, Worker::spawn(on_sync_reply));
+        lib.upgrade_file_links();
         lib.purge_expired();
         Ok(lib)
     }
@@ -1169,6 +1170,41 @@ impl Library {
         (out, all)
     }
 
+    /// Notes imported from Evernote before pictures were supported link to
+    /// their pictures as files: those links become the notes' own images
+    /// (saved and synced, their dates kept). Locked notes are done when
+    /// they're opened ([`Library::upgrade_unlocked`]).
+    fn upgrade_file_links(&mut self) {
+        let dir = self.attachments_dir();
+        for n in &mut self.store.notes {
+            if lock::is_locked(&n.body) {
+                continue;
+            }
+            if let Some(md) = crate::attachments::upgrade_file_links(&n.body, &dir) {
+                n.body = md;
+                n.touch_keep_date();
+                self.unsaved.insert(n.id.clone());
+            }
+        }
+        if !self.unsaved.is_empty() {
+            self.save(true);
+        }
+    }
+
+    /// [`Library::upgrade_file_links`] for a locked note just opened: its
+    /// text is sealed again with the pictures (encrypted for it).
+    fn upgrade_unlocked(&mut self, id: &str) {
+        let Some(text) = self.lock.unlocked.get(id) else { return };
+        let Some(md) = crate::attachments::upgrade_file_links(text, &self.attachments_dir()) else { return };
+        let modified = self.store.note(id).map(|n| n.modified);
+        if self.store_locked(id, &md) == Some(BodySet::Changed) {
+            if let (Some(n), Some(m)) = (self.store.note_mut(id), modified) {
+                n.modified = m;
+            }
+            self.last_edit = None;
+        }
+    }
+
     /// Where an attachment's file is, if this device has it (a synced
     /// note's pictures may still be on their way).
     pub fn attachment_path(&self, name: &str) -> Option<PathBuf> {
@@ -1372,6 +1408,7 @@ impl Library {
         match lock::open(&k, &env) {
             Ok(text) => {
                 self.lock.unlocked.insert(id.to_owned(), text);
+                self.upgrade_unlocked(id);
                 true
             }
             Err(_) => false,
@@ -1405,6 +1442,7 @@ impl Library {
             Ok((k, text)) => {
                 self.lock.keys.insert(env.salt.clone(), k.clone());
                 self.lock.unlocked.insert(id.to_owned(), text);
+                self.upgrade_unlocked(id);
                 self.touch_lock();
                 // The settings' check: this device learns the password's
                 // salt from the note if it hasn't got one, and the password
