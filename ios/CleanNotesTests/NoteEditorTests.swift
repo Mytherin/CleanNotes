@@ -218,6 +218,44 @@ final class NoteEditorTests: XCTestCase {
 
     // ---- Sharing ----
 
+    /// A solid picture of the given size in pixels.
+    private func picture(width: Int, height: Int) -> UIImage {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        return UIGraphicsImageRenderer(size: CGSize(width: width, height: height), format: format).image { ctx in
+            UIColor.gray.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        }
+    }
+
+    func testScannedPagesBecomeOnePDFPagePerImageInItsShape() throws {
+        XCTAssertNil(ScannedDocument.pdf([]))
+        let pdf = try XCTUnwrap(ScannedDocument.pdf([picture(width: 850, height: 1100), picture(width: 1200, height: 600)]))
+        let doc = try XCTUnwrap(CGPDFDocument(CGDataProvider(data: pdf as CFData)!))
+        XCTAssertEqual(doc.numberOfPages, 2)
+        let first = try XCTUnwrap(doc.page(at: 1)).getBoxRect(.mediaBox)
+        let second = try XCTUnwrap(doc.page(at: 2)).getBoxRect(.mediaBox)
+        XCTAssertEqual(first.width, ScannedDocument.pageWidth, accuracy: 0.5)
+        XCTAssertEqual(first.height, ScannedDocument.pageWidth * 1100 / 850, accuracy: 0.5)
+        XCTAssertEqual(second.height, ScannedDocument.pageWidth / 2, accuracy: 0.5)
+    }
+
+    func testAScanIsAttachedAsAPDFAtTheCaret() throws {
+        let (tv, c) = newNote()
+        type("Receipt\n", into: tv)
+        let pdf = try XCTUnwrap(ScannedDocument.pdf([picture(width: 400, height: 500)]))
+        c.attachScan(pdf)
+        let md = c.editor.markdown()
+        XCTAssertTrue(md.contains("[Scanned Document.pdf]("), md)
+        // The link opens the very PDF.
+        let link = try XCTUnwrap(md.range(of: #"\[Scanned Document\.pdf\]\(([^)]+)\)"#, options: .regularExpression))
+        let address = md[link].dropFirst("[Scanned Document.pdf](".count).dropLast()
+        let reference = String(address.dropFirst(address.hasPrefix("attachments/") ? "attachments/".count : 0))
+        let path = try store.core.openAttachment(reference: reference, label: ScannedDocument.fileName)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: path)), pdf)
+        assertInStep(tv, c)
+    }
+
     func testSharingGivesTextAndRichText() throws {
         let (tv, c) = newNote()
         type("List\n[] eggs", into: tv)
