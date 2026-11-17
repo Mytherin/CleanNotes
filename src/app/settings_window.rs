@@ -1,6 +1,7 @@
 //! The Settings window, laid out like Apple Notes' (General) plus an
 //! Accounts tab for sync: add (+) or remove (−) accounts: a folder in an
-//! S3 bucket, or point at a SQLite database.
+//! S3 bucket, or point at a SQLite database. Locked notes and importing
+//! have tabs of their own, so no tab is taller than the window.
 
 use std::sync::mpsc::{self, Receiver};
 
@@ -14,11 +15,26 @@ use crate::theme::{self, Palette};
 
 const LABEL_W: f32 = 190.0;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Tab {
     #[default]
     General,
     Accounts,
+    LockedNotes,
+    Import,
+}
+
+impl Tab {
+    const ALL: [(Tab, crate::icons::Icon, &'static str); 4] = [
+        (Tab::General, crate::icons::Icon::Gear, "General"),
+        (Tab::Accounts, crate::icons::Icon::Sync, "Accounts"),
+        (Tab::LockedNotes, crate::icons::Icon::Lock, "Locked Notes"),
+        (Tab::Import, crate::icons::Icon::FolderPlus, "Import"),
+    ];
+
+    fn title(self) -> &'static str {
+        Tab::ALL.iter().find(|(t, ..)| *t == self).map_or("", |(_, _, l)| l)
+    }
 }
 
 struct SqliteForm {
@@ -104,25 +120,31 @@ impl App {
             return;
         }
         let mut open = true;
-        egui::Window::new(match self.settings_ui.tab {
-            Tab::General => "General",
-            Tab::Accounts => "Accounts",
-        })
-        .id(egui::Id::new("settings"))
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .default_pos(ctx.screen_rect().center() - Vec2::new(280.0, 220.0))
-        .fixed_size(Vec2::new(600.0, 560.0))
-        .frame(egui::Frame::window(&ctx.style()).fill(p.popover).inner_margin(egui::Margin::same(16.0)))
-        .show(ctx, |ui| {
-            self.tab_bar(ui, p);
-            ui.add_space(10.0);
-            match self.settings_ui.tab {
-                Tab::General => self.general_tab(ui, p),
-                Tab::Accounts => self.accounts_tab(ui, p),
-            }
-        });
+        // Never bigger than the app's window (the title bar and margins take
+        // about 80 points); what doesn't fit scrolls.
+        let screen = ctx.screen_rect();
+        let size = Vec2::new(600.0_f32.min(screen.width() - 40.0), 500.0_f32.min(screen.height() - 90.0)).max(Vec2::new(200.0, 120.0));
+        egui::Window::new(self.settings_ui.tab.title())
+            .id(egui::Id::new("settings"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(screen.center() - Vec2::new(280.0, 220.0))
+            .constrain(true)
+            .fixed_size(size)
+            .frame(egui::Frame::window(&ctx.style()).fill(p.popover).inner_margin(egui::Margin::same(16.0)))
+            .show(ctx, |ui| {
+                self.tab_bar(ui, p);
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical().id_salt(("settings-scroll", self.settings_ui.tab)).auto_shrink([false, false]).show(ui, |ui| {
+                    match self.settings_ui.tab {
+                        Tab::General => self.general_tab(ui, p),
+                        Tab::Accounts => self.accounts_tab(ui, p),
+                        Tab::LockedNotes => self.locked_notes_tab(ui, p),
+                        Tab::Import => self.import_tab(ui, p),
+                    }
+                });
+            });
         if !open || (ctx.input(|i| i.key_pressed(Key::Escape)) && self.settings_ui.sheet.is_none()) {
             self.settings_ui.open = false;
         }
@@ -132,9 +154,12 @@ impl App {
 
     fn tab_bar(&mut self, ui: &mut Ui, p: &Palette) {
         ui.horizontal(|ui| {
-            ui.add_space(ui.available_width() / 2.0 - 90.0);
-            for (tab, icon, label) in [(Tab::General, crate::icons::Icon::Gear, "General"), (Tab::Accounts, crate::icons::Icon::Sync, "Accounts")] {
-                let (r, resp) = ui.allocate_exact_size(Vec2::new(84.0, 50.0), Sense::click());
+            const W: f32 = 92.0;
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let n = Tab::ALL.len() as f32;
+            ui.add_space(((ui.available_width() - n * W - (n - 1.0) * 4.0) / 2.0).max(0.0));
+            for (tab, icon, label) in Tab::ALL {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(W, 50.0), Sense::click());
                 let on = self.settings_ui.tab == tab;
                 if on || resp.hovered() {
                     ui.painter().rect_filled(r, 7.0, p.hover);
@@ -181,13 +206,10 @@ impl App {
             }
             ui.label(RichText::new("A").size(19.0));
         });
-        ui.separator();
-        form_row(ui, p, "Check for changes:", |ui| {
-            let opts: Vec<(u32, String)> = REFRESH_CHOICES.iter().map(|&m| (m, refresh_label(m))).collect();
-            combo(ui, "refresh", &mut s.refresh_minutes, &opts);
-        });
-        explain(ui, p, "How often synced accounts look for changes made on other devices.");
-        ui.separator();
+    }
+
+    fn locked_notes_tab(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.spacing_mut().item_spacing.y = 8.0;
         let has_password = self.lib.settings.lock_check.is_some();
         let mut change = false;
         let mut lock_now = false;
@@ -207,7 +229,10 @@ impl App {
         if lock_now {
             self.lock_now();
         }
-        ui.separator();
+    }
+
+    fn import_tab(&mut self, ui: &mut Ui, p: &Palette) {
+        ui.spacing_mut().item_spacing.y = 8.0;
         let mut import = false;
         form_row(ui, p, "Import:", |ui| {
             if ui.button("Import from Evernote…").clicked() {
@@ -262,6 +287,15 @@ impl App {
             ui.add_space(12.0);
             ui.vertical(|ui| self.account_details(ui, p, &selected));
         });
+        ui.add_space(8.0);
+        ui.separator();
+        ui.spacing_mut().item_spacing.y = 8.0;
+        let s = &mut self.lib.settings;
+        form_row(ui, p, "Check for changes:", |ui| {
+            let opts: Vec<(u32, String)> = REFRESH_CHOICES.iter().map(|&m| (m, refresh_label(m))).collect();
+            combo(ui, "refresh", &mut s.refresh_minutes, &opts);
+        });
+        explain(ui, p, "How often synced accounts look for changes made on other devices.");
     }
 
     fn account_details(&mut self, ui: &mut Ui, p: &Palette, id: &str) {
