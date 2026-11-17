@@ -457,6 +457,25 @@ impl NotesCore {
         self.lib().add_image_to(&id, &data).map_err(|e| failed(format!("{e:#}")))
     }
 
+    /// Saves a file (a PDF, a document, …; `file_name` is the name it had)
+    /// to attach to the note `id`: encrypted, with a key of its own, if the
+    /// note is locked. Returns its reference, for
+    /// [`EditorCommand::InsertFile`].
+    pub fn add_note_file(&self, id: String, data: Vec<u8>, file_name: String) -> Result<String, CoreError> {
+        self.lib().add_file_to(&id, &data, &file_name).map_err(|e| failed(format!("{e:#}")))
+    }
+
+    /// An attached file (the reference its link names after `attachments/`,
+    /// and the name it's shown with) copied out to open in another app: the
+    /// copy's path. A locked note's file is decrypted into the copy, which
+    /// is removed again on Lock Now.
+    pub fn open_attachment(&self, reference: String, label: String) -> Result<String, CoreError> {
+        self.lib()
+            .open_attachment(&reference, &label)
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|e| failed(format!("{e:#}")))
+    }
+
     /// Where an attachment's file is, if this device has it yet (a synced
     /// note's pictures may still be on their way). Never a locked note's
     /// picture: see [`NotesCore::attachment_data`].
@@ -1100,6 +1119,9 @@ pub enum EditorCommand {
     /// Puts a picture (saved with [`NotesCore::add_image`]) at the caret,
     /// on a line of its own.
     InsertImage { name: String },
+    /// Puts an attached file (saved with [`NotesCore::add_note_file`]) at
+    /// the caret: its name, linked to it, on a line of its own.
+    InsertFile { reference: String, label: String },
     /// A 3×3 table at the caret (not inside a table).
     InsertTable,
     /// The table at the caret: rows, columns, headers, or all of it.
@@ -1242,6 +1264,7 @@ impl NoteEditor {
             EditorCommand::Redo => Command::Redo,
             EditorCommand::SelectAll => Command::SelectAll,
             EditorCommand::InsertImage { name } => Command::InsertImage(name),
+            EditorCommand::InsertFile { reference, label } => Command::InsertFile { reference, label },
             EditorCommand::InsertTable => Command::InsertTable,
             EditorCommand::AddRowAbove => Command::AddRowAbove,
             EditorCommand::AddRowBelow => Command::AddRowBelow,

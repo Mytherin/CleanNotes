@@ -68,12 +68,17 @@ fn enex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Saves an attachment in `dir`: a picture as the note's own attachment
-/// (shown in it, and synced), another file as `<md5>.<extension>` (once:
-/// the same file attached twice is kept once), linked by its URL.
+/// Saves an attachment in `dir` as the note's own (synced with it): a
+/// picture shown in it, another file (a PDF, …) linked by its name. A file
+/// too large to attach is kept only here, as `<md5>.<extension>`, linked
+/// by its URL.
 fn save_attachment(dir: &Path, r: &Resource) -> Result<Saved> {
     if attachments::image_ext(&r.data).is_some() && r.data.len() <= attachments::MAX_BYTES {
         return Ok(Saved::Image(attachments::save(dir, &r.data)?));
+    }
+    if r.data.len() <= attachments::MAX_FILE_BYTES {
+        let name = attachments::save_file(dir, &r.data, &r.name())?;
+        return Ok(Saved::File(format!("{}{name}", attachments::URL_PREFIX)));
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{}.{}", r.hash, r.extension()));
@@ -216,15 +221,16 @@ impl App {
         }
     }
 
-    /// `.enex` files dropped on the window open the Import sheet; pictures
-    /// are attached to the open note.
+    /// `.enex` files (and folders) dropped on the window open the Import
+    /// sheet; other files (pictures, PDFs, …) are attached to the open note.
     pub(super) fn dropped_files(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
-        let (pictures, rest): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(|p| p.is_file() && super::attach::is_image_path(p));
-        if !pictures.is_empty() {
-            self.attach_files(&pictures);
+        let is_enex = |p: &PathBuf| p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("enex"));
+        let (enex, rest): (Vec<PathBuf>, Vec<PathBuf>) = dropped.into_iter().partition(is_enex);
+        let files: Vec<PathBuf> = rest.into_iter().filter(|p| p.is_file()).collect();
+        if !files.is_empty() {
+            self.attach_files(&files);
         }
-        let enex: Vec<PathBuf> = rest.into_iter().filter(|p| p.is_dir() || p.extension().is_some_and(|e| e.eq_ignore_ascii_case("enex"))).collect();
         if !enex.is_empty() {
             self.settings_ui.open = false;
             self.open_import(&enex);
@@ -273,12 +279,15 @@ mod tests {
         // "Notes" is the account's own folder.
         let two = app.lib.store.notes.iter().find(|n| n.title() == "Two").unwrap();
         assert!(app.lib.store.folder(&two.folder).unwrap().default);
-        // The attachment is saved and linked.
+        // The attachment (not a picture CleanNotes can show) is saved as
+        // the note's own, and linked by its name.
         let pic = app.lib.store.notes.iter().find(|n| n.title() == "Pic").unwrap();
         let saved: Vec<_> = std::fs::read_dir(dir.path().join("data").join("Attachments")).unwrap().map(|e| e.unwrap().path()).collect();
         assert_eq!(saved.len(), 1);
         assert_eq!(std::fs::read(&saved[0]).unwrap(), b"png bytes");
-        assert!(pic.body.contains(&format!("[Attachment.png]({})", enex::file_url(&saved[0]))), "{}", pic.body);
+        let name = attachments::name_for(b"png bytes", "png");
+        assert!(pic.body.contains(&format!("[Attachment.png](attachments/{name})")), "{}", pic.body);
+        assert_eq!(attachments::refs_in_body(&pic.body), vec![name]);
 
         // Again: nothing new.
         let r = app.import_enex(&[files.join("a.enex")], crate::model::LOCAL).unwrap();

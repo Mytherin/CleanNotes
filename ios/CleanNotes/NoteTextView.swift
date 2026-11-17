@@ -1,5 +1,6 @@
 import ImageIO
 import PhotosUI
+import QuickLook
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -745,7 +746,7 @@ struct NoteEditorView: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, PHPickerViewControllerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate {
         let editor: NoteEditor
         let store: NotesStore
         let bridge: EditorBridge
@@ -756,6 +757,9 @@ struct NoteEditorView: UIViewRepresentable {
         var onBlockedEdit: () -> Void = {}
         var onLink: () -> Void = {}
         private(set) var formatting: Formatting?
+        /// The attached file being previewed (Quick Look keeps its data
+        /// source weakly).
+        private var preview: AttachmentPreview?
         /// Setting the text view's text or selection ourselves.
         private var rendering = false
         private var formatHost: UIHostingController<AnyView>?
@@ -861,6 +865,73 @@ struct NoteEditorView: UIViewRepresentable {
             guard var top = textView?.window?.rootViewController else { return }
             while let next = top.presentedViewController { top = next }
             top.present(picker, animated: true)
+        }
+
+        // ---- Other files (PDFs, …) ----
+
+        /// The view controller to present over.
+        private func topController() -> UIViewController? {
+            guard var top = textView?.window?.rootViewController else { return nil }
+            while let next = top.presentedViewController { top = next }
+            return top
+        }
+
+        fileprivate func fileTapped() {
+            if readOnly {
+                blockedEdit()
+                return
+            }
+            let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
+            picker.allowsMultipleSelection = true
+            picker.delegate = self
+            topController()?.present(picker, animated: true)
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            for url in urls {
+                attachFile(url)
+            }
+        }
+
+        /// Puts a file at the caret: a picture shown, another file as a
+        /// link with its name.
+        func attachFile(_ url: URL) {
+            if readOnly {
+                blockedEdit()
+                return
+            }
+            let label = url.lastPathComponent
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else {
+                store.show("\(label) can't be read.")
+                return
+            }
+            if let type = UTType(filenameExtension: url.pathExtension), type.conforms(to: .image), UIImage(data: data) != nil {
+                attachImage(data)
+                return
+            }
+            // A locked note's files are encrypted (the core does it).
+            do {
+                let reference = try store.core.addNoteFile(id: editor.noteId(), data: data, fileName: label)
+                command(.insertFile(reference: reference, label: label))
+            } catch {
+                store.show("\(label) can't be attached.")
+            }
+        }
+
+        /// Opens an attached file (its link tapped) in Quick Look, from a
+        /// copy named as it's shown.
+        func openAttachment(reference: String, label: String) {
+            guard let path = try? store.core.openAttachment(reference: reference, label: label) else {
+                store.show("\(label) isn't on this device yet.")
+                return
+            }
+            let source = AttachmentPreview(url: URL(fileURLWithPath: path))
+            preview = source
+            let ql = QLPreviewController()
+            ql.dataSource = source
+            topController()?.present(ql, animated: true)
         }
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
@@ -1074,6 +1145,18 @@ struct NoteEditorView: UIViewRepresentable {
             return (nil, nil)
         }
 
+        /// The whole text of the link at a point (an attached file's name).
+        private func linkText(at point: CGPoint) -> String {
+            guard let tv = textView, tv.storage.length > 0 else { return "" }
+            let p = CGPoint(x: point.x - tv.textContainerInset.left, y: point.y - tv.textContainerInset.top)
+            let lm = tv.notesLayout
+            let char = lm.characterIndexForGlyph(at: lm.glyphIndex(for: p, in: tv.textContainer))
+            guard char < tv.storage.length else { return "" }
+            var range = NSRange(location: 0, length: 0)
+            guard tv.storage.attribute(.link, at: char, longestEffectiveRange: &range, in: NSRange(location: 0, length: tv.storage.length)) != nil else { return "" }
+            return (tv.storage.string as NSString).substring(with: range)
+        }
+
         func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
             guard let tv = textView else { return false }
             let h = hit(g.location(in: tv))
@@ -1101,7 +1184,13 @@ struct NoteEditorView: UIViewRepresentable {
                 render()
                 edited()
             } else if let url = h.link {
-                UIApplication.shared.open(url)
+                let address = url.absoluteString
+                if url.scheme == nil, address.hasPrefix("attachments/") {
+                    // An attached file: its name is the link's text.
+                    openAttachment(reference: String(address.dropFirst("attachments/".count)), label: linkText(at: g.location(in: tv)))
+                } else {
+                    UIApplication.shared.open(url)
+                }
             }
         }
 
@@ -1123,13 +1212,18 @@ struct NoteEditorView: UIViewRepresentable {
                 },
             ]))
             table.accessibilityLabel = "Table"
+            let attach = UIBarButtonItem(image: UIImage(systemName: "paperclip"), menu: UIMenu(children: [
+                UIAction(title: "Choose Photo", image: UIImage(systemName: "photo.on.rectangle")) { [weak self] _ in self?.photoTapped() },
+                UIAction(title: "Attach File", image: UIImage(systemName: "doc")) { [weak self] _ in self?.fileTapped() },
+            ]))
+            attach.accessibilityLabel = "Attach"
             bar.items = [
                 table, flex(),
                 item("textformat", "Format", #selector(formatTapped)), flex(),
                 item("checklist", "Checklist", #selector(checklistTapped)), flex(),
                 item("decrease.indent", "Outdent", #selector(outdentTapped)), flex(),
                 item("increase.indent", "Indent", #selector(indentTapped)), flex(),
-                item("photo", "Add Photo", #selector(photoTapped)), flex(),
+                attach, flex(),
                 item("link", "Link", #selector(linkTapped)), flex(),
                 item("xmark.circle", "Done", #selector(doneTapped)),
             ]
@@ -1185,5 +1279,20 @@ struct AttributedTextPreview: UIViewRepresentable {
 
     func updateUIView(_ tv: UITextView, context: Context) {
         tv.attributedText = text
+    }
+}
+
+/// One attached file for Quick Look to show.
+final class AttachmentPreview: NSObject, QLPreviewControllerDataSource {
+    let url: URL
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+    func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+        url as NSURL
     }
 }

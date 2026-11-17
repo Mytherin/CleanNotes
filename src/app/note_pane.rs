@@ -136,8 +136,14 @@ impl App {
             if let Some(path) = out.open_image {
                 let _ = open::that(path);
             }
+            if let Some((reference, label)) = out.open_file {
+                self.open_attached_file(&reference, &label);
+            }
             if out.attach_image {
                 self.choose_images();
+            }
+            if out.attach_file {
+                self.choose_files();
             }
             if out.paste_image {
                 self.paste_image();
@@ -339,6 +345,10 @@ impl App {
                     if ui.add_enabled(self.can_attach(), egui::Button::new("Attach Image…")).clicked() {
                         ui.memory_mut(|m| m.close_popup());
                         self.choose_images();
+                    }
+                    if ui.add_enabled(self.can_attach(), egui::Button::new("Attach File…")).clicked() {
+                        ui.memory_mut(|m| m.close_popup());
+                        self.choose_files();
                     }
                     if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
                         if let Some(e) = &mut self.editor {

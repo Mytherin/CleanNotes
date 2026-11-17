@@ -12,6 +12,12 @@
 //! system text view's attachments), whose [`crate::doc::Style::image`] is
 //! the file's name.
 //!
+//! **Other files** (PDFs, documents, audio, …) are kept the same way, under
+//! the extension of the name they had, and shown as a link with that name:
+//! `[boarding-pass.pdf](attachments/<name>)`. They sync like pictures (a
+//! sync carries every `](attachments/…)` a note refers to) and open in the
+//! system's app for them, from a copy (see [`open_copy`]).
+//!
 //! **Encrypted pictures.** A locked note's pictures are kept encrypted
 //! (see [`crate::lock::seal_bytes`]), each with a random key of its own, in
 //! a file named by the SHA-256 of the *encrypted* bytes, with the extension
@@ -34,6 +40,8 @@ pub const URL_PREFIX: &str = "attachments/";
 pub const OBJECT: char = '\u{FFFC}';
 /// The largest image accepted (larger files are refused, not resized).
 pub const MAX_BYTES: usize = 25 * 1024 * 1024;
+/// The largest other file accepted.
+pub const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
 
 /// The SHA-256 of `data` in lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
@@ -133,6 +141,74 @@ pub fn markdown(reference: &str) -> String {
     format!("![]({URL_PREFIX}{reference})")
 }
 
+/// The extension of a file's name, if it can be an attachment's (short,
+/// letters and digits; lowercased).
+fn name_ext(file_name: &str) -> Option<String> {
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    let ext = ext.to_ascii_lowercase();
+    let fits = !stem.is_empty() && (1..=5).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (fits && ext != SEALED_EXT).then_some(ext)
+}
+
+/// The extension a file (not shown as a picture) is kept under: that of
+/// the name it had, else judged by its first bytes.
+pub fn file_ext(file_name: &str, data: &[u8]) -> String {
+    if let Some(ext) = name_ext(file_name) {
+        return ext;
+    }
+    let ext = if data.starts_with(b"%PDF") { "pdf" } else { image_ext(data).unwrap_or("bin") };
+    ext.to_owned()
+}
+
+/// Saves a file of any kind in `dir` (its extension taken from
+/// `file_name`) and returns its name.
+pub fn save_file(dir: &Path, data: &[u8], file_name: &str) -> Result<String> {
+    if data.len() > MAX_FILE_BYTES {
+        bail!("the file is too large (over {} MB)", MAX_FILE_BYTES / (1024 * 1024));
+    }
+    let name = name_for(data, &file_ext(file_name, data));
+    write(dir, &name, data)?;
+    Ok(name)
+}
+
+/// The reference a link's address names, if it is an attachment's
+/// (`attachments/<reference>`).
+pub fn file_link_ref(url: &str) -> Option<&str> {
+    url.strip_prefix(URL_PREFIX).filter(|r| is_ref(r))
+}
+
+/// A copy of an attachment to open in another app, named `label` (with
+/// the attachment's extension if `label` has none), in a folder of its own
+/// in `out_dir`: decrypted if it's a locked note's. (Never the attachment
+/// itself: an app that changed it would break its name.) `None` if the
+/// file isn't on this device, or doesn't decrypt.
+pub fn open_copy(dir: &Path, reference: &str, label: &str, out_dir: &Path) -> Result<PathBuf> {
+    let Some(data) = load(dir, reference) else { bail!("it isn't on this device yet") };
+    let (name, _) = split_ref(reference);
+    let file: String = label
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') { '_' } else { c })
+        .collect();
+    let file = file.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_owned();
+    let mut file = if file.is_empty() { "Attachment".to_owned() } else { file };
+    if name_ext(&file).is_none() {
+        let ext = name.rsplit_once('.').map(|(_, e)| e).filter(|e| *e != SEALED_EXT).map(str::to_owned).unwrap_or_else(|| file_ext("", &data));
+        file = format!("{file}.{ext}");
+    }
+    // A folder per attachment, so two files of the same name don't clash.
+    let folder = out_dir.join(&sha256_hex(reference.as_bytes())[..16]);
+    std::fs::create_dir_all(&folder).with_context(|| format!("creating {}", folder.display()))?;
+    let path = folder.join(file);
+    // Opened before (and maybe still open, which on Windows keeps it from
+    // being written): the same copy will do.
+    if std::fs::read(&path).is_ok_and(|d| d == data) {
+        return Ok(path);
+    }
+    std::fs::write(&path, &data).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
 /// The extension of an encrypted picture's file.
 pub const SEALED_EXT: &str = "enc";
 
@@ -228,11 +304,12 @@ pub fn refs_in_body(body: &str) -> Vec<String> {
     }
 }
 
-/// `md` with the pictures that early versions of the Evernote import linked
-/// to as files (`[photo.jpg](file:///…/Attachments/<md5>.jpg)`) made the
-/// note's own images (`![](attachments/<sha256>.jpg)`), each saved in `dir`
-/// under its proper name. `None` if there were none. Only links to a file
-/// of `dir` that is a picture are changed; other links stay as they are.
+/// `md` with the files that early versions of the Evernote import linked
+/// to (`[photo.jpg](file:///…/Attachments/<md5>.jpg)`) made the note's own
+/// attachments, each saved in `dir` under its proper name: a picture an
+/// image (`![](attachments/<sha256>.jpg)`), another file a link to it
+/// (`[doc.pdf](attachments/<sha256>.pdf)`), so they sync. `None` if there
+/// were none. Only links to a file of `dir` are changed.
 pub fn upgrade_file_links(md: &str, dir: &Path) -> Option<String> {
     const SCHEME: &str = "](file://";
     if !md.contains(SCHEME) {
@@ -255,13 +332,19 @@ pub fn upgrade_file_links(md: &str, dir: &Path) -> Option<String> {
         let Some(name) = attachment_file_of_url(&md[url_start..url_end]) else { continue };
         let file = dir.join(&name);
         let Ok(data) = std::fs::read(&file) else { continue };
-        if image_ext(&data).is_none() {
-            continue;
-        }
-        let Ok(saved) = save(dir, &data) else { continue };
         let start = if open > 0 && md.as_bytes()[open - 1] == b'!' { open - 1 } else { open };
-        out.push_str(&md[last..start]);
-        out.push_str(&markdown(&saved));
+        if image_ext(&data).is_some() && data.len() <= MAX_BYTES {
+            let Ok(saved) = save(dir, &data) else { continue };
+            out.push_str(&md[last..start]);
+            out.push_str(&markdown(&saved));
+        } else {
+            let Ok(saved) = save_file(dir, &data, &name) else { continue };
+            out.push_str(&md[last..open]);
+            out.push_str(&md[open..url_start]);
+            out.push_str(URL_PREFIX);
+            out.push_str(&saved);
+            out.push(')');
+        }
         last = url_end + 1;
     }
     if last == 0 {
@@ -296,12 +379,37 @@ fn attachment_file_of_url(url: &str) -> Option<String> {
     (folder.eq_ignore_ascii_case(DIR) && plain).then(|| name.to_owned())
 }
 
-/// `md` with each image reference `f` gives another for replaced.
-pub fn replace_refs(md: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+/// The text of the link whose address starts at `url_start` (after its
+/// `](`), unescaped: an attached file's name. Empty for an image.
+fn link_label(md: &str, url_start: usize) -> String {
+    let close = url_start.saturating_sub(URL_PREFIX.len() + 2);
+    let line_start = md[..close].rfind('\n').map_or(0, |p| p + 1);
+    // The last `[` that isn't escaped (an odd number of `\` before it).
+    let escaped_at = |i: usize| md.as_bytes()[line_start..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1;
+    let Some(open) = md[line_start..close].rmatch_indices('[').map(|(p, _)| line_start + p).find(|&i| !escaped_at(i)) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let mut escaped = false;
+    for c in md[open + 1..close].chars() {
+        if c == '\\' && !escaped {
+            escaped = true;
+            continue;
+        }
+        escaped = false;
+        out.push(c);
+    }
+    out
+}
+
+/// `md` with each attachment reference `f` gives another for replaced.
+/// `f` gets the reference and its link's text (an attached file's name;
+/// empty for a picture).
+pub fn replace_refs(md: &str, mut f: impl FnMut(&str, &str) -> Option<String>) -> String {
     let mut out = String::with_capacity(md.len());
     let mut last = 0;
     for (span, r) in ref_spans(md) {
-        if let Some(new) = f(r) {
+        if let Some(new) = f(r, &link_label(md, span.start)) {
             out.push_str(&md[last..span.start]);
             out.push_str(&new);
             last = span.end;
@@ -357,6 +465,19 @@ pub fn save_sealed(dir: &Path, data: &[u8]) -> Result<String> {
     if image_ext(data).is_none() {
         bail!("that isn't an image CleanNotes can show (PNG, JPEG, GIF, WebP, BMP or HEIC)");
     }
+    seal_data(dir, data)
+}
+
+/// Saves a file of any kind encrypted, as [`save_sealed`] a picture, and
+/// returns its reference (with the key), for a locked note.
+pub fn save_sealed_file(dir: &Path, data: &[u8]) -> Result<String> {
+    if data.len() > MAX_FILE_BYTES {
+        bail!("the file is too large (over {} MB)", MAX_FILE_BYTES / (1024 * 1024));
+    }
+    seal_data(dir, data)
+}
+
+fn seal_data(dir: &Path, data: &[u8]) -> Result<String> {
     let key = crate::lock::new_blob_key();
     let blob = crate::lock::seal_bytes(&key, data);
     let name = name_for(&blob, SEALED_EXT);
@@ -365,16 +486,23 @@ pub fn save_sealed(dir: &Path, data: &[u8]) -> Result<String> {
     Ok(format!("{name}#{hex}"))
 }
 
-/// The encrypted picture's bytes saved as a plain attachment: its name.
-pub fn unseal(dir: &Path, r: &str) -> Result<String> {
-    let Some(data) = load(dir, r) else { bail!("the picture isn't on this device yet") };
-    save(dir, &data)
+/// The encrypted attachment's bytes saved as a plain one: its name. `label`
+/// is its link's text: empty for a picture, else the file's name (whose
+/// extension the plain file gets).
+pub fn unseal(dir: &Path, r: &str, label: &str) -> Result<String> {
+    let Some(data) = load(dir, r) else { bail!("the attachment isn't on this device yet") };
+    if label.is_empty() && image_ext(&data).is_some() {
+        save(dir, &data)
+    } else {
+        save_file(dir, &data, label)
+    }
 }
 
-/// A plain attachment saved encrypted: its reference (with the key).
+/// A plain attachment (a picture or another file) saved encrypted: its
+/// reference (with the key).
 pub fn seal(dir: &Path, name: &str) -> Result<String> {
-    let Some(data) = load(dir, name) else { bail!("the picture isn't on this device yet") };
-    save_sealed(dir, &data)
+    let Some(data) = load(dir, name) else { bail!("the attachment isn't on this device yet") };
+    seal_data(dir, &data)
 }
 
 #[cfg(test)]
@@ -399,14 +527,81 @@ mod tests {
         );
         let up = upgrade_file_links(&md, &dir).unwrap();
         let name = name_for(PNG, "png");
-        assert_eq!(
-            up,
-            format!("# T\n\n![](attachments/{name})\n\nsee [doc.pdf]({}) and [gone.jpg]({}) [x](https://e.com)\n", url("ffff.pdf"), url("gone.jpg"))
-        );
-        assert!(exists(&dir, &name));
+        let pdf = name_for(b"%PDF-1.4", "pdf");
+        assert_eq!(up, format!("# T\n\n![](attachments/{name})\n\nsee [doc.pdf](attachments/{pdf}) and [gone.jpg]({}) [x](https://e.com)\n", url("gone.jpg")));
+        assert!(exists(&dir, &name) && exists(&dir, &pdf));
+        assert_eq!(refs_in(&up), vec![name.clone(), pdf]);
         // Nothing to do again, nor for links elsewhere.
         assert_eq!(upgrade_file_links(&up, &dir), None);
         assert_eq!(upgrade_file_links("[a](file:///C:/Other/0123abcd.png)", &dir), None);
+    }
+
+    #[test]
+    fn files_are_kept_under_their_names_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = b"%PDF-1.7 a boarding pass";
+        let a = save_file(dir.path(), pdf, "Boarding Pass.PDF").unwrap();
+        assert_eq!(a, name_for(pdf, "pdf"));
+        assert!(exists(dir.path(), &a));
+        assert_eq!(file_ext("notes.docx", b"PK.."), "docx");
+        // No usable extension: judged by the bytes.
+        assert_eq!(file_ext("scan", pdf), "pdf");
+        assert_eq!(file_ext("weird.toolong", b"??"), "bin");
+        assert_eq!(file_ext("x.enc", b"??"), "bin");
+        assert_eq!(file_ext(".pdf", PNG), "png");
+        assert_eq!(file_link_ref(&format!("attachments/{a}")), Some(a.as_str()));
+        assert_eq!(file_link_ref("attachments/../x.pdf"), None);
+        assert_eq!(file_link_ref("https://example.com/x.pdf"), None);
+    }
+
+    #[test]
+    fn sealed_files_keep_their_extension_when_unsealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = b"%PDF-1.7 secret";
+        let r = save_sealed_file(dir.path(), pdf).unwrap();
+        assert!(is_sealed_ref(&r));
+        assert!(!std::fs::read(path(dir.path(), split_ref(&r).0)).unwrap().windows(4).any(|w| w == b"%PDF"));
+        assert_eq!(load(dir.path(), &r).unwrap(), pdf);
+        // The link's text gives the extension back.
+        assert_eq!(unseal(dir.path(), &r, "taxes.xlsx").unwrap(), name_for(pdf, "xlsx"));
+        assert_eq!(unseal(dir.path(), &r, "").unwrap(), name_for(pdf, "pdf"));
+        // A plain file can be sealed (to lock its note).
+        let plain = save_file(dir.path(), pdf, "a.pdf").unwrap();
+        let sealed = seal(dir.path(), &plain).unwrap();
+        assert_eq!(load(dir.path(), &sealed).unwrap(), pdf);
+    }
+
+    #[test]
+    fn replacing_refs_gives_the_links_text() {
+        let a = name_for(b"a", "png");
+        let f = name_for(b"f", "pdf");
+        let md = format!("![](attachments/{a})\n[my \\[x\\].pdf](attachments/{f})\n");
+        let mut seen = Vec::new();
+        replace_refs(&md, |r, label| {
+            seen.push((r.to_owned(), label.to_owned()));
+            None
+        });
+        assert_eq!(seen, vec![(a, String::new()), (f, "my [x].pdf".to_owned())]);
+    }
+
+    #[test]
+    fn files_open_from_a_copy_with_their_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, out) = (tmp.path().join("att"), tmp.path().join("open"));
+        let pdf = b"%PDF-1.7 ticket";
+        let plain = save_file(&dir, pdf, "ticket.pdf").unwrap();
+        let p = open_copy(&dir, &plain, "Ticket: Nov/17.pdf", &out).unwrap();
+        assert_eq!(p.file_name().unwrap(), "Ticket_ Nov_17.pdf");
+        assert_eq!(std::fs::read(&p).unwrap(), pdf);
+        // Again (maybe still open): the same copy.
+        assert_eq!(open_copy(&dir, &plain, "Ticket: Nov/17.pdf", &out).unwrap(), p);
+        // A locked note's file is decrypted into the copy; a name without an
+        // extension gets one.
+        let sealed = save_sealed_file(&dir, pdf).unwrap();
+        let q = open_copy(&dir, &sealed, "ticket", &out).unwrap();
+        assert_eq!(q.file_name().unwrap(), "ticket.pdf");
+        assert_eq!(std::fs::read(&q).unwrap(), pdf);
+        assert!(open_copy(&dir, &name_for(b"gone", "pdf"), "gone.pdf", &out).is_err());
     }
 
     #[test]
@@ -460,7 +655,7 @@ mod tests {
         let wrong = format!("{name}#{}", "0".repeat(64));
         assert_eq!(load(dir.path(), &wrong), None);
         // Back to a plain attachment, the same as saving it plainly.
-        assert_eq!(unseal(dir.path(), &r).unwrap(), name_for(PNG, "png"));
+        assert_eq!(unseal(dir.path(), &r, "").unwrap(), name_for(PNG, "png"));
         assert!(save_sealed(dir.path(), b"text").is_err());
         // Keys only go with encrypted pictures, and must be whole.
         let plain = name_for(PNG, "png");
@@ -476,7 +671,7 @@ mod tests {
         let md = format!("x ![](attachments/{a}) y\n![](attachments/{s})\n");
         assert_eq!(refs_in(&md), vec![a.clone(), name_for(b"s", "enc")]);
         assert_eq!(image_refs_in(&md), vec![a.clone(), s.clone()]);
-        let out = replace_refs(&md, |r| (r == s).then(|| "Z".repeat(1)));
+        let out = replace_refs(&md, |r, _| (r == s).then(|| "Z".repeat(1)));
         assert_eq!(out, format!("x ![](attachments/{a}) y\n![](attachments/Z)\n"));
         assert_eq!(without_images(&format!("x ![](attachments/{a}) y ![](attachments/{s})")), "x  y ");
         assert_eq!(without_images("![](attachments/nope) z"), "![](attachments/nope) z");
