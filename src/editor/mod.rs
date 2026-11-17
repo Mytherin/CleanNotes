@@ -61,6 +61,9 @@ pub struct Output {
     /// Something to do with an attached file (its reference and name),
     /// from its card or menu.
     pub file_action: Option<(FileAction, String, String)>,
+    /// Pictures (and nothing else) were copied: their references, for the
+    /// app to put on the system clipboard as pictures and files.
+    pub copy_images: Vec<String>,
 }
 
 /// What can be done with an attached file, by the app.
@@ -159,9 +162,14 @@ impl Editor {
         }
     }
 
-    fn copy(&mut self, ctx: &egui::Context) {
-        if let Some(text) = self.ed.copy() {
+    fn copy(&mut self, ctx: &egui::Context, out: &mut Output) {
+        let images = self.ed.selected_images();
+        let Some(text) = self.ed.copy() else { return };
+        if images.is_empty() {
             ctx.copy_text(text);
+        } else {
+            // (egui's clipboard only carries text: the app copies these.)
+            out.copy_images = images;
         }
     }
 
@@ -577,7 +585,7 @@ impl Editor {
                         self.insert_text(&t);
                     }
                     Event::Text(_) | Event::Ime(egui::ImeEvent::Commit(_)) => out.blocked_edit = true,
-                    Event::Copy => self.copy(&ctx),
+                    Event::Copy => self.copy(&ctx, &mut out),
                     // egui reports Ctrl+Shift+X as Cut: it's Strikethrough.
                     Event::Cut if shift_down => {
                         if !opts.read_only {
@@ -585,7 +593,7 @@ impl Editor {
                         }
                     }
                     Event::Cut => {
-                        self.copy(&ctx);
+                        self.copy(&ctx, &mut out);
                         if !opts.read_only {
                             self.delete_selected();
                         }
@@ -1138,12 +1146,12 @@ impl Editor {
                 ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(shortcut)).clicked()
             };
             if item(ui, "Cut", cmd_key!("X"), has_sel && editable) {
-                self.copy(ctx);
+                self.copy(ctx, out);
                 self.delete_selected();
                 ui.close_menu();
             }
             if item(ui, "Copy", cmd_key!("C"), has_sel) {
-                self.copy(ctx);
+                self.copy(ctx, out);
                 ui.close_menu();
             }
             if item(ui, "Paste", cmd_key!("V"), editable) {
@@ -1499,7 +1507,22 @@ mod tests {
         let mut e = Editor::new("n", "**bold** plain\n");
         e.sel = Selection { anchor: Pos::new(0, 0), caret: Pos::new(0, 4) };
         let ctx = egui::Context::default();
-        let out = ctx.run(egui::RawInput::default(), |ctx| e.copy(ctx));
+        let mut copied = Output::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| e.copy(ctx, &mut copied));
         assert!(out.platform_output.copied_text == "bold");
+        assert!(copied.copy_images.is_empty());
+    }
+
+    #[test]
+    fn copied_pictures_are_the_apps_to_put_on_the_clipboard() {
+        let name = cleannotes_core::attachments::name_for(b"pic", "png");
+        let mut e = Editor::new("n", &format!("day\n![](attachments/{name})\n"));
+        e.sel = Selection { anchor: Pos::new(1, 0), caret: Pos::new(1, 1) };
+        let ctx = egui::Context::default();
+        let mut copied = Output::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| e.copy(ctx, &mut copied));
+        assert_eq!(copied.copy_images, vec![name]);
+        // (Not as text: that would replace them.)
+        assert!(out.platform_output.copied_text.is_empty());
     }
 }

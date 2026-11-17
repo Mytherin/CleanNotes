@@ -158,6 +158,9 @@ impl App {
             if out.paste_image {
                 self.paste_image();
             }
+            if !out.copy_images.is_empty() {
+                self.copy_images(&out.copy_images);
+            }
         }
         self.link_sheet(ui.ctx(), p);
         self.rename_sheet(ui.ctx(), p);
