@@ -40,11 +40,14 @@ for target in "$DEVICE" "${SIMS[@]}"; do
 done
 
 # The Swift bindings come from the library's own metadata (a build for this
-# Mac is the simplest to read it from).
-cargo build -p cleannotes-ffi --lib $FLAG
+# Mac is the simplest to read it from). Its C code (SQLite) needs the macOS
+# SDK named: run from Xcode's build phase, with SDKROOT unset above, `cc`
+# otherwise finds no SDK at all ('stdio.h' file not found).
+MAC_SDK="$(xcrun --sdk macosx --show-sdk-path)"
+SDKROOT="$MAC_SDK" cargo build -p cleannotes-ffi --lib $FLAG
 HOST_LIB="$ROOT/target/$PROFILE/libcleannotes_ffi.dylib"
 mkdir -p "$GEN"
-cargo run -q -p cleannotes-ffi --features bindgen --bin uniffi-bindgen -- \
+SDKROOT="$MAC_SDK" cargo run -q -p cleannotes-ffi --features bindgen --bin uniffi-bindgen -- \
     generate --library "$HOST_LIB" --language swift --out-dir "$GEN"
 
 # Headers and module map for the XCFramework.
