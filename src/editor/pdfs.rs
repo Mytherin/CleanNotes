@@ -16,10 +16,30 @@ use eframe::egui::{self, ColorImage, TextureHandle, TextureId, TextureOptions, V
 
 use cleannotes_core::attachments;
 
-/// Pages are drawn this many pixels high (sharp at about 3x their height in
-/// a card), and at most [`MAX_W`] wide.
-const PAGE_PX: f32 = 720.0;
+/// Pages are drawn at most this many pixels wide.
 const MAX_W: f32 = 2048.0;
+
+/// How big a page is drawn: for a small card's picture, a card, or Quick
+/// Look (each sharp at about 3x its size on screen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Res {
+    Thumb,
+    Card,
+    Full,
+}
+
+impl Res {
+    /// Its height in pixels.
+    fn px(self) -> f32 {
+        match self {
+            Res::Thumb => 200.0,
+            Res::Card => 720.0,
+            Res::Full => 2000.0,
+        }
+    }
+}
+
+type PageKey = (String, usize, Res);
 /// The most pages kept drawn, over all PDFs.
 pub const MAX_PAGES: usize = 48;
 
@@ -59,13 +79,15 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub struct PdfCache {
     dir: PathBuf,
     docs: Shared<HashMap<String, DocSlot>>,
-    pages: Shared<HashMap<(String, usize), PageSlot>>,
+    pages: Shared<HashMap<PageKey, PageSlot>>,
+    /// Attachments' sizes in bytes (`None`: not on this device).
+    file_sizes: Mutex<HashMap<String, Option<u64>>>,
     tick: AtomicU64,
 }
 
 impl PdfCache {
     pub fn new(dir: PathBuf) -> PdfCache {
-        PdfCache { dir, docs: Default::default(), pages: Default::default(), tick: AtomicU64::new(0) }
+        PdfCache { dir, docs: Default::default(), pages: Default::default(), file_sizes: Default::default(), tick: AtomicU64::new(0) }
     }
 
     /// The PDF `reference`, starting to read it if it isn't yet.
@@ -103,9 +125,9 @@ impl PdfCache {
 
     /// Page `index` of the PDF `reference` (read by [`PdfCache::get`]), if
     /// it's drawn; else starts drawing it.
-    pub fn page(&self, ctx: &egui::Context, reference: &str, index: usize) -> Option<TextureId> {
+    pub fn page(&self, ctx: &egui::Context, reference: &str, index: usize, res: Res) -> Option<TextureId> {
         let now = self.tick.fetch_add(1, Ordering::Relaxed);
-        let key = (reference.to_owned(), index);
+        let key = (reference.to_owned(), index, res);
         let mut pages = lock(&self.pages);
         match pages.remove(&key) {
             None => {
@@ -116,7 +138,7 @@ impl PdfCache {
                 pages.insert(key.clone(), PageSlot::Loading);
                 let (shared, ctx) = (self.pages.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let slot = match std::panic::catch_unwind(|| render_page(&bytes, index)) {
+                    let slot = match std::panic::catch_unwind(|| render_page(&bytes, index, res)) {
                         Ok(Some(img)) => PageSlot::Decoded(img),
                         _ => PageSlot::Failed,
                     };
@@ -130,7 +152,7 @@ impl PdfCache {
                 None
             }
             Some(PageSlot::Decoded(img)) => {
-                let tex = ctx.load_texture(format!("pdf:{reference}:{index}"), img, TextureOptions::LINEAR);
+                let tex = ctx.load_texture(format!("pdf:{reference}:{index}:{res:?}"), img, TextureOptions::LINEAR);
                 let id = tex.id();
                 pages.insert(key, PageSlot::Ready(tex, now));
                 evict(&mut pages);
@@ -152,12 +174,22 @@ impl PdfCache {
     /// looked for again.
     pub fn retry_missing(&self) {
         lock(&self.docs).retain(|_, s| !matches!(s, DocSlot::Missing));
+        lock(&self.file_sizes).retain(|_, s| s.is_some());
     }
 
     /// Locked notes closed: their PDFs, decrypted, aren't kept.
     pub fn forget_sealed(&self) {
         lock(&self.docs).retain(|r, _| !attachments::is_sealed_ref(r));
-        lock(&self.pages).retain(|(r, _), _| !attachments::is_sealed_ref(r));
+        lock(&self.pages).retain(|(r, _, _), _| !attachments::is_sealed_ref(r));
+    }
+
+    /// An attachment's (any file's) size in bytes, if it's on this device.
+    /// (A locked note's is its encrypted file's: a few bytes more.)
+    pub fn file_size(&self, reference: &str) -> Option<u64> {
+        *lock(&self.file_sizes).entry(reference.to_owned()).or_insert_with(|| {
+            let (name, _) = attachments::split_ref(reference);
+            std::fs::metadata(attachments::path(&self.dir, name)).ok().map(|m| m.len())
+        })
     }
 
     /// How many pages are drawn and kept.
@@ -168,7 +200,7 @@ impl PdfCache {
 }
 
 /// Lets the pages looked at longest ago go, past [`MAX_PAGES`].
-fn evict(pages: &mut HashMap<(String, usize), PageSlot>) {
+fn evict(pages: &mut HashMap<PageKey, PageSlot>) {
     loop {
         let ready = pages.iter().filter_map(|(k, s)| match s {
             PageSlot::Ready(_, t) => Some((k, *t)),
@@ -207,7 +239,7 @@ fn page_sizes(bytes: &Arc<Vec<u8>>) -> Option<Vec<Vec2>> {
 }
 
 /// Page `index` of a PDF, drawn on white.
-fn render_page(bytes: &Arc<Vec<u8>>, index: usize) -> Option<ColorImage> {
+fn render_page(bytes: &Arc<Vec<u8>>, index: usize, res: Res) -> Option<ColorImage> {
     use hayro::hayro_interpret::InterpreterSettings;
     use hayro::vello_cpu::color::palette::css::WHITE;
     let pdf = hayro::hayro_syntax::Pdf::new(bytes.clone()).ok()?;
@@ -217,7 +249,7 @@ fn render_page(bytes: &Arc<Vec<u8>>, index: usize) -> Option<ColorImage> {
     if !(w > 0.0 && h > 0.0) {
         return None;
     }
-    let scale = (PAGE_PX / h).min(MAX_W / w).min(8.0);
+    let scale = (res.px() / h).min(MAX_W / w).min(8.0);
     let settings = hayro::PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE };
     let pixmap = hayro::render(page, &hayro::RenderCache::new(), &InterpreterSettings::default(), &hayro::RenderSettings::default(), &settings);
     let size = [pixmap.width() as usize, pixmap.height() as usize];
@@ -278,14 +310,14 @@ pub(super) mod tests {
         let pdf = Arc::new(test_pdf(&[(200, 100), (100, 300)]));
         assert!(is_pdf(&pdf));
         assert_eq!(page_sizes(&pdf), Some(vec![Vec2::new(200.0, 100.0), Vec2::new(100.0, 300.0)]));
-        let img = render_page(&pdf, 0).expect("the page is drawn");
+        let img = render_page(&pdf, 0, Res::Card).expect("the page is drawn");
         assert_eq!(img.size, [1440, 720]);
         // White, with the black square in its middle.
         let px = |x: usize, y: usize| img.pixels[y * img.size[0] + x];
         assert_eq!(px(5, 5), egui::Color32::WHITE);
         assert_eq!(px(720, 360), egui::Color32::BLACK);
-        assert_eq!(render_page(&pdf, 1).unwrap().size, [240, 720]);
-        assert!(render_page(&pdf, 2).is_none());
+        assert_eq!(render_page(&pdf, 1, Res::Card).unwrap().size, [240, 720]);
+        assert!(render_page(&pdf, 2, Res::Card).is_none());
         // Not a PDF, or one cut short.
         assert!(!is_pdf(b"PK\x03\x04 a zip"));
         assert_eq!(page_sizes(&Arc::new(b"%PDF-1.4 cut short".to_vec())), None);
@@ -307,11 +339,11 @@ pub(super) mod tests {
         assert_eq!(wait(|| (cache.get(&ctx, &broken) != Pdf::Loading).then_some(cache.get(&ctx, &broken))), Pdf::Gone);
         assert_eq!(cache.get(&ctx, &format!("{}.pdf", "a".repeat(64))), Pdf::Gone, "not on this device");
         for i in 0..MAX_PAGES + 2 {
-            wait(|| cache.page(&ctx, &name, i));
+            wait(|| cache.page(&ctx, &name, i, Res::Card));
         }
         // Only so many are kept: the first ones, looked at longest ago, went.
         assert_eq!(cache.pages_kept(), MAX_PAGES);
-        assert!(cache.page(&ctx, &name, 0).is_none());
-        assert!(cache.page(&ctx, &name, MAX_PAGES + 1).is_some());
+        assert!(cache.page(&ctx, &name, 0, Res::Card).is_none());
+        assert!(cache.page(&ctx, &name, MAX_PAGES + 1, Res::Card).is_some());
     }
 }

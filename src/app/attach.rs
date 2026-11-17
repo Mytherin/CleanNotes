@@ -140,6 +140,33 @@ impl App {
         }
     }
 
+    /// "Copy" in an attached file's menu: the file on the clipboard, to
+    /// paste in Explorer, a mail, … (a copy named as it's shown, as for
+    /// opening it).
+    pub fn copy_attached_file(&mut self, reference: &str, label: &str) {
+        let copied = self.lib.open_attachment(reference, label).and_then(|path| {
+            let mut cb = arboard::Clipboard::new()?;
+            cb.set().file_list(&[path])?;
+            Ok(())
+        });
+        if let Err(e) = copied {
+            self.push_notice(format!("{label} can't be copied: {e:#}."));
+        }
+    }
+
+    /// "Save As…" in an attached file's menu (Apple Notes' Share…): a copy
+    /// saved where the user picks.
+    pub fn save_attached_file(&mut self, reference: &str, label: &str) {
+        let Some(data) = self.lib.attachment_data(reference) else {
+            self.push_notice(format!("{label} can't be saved: it isn't on this device yet."));
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new().set_title("Save As").set_file_name(label.trim()).save_file() else { return };
+        if let Err(e) = std::fs::write(&path, data) {
+            self.push_notice(format!("{label} can't be saved: {e}."));
+        }
+    }
+
     /// Paste with a picture (or files) on the clipboard and no text (text
     /// is pasted by the editor itself).
     pub fn paste_image(&mut self) {

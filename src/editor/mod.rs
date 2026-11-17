@@ -13,12 +13,13 @@ use std::ops::{Deref, DerefMut};
 
 use eframe::egui::{self, text::CCursor, Event, Key, Modifiers, Pos2, Rect, Sense, Vec2};
 
-use crate::doc::{Attr, Kind, Pos, Selection};
-use crate::theme::Palette;
+use crate::doc::{Attr, FileView, Kind, Pos, Selection};
+use crate::theme::{self, Palette};
 pub use cleannotes_core::editing::{Command, Editing};
 
 pub mod images;
 pub mod layout;
+pub mod cards;
 pub mod pdfs;
 use layout::{Laid, Marks};
 
@@ -57,6 +58,38 @@ pub struct Output {
     /// Paste was asked for: a picture on the clipboard is the app's to
     /// paste (egui only brings text).
     pub paste_image: bool,
+    /// Something to do with an attached file (its reference and name),
+    /// from its card or menu.
+    pub file_action: Option<(FileAction, String, String)>,
+}
+
+/// What can be done with an attached file, by the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileAction {
+    /// In the system's app for it.
+    Open,
+    /// In CleanNotes' own viewer, all its pages (a PDF).
+    QuickLook,
+    /// The file on the clipboard (to paste in Explorer, a mail, …).
+    Copy,
+    /// A copy saved where the user picks ("Share…" in Apple Notes).
+    SaveAs,
+}
+
+/// The "Rename Attachment" sheet: the attached file of paragraph `block`.
+pub struct RenameSheet {
+    pub block: usize,
+    pub label: String,
+    pub focus: bool,
+}
+
+/// A choice in an attached file's menu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MenuChoice {
+    File(FileAction),
+    View(FileView),
+    Rename,
+    Delete,
 }
 
 /// The "Add Link" sheet.
@@ -80,6 +113,11 @@ pub struct Editor {
     /// How far each PDF's pages are scrolled sideways, and where to (‹ ›
     /// ease them there), by reference.
     pdf_scroll: std::collections::HashMap<String, (f32, f32)>,
+    /// The PDFs whose thumbnails are shown, by reference.
+    pdf_thumbs: std::collections::HashSet<String>,
+    /// The attached file (its paragraph) right-clicked: its menu is shown.
+    file_menu: Option<usize>,
+    pub rename_sheet: Option<RenameSheet>,
 }
 
 impl Deref for Editor {
@@ -107,7 +145,7 @@ impl Editor {
     }
 
     fn wrap(ed: Editing) -> Editor {
-        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default() }
+        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None }
     }
 
     pub fn id(&self) -> egui::Id {
@@ -160,9 +198,15 @@ impl Editor {
         self.laid.iter().flat_map(|l| &l.images).find(|img| img.rect.contains(pt))
     }
 
-    /// The PDF whose pages are under a point, if any.
-    fn pdf_at(&self, pt: Pos2) -> Option<&layout::LaidPdf> {
-        self.laid.iter().filter_map(|l| l.pdf.as_ref()).find(|pdf| pdf.strip.contains(pt))
+    /// The attached file's card under a point, if any, and its paragraph.
+    fn card_at(&self, pt: Pos2) -> Option<(usize, &cards::LaidFile)> {
+        self.laid.iter().enumerate().find_map(|(i, l)| l.file.as_ref().filter(|f| f.card.contains(pt)).map(|f| (i, f)))
+    }
+
+    /// The card under a point, if it's on its pages (a small card's
+    /// picture) or controls: something a click does something with.
+    fn card_control_at(&self, pt: Pos2) -> Option<&cards::LaidFile> {
+        self.card_at(pt).map(|(_, f)| f).filter(|f| f.pages_at(pt) || f.arrow_at(pt).is_some() || f.toggle_at(pt) || f.thumb_at(pt).is_some() || f.menu.contains(pt))
     }
 
     /// Sideways scrolling (a trackpad's, or Shift and the wheel) over a
@@ -170,7 +214,7 @@ impl Editor {
     fn scroll_pdfs(&mut self, ui: &egui::Ui) {
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let dx = ui.input(|i| i.smooth_scroll_delta.x);
-        let under = pointer.and_then(|pt| self.pdf_at(pt)).filter(|pdf| pdf.max_scroll > 0.0);
+        let under = pointer.and_then(|pt| self.card_at(pt)).map(|(_, f)| f).filter(|f| f.max_scroll > 0.0);
         if let (Some(pdf), true) = (under, dx != 0.0) {
             let (reference, max) = (pdf.reference.clone(), pdf.max_scroll);
             let s = self.pdf_scroll.entry(reference).or_default();
@@ -190,14 +234,41 @@ impl Editor {
         }
     }
 
-    /// ‹ (`-1`) or › (`1`) on the PDF `reference`'s card.
-    fn step_pdf(&mut self, ctx: &egui::Context, opts: &Options, reference: &str, dir: i32) {
-        let pdfs::Pdf::Ready(sizes) = opts.pdfs.get(ctx, reference) else { return };
-        let Some(pdf) = self.laid.iter().filter_map(|l| l.pdf.as_ref()).find(|pdf| pdf.reference == reference) else { return };
-        let s = self.pdf_scroll.get(reference).copied().unwrap_or_default();
-        let to = pdf.step(s.1, dir, &sizes);
-        self.pdf_scroll.insert(reference.to_owned(), (s.0, to));
+    /// Eases the pages of the card of paragraph `block` to where `to`
+    /// says (from where they're headed now).
+    fn scroll_card(&mut self, ctx: &egui::Context, block: usize, to: impl FnOnce(&cards::LaidFile, f32) -> f32) {
+        let Some(f) = self.laid.get(block).and_then(|l| l.file.as_ref()) else { return };
+        let s = self.pdf_scroll.get(&f.reference).copied().unwrap_or_default();
+        let target = to(f, s.1);
+        let reference = f.reference.clone();
+        self.pdf_scroll.insert(reference, (s.0, target));
         ctx.request_repaint();
+    }
+
+    /// A press on a card's controls (‹ ›, "Show Thumbnails", a thumbnail):
+    /// whether there was one.
+    fn press_card(&mut self, ctx: &egui::Context, pt: Pos2) -> bool {
+        let Some((block, f)) = self.card_at(pt) else { return false };
+        if let Some(dir) = f.arrow_at(pt) {
+            self.scroll_card(ctx, block, |f, t| f.step(t, dir));
+        } else if f.toggle_at(pt) {
+            let r = f.reference.clone();
+            if !self.pdf_thumbs.remove(&r) {
+                self.pdf_thumbs.insert(r);
+            }
+        } else if let Some(page) = f.thumb_at(pt) {
+            self.scroll_card(ctx, block, |f, _| f.scroll_to(page));
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// What a click on a card's pages (or a small card's picture) does:
+    /// Quick Look for a PDF that can be read, else open it.
+    fn click_card(f: &cards::LaidFile) -> (FileAction, String, String) {
+        let action = if f.pdf && (f.view != FileView::Small || !f.pages.is_empty()) { FileAction::QuickLook } else { FileAction::Open };
+        (action, f.reference.clone(), f.label.clone())
     }
 
     /// The position under a point (screen coordinates).
@@ -606,7 +677,7 @@ impl Editor {
                     let row_h = h + 2.0 * layout::CELL_PAD.y;
                     for (col, galley) in row.into_iter().enumerate() {
                         let rect = Rect::from_min_size(Pos2::new(left + col as f32 * col_w, y), Vec2::new(col_w, row_h));
-                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None, images: Vec::new(), pdf: None });
+                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None, images: Vec::new(), file: None });
                     }
                     y += row_h;
                     ys.push(y);
@@ -649,35 +720,76 @@ impl Editor {
                 let galley = ui.fonts(|f| f.layout_job(layout::job(&empty, body, p, width - indent, &Marks::default(), false)));
                 let h = iy - y - layout::IMAGE_GAP / 2.0;
                 let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-                laid.push(Laid { rect, origin: Pos2::new(left + indent, y), galley, checkbox: None, images, pdf: None });
+                laid.push(Laid { rect, origin: Pos2::new(left + indent, y), galley, checkbox: None, images, file: None });
                 y += h + 1.0;
                 continue;
             }
-            // A link to an attached PDF: a card, its pages above its name
-            // (just the link if it isn't here or can't be read).
-            let pdf = layout::pdf_link(b).and_then(|(reference, label)| match opts.pdfs.get(&ctx, &reference) {
-                pdfs::Pdf::Gone => None,
-                pdfs::Pdf::Loading => Some((reference, label, None)),
-                pdfs::Pdf::Ready(sizes) => Some((reference, label, Some(sizes))),
-            });
-            if let Some((reference, label, sizes)) = pdf {
-                let card_w = (width - indent).min(layout::CARD_MAX_W).max(120.0);
-                // The name is plain text in the card (the card says it opens).
-                let mut job = layout::job(b, body, p, card_w - 2.0 * layout::CARD_PAD - layout::COUNT_W, &marks, false);
+            // An attached file: a card, its name the card's title.
+            if let Some(reference) = self.doc.file_at(i) {
+                let reference = reference.to_owned();
+                let label = b.text.trim().to_owned();
+                let col = (width - indent).max(160.0);
+                let ext = cards::extension(&reference, &label);
+                let pdf = cards::is_pdf_name(&reference, &label);
+                let state = if pdf { opts.pdfs.get(&ctx, &reference) } else { pdfs::Pdf::Gone };
+                let size = opts.pdfs.file_size(&reference);
+                let kind = cards::kind_name(&ext);
+                let view = match state {
+                    pdfs::Pdf::Gone => FileView::Small,
+                    _ => self.doc.file_view(i),
+                };
+                let details = match (size, view) {
+                    (None, _) => format!("{kind} · Not on this device yet"),
+                    (Some(n), FileView::Small) => format!("{kind} · {}", cards::size_text(n)),
+                    (Some(n), _) => cards::size_text(n),
+                };
+                // The name is plain text, bold, in the card (the card says
+                // it opens).
+                let (wrap, font) = match view {
+                    FileView::Small => (cards::LaidFile::small_text_w(col), theme::bold_font(body)),
+                    _ => (cards::LaidFile::pages_text_w(col), theme::bold_font(cards::TITLE_SIZE)),
+                };
+                let mut job = layout::job(b, body, p, wrap.max(40.0), &marks, false);
                 for s in &mut job.sections {
                     s.format.color = p.text;
                     s.format.underline = egui::Stroke::NONE;
+                    s.format.font_id = font.clone();
                 }
                 let galley = ui.fonts(|f| f.layout_job(job));
-                let scroll = self.pdf_scroll.get(&reference).map_or(0.0, |s| s.0);
-                let pos = Pos2::new(left + indent, y + layout::CARD_MARGIN);
-                let mut card = layout::LaidPdf::new(reference, label, pos, card_w, sizes.as_deref(), galley.rect.height(), scroll);
+                let pos = Pos2::new(left + indent, y + cards::MARGIN);
+                let first_row = galley.rows.first().map_or(Vec2::ZERO, |r| r.rect.size());
+                let mut card = match (&state, view) {
+                    (_, FileView::Small) => {
+                        let first = match &state {
+                            pdfs::Pdf::Ready(sizes) => sizes.first().copied(),
+                            _ => None,
+                        };
+                        cards::LaidFile::small(reference, label, pdf, details, ext, pos, col, galley.rect.size(), first)
+                    }
+                    (state, view) => {
+                        let sizes = match state {
+                            pdfs::Pdf::Ready(sizes) => Some(sizes.clone()),
+                            _ => None,
+                        };
+                        let scroll = self.pdf_scroll.get(&reference).map_or(0.0, |s| s.0);
+                        let thumbs = self.pdf_thumbs.contains(&reference);
+                        cards::LaidFile::pages(reference, label, details, view, pos, col, sizes.as_deref(), first_row, galley.rect.height(), scroll, thumbs)
+                    }
+                };
+                let res = match view {
+                    FileView::Small => pdfs::Res::Thumb,
+                    FileView::Medium => pdfs::Res::Card,
+                    FileView::Large => pdfs::Res::Full,
+                };
                 for pg in &mut card.pages {
-                    pg.tex = opts.pdfs.page(&ctx, &card.reference, pg.index);
+                    pg.tex = opts.pdfs.page(&ctx, &card.reference, pg.index, res);
                 }
-                let h = card.card.height() + 2.0 * layout::CARD_MARGIN;
+                for t in &mut card.thumbs {
+                    t.tex = opts.pdfs.page(&ctx, &card.reference, t.index, pdfs::Res::Thumb);
+                }
+                let h = card.card.height() + 2.0 * cards::MARGIN;
                 let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-                laid.push(Laid { rect, origin: card.text_origin, galley, checkbox: None, images: Vec::new(), pdf: Some(card) });
+                laid.push(Laid { rect, origin: card.text_origin, galley, checkbox: None, images: Vec::new(), file: Some(card) });
                 y += h + 1.0;
                 continue;
             }
@@ -687,12 +799,13 @@ impl Editor {
             let origin = Pos2::new(left + indent, y + mono_pad);
             let h = galley.rect.height().max(layout::size(b.kind, body) * 1.2) + 2.0 * mono_pad;
             let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-            laid.push(Laid { rect, origin, galley, checkbox: None, images: Vec::new(), pdf: None });
+            laid.push(Laid { rect, origin, galley, checkbox: None, images: Vec::new(), file: None });
             y += h + 1.0;
         }
         // Scrolled no further than the pages reach (the window narrowed,
         // say).
-        for card in laid.iter().filter_map(|l| l.pdf.as_ref()) {
+        // (Not by a small card of the same PDF: it doesn't scroll.)
+        for card in laid.iter().filter_map(|l| l.file.as_ref()).filter(|f| f.view != FileView::Small) {
             if let Some(s) = self.pdf_scroll.get_mut(&card.reference) {
                 s.0 = s.0.clamp(0.0, card.max_scroll);
                 s.1 = s.1.clamp(0.0, card.max_scroll);
@@ -719,16 +832,18 @@ impl Editor {
         for t in &tables {
             layout::paint_table(&painter, t, p);
         }
-        // PDF cards, under their names (and the selection of them).
-        let hover = resp.hovered().then(|| ui.input(|i| i.pointer.hover_pos())).flatten();
+        // Attached files' cards, under their names (and the selection of
+        // them). (Hover by the pointer itself: the ⌄ button takes it from
+        // the editor's response.)
+        let hover = ui.ctx().pointer_hover_pos().filter(|pt| ui.clip_rect().contains(*pt));
         for (i, l) in laid.iter().enumerate() {
-            let Some(pdf) = &l.pdf else { continue };
-            layout::paint_pdf(&painter, pdf, p, hover.is_some_and(|pt| pdf.card.contains(pt)));
-            // Selected with all of its name: its pages are tinted too.
+            let Some(file) = &l.file else { continue };
+            cards::paint(&painter, file, p, hover);
+            // Selected with all of its name: the card is tinted too.
             let b = &self.doc.blocks[i];
             if !self.sel.is_empty() && self.sel.start() <= Pos::new(i, 0) && Pos::new(i, b.len()) <= self.sel.end() {
                 let c = if focused { p.text_selection } else { p.selection_inactive };
-                painter.rect_filled(pdf.strip, 0.0, c.gamma_multiply(0.6));
+                painter.rect_filled(file.card, 12.0, c.gamma_multiply(0.35));
             }
         }
         if !self.sel.is_empty() {
@@ -763,7 +878,7 @@ impl Editor {
         // ---- Pointer ----
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let hover_link = resp.hovered().then(|| pointer.and_then(|pt| self.link_at(pt))).flatten();
-        if hover_link.is_some() || (resp.hovered() && pointer.is_some_and(|pt| self.pdf_at(pt).is_some())) {
+        if hover_link.is_some() || (resp.hovered() && pointer.is_some_and(|pt| self.card_control_at(pt).is_some())) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         } else if resp.hovered() {
             let over_box = pointer.is_some_and(|pt| self.laid.iter().any(|l| l.checkbox.is_some_and(|r| r.contains(pt))) || self.image_at(pt).is_some());
@@ -775,7 +890,9 @@ impl Editor {
         // A right-click puts the caret there (unless on the selection), so
         // its menu acts on what was clicked: the table cell, say.
         if resp.secondary_clicked() {
-            if let Some(pt) = pointer {
+            // On an attached file's card: its menu, not the text's.
+            self.file_menu = pointer.and_then(|pt| self.card_at(pt)).map(|(i, _)| i);
+            if let Some(pt) = pointer.filter(|_| self.file_menu.is_none()) {
                 let at = self.pos_at(pt);
                 if self.sel.is_empty() || at < self.sel.start() || at > self.sel.end() {
                     self.sel = Selection::caret(at);
@@ -787,10 +904,9 @@ impl Editor {
             let pressed = ui.input(|i| i.pointer.primary_pressed());
             if pressed && resp.hovered() {
                 let checkbox = self.laid.iter().position(|l| l.checkbox.is_some_and(|r| r.contains(pt)));
-                let arrow = self.pdf_at(pt).and_then(|pdf| Some((pdf.reference.clone(), pdf.arrow_at(pt)?)));
-                if let Some((reference, dir)) = arrow {
-                    // ‹ or ›: the pages scroll a strip's width that way.
-                    self.step_pdf(&ctx, opts, &reference, dir);
+                if self.press_card(&ctx, pt) || self.card_control_at(pt).is_some() {
+                    // ‹ ›, "Show Thumbnails", a thumbnail: done; pages: a
+                    // click opens them (the caret stays).
                 } else if let Some(b) = checkbox {
                     if opts.read_only {
                         out.blocked_edit = true;
@@ -844,12 +960,13 @@ impl Editor {
                     None => out.open_url = Some(url),
                 }
             } else if let Some(pt) = pointer {
-                // A PDF's pages open it, as its name does.
-                if let Some(pdf) = self.pdf_at(pt).filter(|pdf| pdf.arrow_at(pt).is_none()) {
-                    out.open_file = Some((pdf.reference.clone(), pdf.label.clone()));
+                // A card's pages (a small card's picture): Quick Look.
+                if let Some((_, f)) = self.card_at(pt).filter(|(_, f)| f.pages_at(pt)) {
+                    out.file_action = Some(Self::click_card(f));
                 }
             }
         }
+        self.card_menus(ui, opts, &mut out);
         self.context_menu(&resp, opts, &ctx, &mut out);
 
         // ---- Caret ----
@@ -909,7 +1026,110 @@ impl Editor {
         layout::auto_links(&b.text).into_iter().find(|(range, _)| range.contains(&ci)).map(|(_, u)| u)
     }
 
+    /// What an attached file's menu shows for the card of paragraph
+    /// `block`: "PDF Document · 211 KB", whether Quick Look is there, and
+    /// its view (`None`: no View As, for a file that isn't a PDF).
+    fn menu_info(&self, opts: &Options, block: usize) -> Option<(String, bool, Option<FileView>)> {
+        let f = self.laid.get(block)?.file.as_ref()?;
+        let kind = cards::kind_name(&f.ext);
+        let header = match opts.pdfs.file_size(&f.reference) {
+            Some(n) => format!("{kind} · {}", cards::size_text(n)),
+            None => kind,
+        };
+        let readable = f.pdf && (f.view != FileView::Small || !f.pages.is_empty());
+        let view = f.pdf.then(|| self.doc.file_view(block));
+        Some((header, readable, view))
+    }
+
+    /// An attached file's menu, as in Apple Notes (less Markup; Share… is
+    /// Save As…: Windows has no share sheet to hand a file to).
+    fn attachment_menu(ui: &mut egui::Ui, header: &str, quick_look: bool, view: Option<FileView>, editable: bool) -> Option<MenuChoice> {
+        ui.set_min_width(220.0);
+        let mut choice = None;
+        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, c: MenuChoice| {
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                choice = Some(c);
+                ui.close_menu();
+            }
+        };
+        ui.label(egui::RichText::new(header).size(12.5).color(ui.visuals().weak_text_color()));
+        ui.separator();
+        item(ui, "Quick Look Attachment", quick_look, MenuChoice::File(FileAction::QuickLook));
+        item(ui, "Open Attachment", true, MenuChoice::File(FileAction::Open));
+        ui.separator();
+        if let Some(current) = view {
+            ui.add_enabled_ui(editable, |ui| {
+                ui.menu_button("View As", |ui| {
+                    for (label, v) in [("Small", FileView::Small), ("Medium", FileView::Medium), ("Large", FileView::Large)] {
+                        if ui.add(egui::Button::new(label).selected(v == current)).clicked() {
+                            choice = Some(MenuChoice::View(v));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            });
+        }
+        let mut item = |ui: &mut egui::Ui, label: &str, enabled: bool, c: MenuChoice| {
+            if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+                choice = Some(c);
+                ui.close_menu();
+            }
+        };
+        item(ui, "Rename Attachment…", editable, MenuChoice::Rename);
+        ui.separator();
+        item(ui, "Copy", true, MenuChoice::File(FileAction::Copy));
+        item(ui, "Save As…", true, MenuChoice::File(FileAction::SaveAs));
+        ui.separator();
+        item(ui, "Delete", editable, MenuChoice::Delete);
+        choice
+    }
+
+    /// Does what was chosen in the menu of the attached file of paragraph
+    /// `block`.
+    fn apply_menu_choice(&mut self, block: usize, choice: MenuChoice, opts: &Options, out: &mut Output) {
+        let Some(f) = self.laid.get(block).and_then(|l| l.file.as_ref()) else { return };
+        let (reference, label) = (f.reference.clone(), f.label.clone());
+        let editable = !opts.read_only;
+        match choice {
+            MenuChoice::File(action) => out.file_action = Some((action, reference, label)),
+            MenuChoice::View(view) if editable => self.command(Command::SetFileView { block, view }),
+            MenuChoice::Rename if editable => self.rename_sheet = Some(RenameSheet { block, label, focus: true }),
+            MenuChoice::Delete if editable => self.command(Command::DeleteFile { block }),
+            _ => out.blocked_edit = true,
+        }
+    }
+
+    /// The ⌄ on each card: its menu, on a click.
+    fn card_menus(&mut self, ui: &mut egui::Ui, opts: &Options, out: &mut Output) {
+        let editable = !opts.read_only;
+        let buttons: Vec<(usize, Rect)> = self.laid.iter().enumerate().filter_map(|(i, l)| l.file.as_ref().map(|f| (i, f.menu))).collect();
+        for (block, rect) in buttons {
+            let Some((header, quick_look, view)) = self.menu_info(opts, block) else { continue };
+            // (Drawn by the card: the button is only where it's clicked.)
+            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect).id_salt(("file-menu", block)));
+            let button = egui::Button::new("").frame(false).min_size(rect.size());
+            let chosen = egui::menu::menu_custom_button(&mut child, button, |ui| Self::attachment_menu(ui, &header, quick_look, view, editable));
+            if let Some(Some(choice)) = chosen.inner {
+                self.apply_menu_choice(block, choice, opts, out);
+            }
+        }
+    }
+
     fn context_menu(&mut self, resp: &egui::Response, opts: &Options, ctx: &egui::Context, out: &mut Output) {
+        // Right-clicked on an attached file's card: its menu.
+        if let Some(block) = self.file_menu {
+            let Some((header, quick_look, view)) = self.menu_info(opts, block) else {
+                self.file_menu = None;
+                return;
+            };
+            let mut chosen = None;
+            resp.context_menu(|ui| chosen = Self::attachment_menu(ui, &header, quick_look, view, !opts.read_only));
+            if let Some(choice) = chosen {
+                self.apply_menu_choice(block, choice, opts, out);
+                self.file_menu = None;
+            }
+            return;
+        }
         let has_sel = !self.sel.is_empty();
         let editable = !opts.read_only;
         resp.context_menu(|ui| {
@@ -1164,18 +1384,18 @@ mod tests {
     }
 
     #[test]
-    fn attached_pdfs_are_cards_whose_pages_scroll_sideways() {
+    fn attached_files_are_cards_as_in_apple_notes() {
         let dir = tempfile::tempdir().unwrap();
         let pdf = pdfs::tests::test_pdf(&[(612, 792); 12]);
         let name = cleannotes_core::attachments::save_file(dir.path(), &pdf, "trip.pdf").unwrap();
         let doc = cleannotes_core::attachments::save_file(dir.path(), b"PK\x03\x04", "notes.docx").unwrap();
         let cache = images::ImageCache::new(dir.path().to_owned());
         let pdf_cache = pdfs::PdfCache::new(dir.path().to_owned());
-        let md = format!("# Trip\n[trip.pdf](attachments/{name})\n[notes.docx](attachments/{doc})\nsee [trip.pdf](attachments/{name})\nafter\n");
+        let md = format!("# Trip\n[trip.pdf](attachments/{name})\n[notes.docx](attachments/{doc})\nsee [trip.pdf](attachments/{name})\n[pass.pdf](attachments/{name} \"small\")\nafter\n");
         let mut e = Editor::new("n", &md);
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        let input = |events: Vec<egui::Event>| egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 900.0))), events, ..Default::default() };
+        let input = |events: Vec<egui::Event>| egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 1400.0))), events, ..Default::default() };
         let frame = |e: &mut Editor, input: egui::RawInput| {
             let mut out = Output::default();
             let _ = ctx.run(input, |ctx| {
@@ -1187,56 +1407,91 @@ mod tests {
             });
             out
         };
-        let pdf_of = |e: &Editor| e.laid[1].pdf.as_ref().map(|c| (c.count, c.scroll, c.strip, c.card, c.pages.iter().map(|pg| (pg.index, pg.tex.is_some())).collect::<Vec<_>>()));
+        let card = |e: &Editor, i: usize| e.laid[i].file.as_ref().unwrap().clone();
         // Read and drawn on threads of their own: shown a few frames on.
         pdfs::tests::wait(|| {
             frame(&mut e, input(vec![]));
-            pdf_of(&e).filter(|c| c.0 == 12 && c.4.iter().all(|pg| pg.1))
+            let ready = |i: usize| e.laid[i].file.as_ref().is_some_and(|f| !f.pages.is_empty() && f.pages.iter().all(|pg| pg.tex.is_some()));
+            (ready(1) && ready(4)).then_some(())
         });
-        let c = e.laid[1].pdf.as_ref().unwrap();
-        assert_eq!((c.reference.as_str(), c.label.as_str()), (name.as_str(), "trip.pdf"));
-        assert_eq!(c.strip.height(), layout::PAGE_H);
-        // The name is in the card, below the pages; the rest below the card.
+        // Medium, unless set: the name at the top, big pages below.
+        let c = card(&e, 1);
+        assert_eq!((c.view, c.reference.as_str(), c.label.as_str()), (FileView::Medium, name.as_str(), "trip.pdf"));
+        assert_eq!(c.strip.height(), cards::MEDIUM_PAGE_H);
         assert_eq!(e.laid[1].origin, c.text_origin);
-        assert!(c.card.contains(e.laid[1].origin) && c.text_origin.y > c.strip.bottom());
-        assert!(e.laid[2].rect.top() > c.card.bottom());
-        // Only pages in or near view are drawn; there's more to the right.
-        assert_eq!(c.pages.first().map(|pg| pg.index), Some(0));
-        assert!(c.pages.len() < 12 && c.pages.len() >= 3, "{}", c.pages.len());
-        assert!(c.arrow(-1).is_none() && c.arrow(1).is_some());
-        // Other files, and a PDF linked inside text, are links only.
-        assert!(e.laid[2].pdf.is_none() && e.laid[3].pdf.is_none());
+        assert!(c.text_origin.y < c.strip.top() && e.laid[2].rect.top() > c.card.bottom());
+        assert!(c.pages.len() < 12 && c.arrow(-1).is_none() && c.arrow(1).is_some());
+        // Other files: small cards, saying what they are; a PDF linked in
+        // text is a link; one set small shows its first page in the card.
+        let d = card(&e, 2);
+        assert_eq!(d.view, FileView::Small);
+        assert!(d.details.starts_with("Word Document · ") && d.pages.is_empty(), "{}", d.details);
+        assert!(e.laid[3].file.is_none());
+        let s = card(&e, 4);
+        assert_eq!((s.view, s.pages.len()), (FileView::Small, 1));
+        assert!(s.details.starts_with("PDF Document · ") && s.details.ends_with(" KB"), "{}", s.details);
+        assert!(s.strip.contains(s.pages[0].rect.center()) && s.menu.right() < s.strip.left());
 
         // Shift and the wheel over the pages scroll them sideways.
-        let strip = c.strip;
         let wheel = egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: Vec2::new(0.0, -120.0), modifiers: Modifiers::SHIFT };
-        frame(&mut e, input(vec![egui::Event::PointerMoved(strip.center()), wheel]));
+        frame(&mut e, input(vec![egui::Event::PointerMoved(c.strip.center()), wheel]));
         for _ in 0..30 {
             frame(&mut e, input(vec![]));
         }
-        let scrolled = e.laid[1].pdf.as_ref().unwrap().scroll;
+        let scrolled = card(&e, 1).scroll;
         assert!(scrolled > 50.0, "{scrolled}");
-
-        // › scrolls on to a page's start, a strip's width or so on.
-        let arrow = e.laid[1].pdf.as_ref().unwrap().arrow(1).unwrap().center();
         let click = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
-        frame(&mut e, input(vec![egui::Event::PointerMoved(arrow), click(arrow, true)]));
-        let out = frame(&mut e, input(vec![click(arrow, false)]));
-        assert_eq!(out.open_file, None, "the arrow doesn't open it");
-        for _ in 0..120 {
-            frame(&mut e, input(vec![]));
-        }
-        let c = e.laid[1].pdf.as_ref().unwrap();
-        let page_w = 612.0 / 792.0 * layout::PAGE_H + layout::PAGE_GAP;
-        assert!(c.scroll > scrolled + 200.0 && (c.scroll / page_w).fract().min(1.0 - (c.scroll / page_w).fract()) < 0.01, "{}", c.scroll);
-        assert!(c.pages.iter().any(|pg| pg.index >= 4));
-        assert_eq!(e.sel, Selection::caret(Pos::new(0, 0)), "nor moves the caret");
+        let press = |e: &mut Editor, at: Pos2| {
+            frame(e, input(vec![egui::Event::PointerMoved(at), click(at, true)]));
+            let out = frame(e, input(vec![click(at, false)]));
+            for _ in 0..120 {
+                frame(e, input(vec![]));
+            }
+            out
+        };
+        // › scrolls on to a page's start, without opening it or moving the
+        // caret.
+        let at = card(&e, 1).arrow(1).unwrap().center();
+        let out = press(&mut e, at);
+        assert!(out.file_action.is_none());
+        let c = card(&e, 1);
+        assert!(c.scroll > scrolled + 200.0 && c.starts.contains(&c.scroll), "{}", c.scroll);
+        assert_eq!(e.sel, Selection::caret(Pos::new(0, 0)));
+        // Show Thumbnails, and one clicked goes to its page.
+        let at = card(&e, 1).toggle.unwrap().center();
+        press(&mut e, at);
+        let c = card(&e, 1);
+        assert!(c.thumbs_shown && !c.thumbs.is_empty());
+        let t = c.thumbs.iter().find(|t| t.index == 1).unwrap().rect.center();
+        press(&mut e, t);
+        let c = card(&e, 1);
+        assert_eq!((c.scroll, c.current), (c.starts[1], 1));
+        // A click on the pages: Quick Look.
+        let page = c.pages.iter().map(|pg| pg.rect.center()).find(|pt| c.pages_at(*pt)).unwrap();
+        let out = press(&mut e, page);
+        assert_eq!(out.file_action, Some((FileAction::QuickLook, name.clone(), "trip.pdf".to_owned())));
+        // The ⌄ takes the click (its menu): nothing else happens.
+        let at = card(&e, 1).menu.center();
+        let out = press(&mut e, at);
+        assert!(out.file_action.is_none() && out.open_file.is_none());
 
-        // A click on a page opens the PDF.
-        let page = c.pages.iter().find(|pg| c.strip.contains(pg.rect.center()) && c.arrow_at(pg.rect.center()).is_none()).unwrap().rect.center();
-        frame(&mut e, input(vec![egui::Event::PointerMoved(page), click(page, true)]));
-        let out = frame(&mut e, input(vec![click(page, false)]));
-        assert_eq!(out.open_file, Some((name.clone(), "trip.pdf".to_owned())));
+        // The menu's choices.
+        let opts_cache = (images::ImageCache::new(dir.path().to_owned()), pdfs::PdfCache::new(dir.path().to_owned()));
+        let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &opts_cache.0, pdfs: &opts_cache.1, can_attach: true };
+        let mut out = Output::default();
+        e.apply_menu_choice(1, MenuChoice::View(FileView::Large), &opts, &mut out);
+        assert!(e.take_markdown().unwrap().contains(&format!("[trip.pdf](attachments/{name} \"large\")")));
+        e.apply_menu_choice(2, MenuChoice::File(FileAction::Copy), &opts, &mut out);
+        assert_eq!(out.file_action, Some((FileAction::Copy, doc.clone(), "notes.docx".to_owned())));
+        e.apply_menu_choice(2, MenuChoice::Rename, &opts, &mut out);
+        assert!(e.rename_sheet.as_ref().is_some_and(|s| s.block == 2 && s.label == "notes.docx"));
+        e.apply_menu_choice(2, MenuChoice::Delete, &opts, &mut out);
+        assert!(!e.take_markdown().unwrap().contains("notes.docx"));
+        // Not in a deleted note.
+        let ro = Options { read_only: true, ..opts };
+        let mut out = Output::default();
+        e.apply_menu_choice(1, MenuChoice::Delete, &ro, &mut out);
+        assert!(out.blocked_edit && e.take_markdown().is_none());
     }
 
     #[test]

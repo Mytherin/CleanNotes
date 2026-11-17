@@ -6,7 +6,8 @@ use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Ui, Vec2};
 use super::sidebar::{capsule_item, glass, glass_button, menu_look, popover_frame, submenu, tool_button};
 use super::{modal, note_header_time, App, Confirm, Pane, TOOLBAR_H};
 use crate::doc::{Attr, Kind};
-use crate::editor::{Command, Options};
+use crate::editor::pdfs::{Pdf, Res};
+use crate::editor::{Command, FileAction, Options};
 use crate::icons::Icon;
 use crate::theme::{self, Palette};
 
@@ -140,6 +141,14 @@ impl App {
             if let Some((reference, label)) = out.open_file {
                 self.open_attached_file(&reference, &label);
             }
+            if let Some((action, reference, label)) = out.file_action {
+                match action {
+                    FileAction::Open => self.open_attached_file(&reference, &label),
+                    FileAction::QuickLook => self.quick_look = Some((reference, label)),
+                    FileAction::Copy => self.copy_attached_file(&reference, &label),
+                    FileAction::SaveAs => self.save_attached_file(&reference, &label),
+                }
+            }
             if out.attach_image {
                 self.choose_images();
             }
@@ -151,6 +160,8 @@ impl App {
             }
         }
         self.link_sheet(ui.ctx(), p);
+        self.rename_sheet(ui.ctx(), p);
+        self.quick_look_sheet(ui.ctx(), p);
     }
 
     /// "Edit as Markdown": the note's Markdown, as stored, in a plain text
@@ -656,6 +667,114 @@ impl App {
                 e.command(Command::SetLink(url));
             }
             e.focus_requested = true;
+        }
+    }
+
+    /// "Rename Attachment…": the name an attached file is shown with.
+    fn rename_sheet(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(e) = &mut self.editor else { return };
+        let Some(sheet) = &mut e.rename_sheet else { return };
+        let mut result: Option<Option<String>> = None;
+        modal(ctx, "rename-attachment", p, |ui| {
+            ui.set_width(340.0);
+            ui.label(egui::RichText::new("Rename Attachment").font(theme::bold_font(14.0)));
+            ui.add_space(6.0);
+            let te = ui.add(egui::TextEdit::singleline(&mut sheet.label).desired_width(f32::INFINITY));
+            if sheet.focus {
+                te.request_focus();
+                sheet.focus = false;
+            }
+            ui.add_space(10.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ok = !sheet.label.trim().is_empty();
+                let button = egui::Button::new(egui::RichText::new("Rename").color(egui::Color32::WHITE)).fill(theme::BLUE);
+                if (ui.add_enabled(ok, button).clicked() || (ok && te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)))) && result.is_none() {
+                    result = Some(Some(sheet.label.clone()));
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                    result = Some(None);
+                }
+            });
+        });
+        if let Some(r) = result {
+            let block = sheet.block;
+            e.rename_sheet = None;
+            if let Some(label) = r {
+                e.command(Command::RenameFile { block, label });
+            }
+            e.focus_requested = true;
+        }
+    }
+
+    /// Quick Look: an attached PDF's pages, one below the other, big.
+    fn quick_look_sheet(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some((reference, label)) = self.quick_look.clone() else { return };
+        let screen = ctx.screen_rect();
+        let width = (screen.width() - 160.0).clamp(280.0, 820.0);
+        let state = self.pdfs.get(ctx, &reference);
+        let pdfs = &self.pdfs;
+        let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut open = false;
+        modal(ctx, "quick-look", p, |ui| {
+            ui.set_width(width);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(&label).font(theme::bold_font(15.0)));
+                if let Pdf::Ready(sizes) = &state {
+                    let n = sizes.len();
+                    ui.label(egui::RichText::new(if n == 1 { "1 page".to_owned() } else { format!("{n} pages") }).color(p.secondary));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close |= ui.button("Done").clicked();
+                    open |= ui.button("Open").clicked();
+                });
+            });
+            ui.add_space(8.0);
+            let sizes = match &state {
+                Pdf::Ready(sizes) => sizes.clone(),
+                Pdf::Loading => {
+                    ui.label(egui::RichText::new("Loading…").color(p.secondary));
+                    return;
+                }
+                Pdf::Gone => {
+                    ui.label(egui::RichText::new("This PDF can't be shown here.").color(p.secondary));
+                    return;
+                }
+            };
+            let gap = 14.0;
+            let page_w = width - 16.0;
+            let heights: Vec<f32> = sizes.iter().map(|s| page_w * s.y / s.x).collect();
+            let total: f32 = heights.iter().sum::<f32>() + gap * heights.len().saturating_sub(1) as f32;
+            egui::ScrollArea::vertical()
+                .id_salt(("quick-look", &reference))
+                .max_height((screen.height() - 180.0).max(200.0))
+                .auto_shrink([false, true])
+                .show_viewport(ui, |ui, viewport| {
+                    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(width, total), Sense::hover());
+                    let mut y = 0.0;
+                    for (i, h) in heights.iter().enumerate() {
+                        // Only the pages in view (and one either side) are drawn.
+                        let near = viewport.expand2(egui::Vec2::new(0.0, viewport.height()));
+                        if y + h >= near.top() && y <= near.bottom() {
+                            let r = Rect::from_min_size(rect.min + egui::Vec2::new(8.0, y), egui::Vec2::new(page_w, *h));
+                            ui.painter().rect_filled(r.translate(egui::Vec2::new(0.0, 1.5)).expand(1.0), 2.0, egui::Color32::from_black_alpha(40));
+                            match pdfs.page(ctx, &reference, i, Res::Full) {
+                                Some(tex) => {
+                                    ui.painter().image(tex, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), egui::Color32::WHITE);
+                                }
+                                None => {
+                                    ui.painter().rect_filled(r, 0.0, egui::Color32::WHITE);
+                                }
+                            }
+                        }
+                        y += h + gap;
+                    }
+                });
+        });
+        if open {
+            self.open_attached_file(&reference, &label);
+        }
+        if close || open {
+            self.quick_look = None;
         }
     }
 }

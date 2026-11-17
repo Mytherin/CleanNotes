@@ -101,6 +101,8 @@ pub struct App {
     /// Pictures in notes, loaded.
     pub images: ImageCache,
     pub pdfs: PdfCache,
+    /// Quick Look: an attached PDF (its reference and name) shown whole.
+    pub quick_look: Option<(String, String)>,
 }
 
 impl App {
@@ -139,6 +141,7 @@ impl App {
         App {
             images: ImageCache::new(lib.attachments_dir()),
             pdfs: PdfCache::new(lib.attachments_dir()),
+            quick_look: None,
             lib,
             location: Location::Folder(String::new()),
             selected: None,
