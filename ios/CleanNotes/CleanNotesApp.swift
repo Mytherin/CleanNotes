@@ -1,10 +1,11 @@
+import CoreSpotlight
 import SwiftUI
 import UIKit
 
 @main
 struct CleanNotesApp: App {
     @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var store = NotesStore()
+    @StateObject private var store = NotesStore.shared
     @Environment(\.scenePhase) private var phase
 
     var body: some Scene {
@@ -37,7 +38,7 @@ struct RootView: View {
     @EnvironmentObject private var store: NotesStore
     @State private var path: [Route] = []
     @State private var restored = false
-    @ObservedObject private var quickActions = QuickActionCenter.shared
+    @ObservedObject private var requests = AppRequests.shared
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -56,23 +57,43 @@ struct RootView: View {
             guard !restored else { return }
             restored = true
             path = [.list(store.core.initialPlace())]
-            // Launched from the quick action.
-            handleQuickAction()
+            // Launched from the quick action, Spotlight or Shortcuts.
+            handleRequest()
         }
-        .onChange(of: quickActions.pending) { _, _ in
-            if restored { handleQuickAction() }
+        .onChange(of: requests.pending) { _, _ in
+            if restored { handleRequest() }
+        }
+        .onContinueUserActivity(CSSearchableItemActionType) { activity in
+            if let request = AppRequest(activity: activity) {
+                requests.pending = request
+            }
         }
     }
 
-    /// New Note from the Home Screen: a note in the default folder, open with
-    /// the keyboard up, over that folder's list.
-    private func handleQuickAction() {
-        guard let action = quickActions.pending else { return }
-        quickActions.pending = nil
-        guard action == QuickAction.newNote else { return }
+    /// Goes where the quick action, Spotlight or Shortcuts asked.
+    private func handleRequest() {
+        guard let request = requests.pending else { return }
+        requests.pending = nil
         store.saveEditor()
-        let n = store.core.newNote(place: .folder(id: store.core.defaultFolder()))
-        path = [.list(n.place), .note(id: n.id, isNew: true)]
+        switch request {
+        case let .newNote(folder):
+            // As New Note from the Home Screen: open with the keyboard up,
+            // over that folder's list.
+            let n = store.core.newNote(place: .folder(id: folder ?? store.core.defaultFolder()))
+            path = [.list(n.place), .note(id: n.id, isNew: true)]
+        case let .openNote(id, editing):
+            guard let place = store.core.notePlace(id: id) else {
+                store.show("The note can't be found.")
+                return
+            }
+            path = [.list(place), .note(id: id, isNew: editing)]
+        case let .openPlace(place):
+            guard store.core.placeExists(place: place) else {
+                store.show("The folder can't be found.")
+                return
+            }
+            path = [.list(place)]
+        }
     }
 }
 

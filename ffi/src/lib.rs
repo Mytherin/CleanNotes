@@ -291,6 +291,20 @@ pub struct Overview {
     pub smart_folders: Vec<SmartFolderItem>,
 }
 
+/// A note for the system's search (Spotlight). A locked note's text and
+/// tags are empty.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct IndexedNote {
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    pub folder: String,
+    pub tags: Vec<String>,
+    /// Seconds since 1970.
+    pub modified: i64,
+    pub locked: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct NewNote {
     pub id: String,
@@ -735,6 +749,44 @@ impl NotesCore {
     /// A note's Markdown (a locked note's once unlocked).
     pub fn markdown(&self, id: String) -> Option<String> {
         self.lib().plain_body(&id)
+    }
+
+    // ---- From outside the app (Spotlight, Shortcuts, Siri) ----
+
+    /// The notes Spotlight should find (see `Library::indexed_notes`).
+    pub fn indexed_notes(&self) -> Vec<IndexedNote> {
+        self.lib()
+            .indexed_notes()
+            .into_iter()
+            .map(|n| IndexedNote {
+                id: n.id,
+                title: n.title,
+                text: n.text,
+                folder: n.folder,
+                tags: n.tags,
+                modified: n.modified.timestamp(),
+                locked: n.locked,
+            })
+            .collect()
+    }
+
+    /// Where a note is listed (its folder, or Recently Deleted), to open it
+    /// over that list. None if it's gone.
+    pub fn note_place(&self, id: String) -> Option<Place> {
+        self.lib().note_location(&id).map(Place::from)
+    }
+
+    /// A note with `text` (plain text; the first line is its title) in
+    /// `folder`, or where new notes go.
+    pub fn create_note(&self, folder: Option<String>, text: String) -> NewNote {
+        let (id, folder) = self.lib().create_note(folder.as_deref(), &text);
+        NewNote { id, place: Place::Folder { id: folder } }
+    }
+
+    /// Adds plain text to the end of a note. Not to a locked note, nor one in
+    /// Recently Deleted. Save the open editor first.
+    pub fn add_text(&self, id: String, text: String) -> Result<(), CoreError> {
+        self.lib().add_text(&id, &text).map_err(|e| failed(e.to_string()))
     }
 
     // ---- The open note ----
@@ -1538,6 +1590,23 @@ mod tests {
         let lib = Library::open(dir.path(), Secrets::Memory, || {}).unwrap();
         let _ = Quiet.sync_replied();
         (Arc::new(NotesCore { lib: Mutex::new(lib) }), dir)
+    }
+
+    #[test]
+    fn notes_come_and_go_from_outside_the_app() {
+        let (core, _dir) = core();
+        let n = core.create_note(None, "Ideas\nA garden".into());
+        assert_eq!(n.place, Place::Folder { id: core.default_folder() });
+        core.add_text(n.id.clone(), "A pond".into()).unwrap();
+        let found = core.indexed_notes();
+        assert_eq!(found.len(), 1);
+        assert_eq!((found[0].title.as_str(), found[0].text.as_str()), ("Ideas", "A garden\nA pond"));
+        assert!(found[0].modified > 0);
+        assert_eq!(core.note_place(n.id.clone()), Some(n.place.clone()));
+        core.trash_notes(vec![n.id.clone()], n.place);
+        assert!(core.indexed_notes().is_empty());
+        assert!(core.add_text(n.id.clone(), "x".into()).is_err());
+        assert_eq!(core.note_place(n.id), Some(Place::Deleted { account: local_account_id() }));
     }
 
     #[test]
