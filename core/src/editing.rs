@@ -330,11 +330,11 @@ impl Editing {
         }
     }
 
-    /// Typing "- ", "* " or "1. " at the start of body text starts a list,
-    /// as in Apple Notes.
+    /// Typing "- ", "* " or "1. " at the start of body text or a title or
+    /// heading (a new note's first line) starts a list, as in Apple Notes.
     fn auto_list(&mut self, caret: Pos) {
         let b = &self.doc.blocks[caret.block];
-        if b.kind != Kind::Body {
+        if !matches!(b.kind, Kind::Body | Kind::Title | Kind::Heading | Kind::Subheading) {
             return;
         }
         let before: String = b.text.chars().take(caret.offset).collect();
@@ -1136,6 +1136,32 @@ mod tests {
             e.replace_range(p, p, c);
         }
         assert_eq!(e.take_markdown().as_deref(), Some("- a\n"));
+        // Also on a new note's first line, a Title by default; not in code.
+        let mut e = Editing::new("n", "# \n");
+        assert_eq!(e.doc.blocks[0].kind, Kind::Title);
+        e.set_selection(Pos::new(0, 0), Pos::new(0, 0));
+        e.insert_text("*");
+        e.insert_text(" ");
+        assert_eq!((e.doc.blocks[0].kind, e.doc.blocks[0].text.as_str()), (Kind::Bulleted, ""));
+        let mut e = Editing::new("n", "```\n\n```\n");
+        assert_eq!(e.doc.blocks[0].kind, Kind::Monospaced);
+        e.set_selection(Pos::new(0, 0), Pos::new(0, 0));
+        e.insert_text("*");
+        e.insert_text(" ");
+        assert_eq!((e.doc.blocks[0].kind, e.doc.blocks[0].text.as_str()), (Kind::Monospaced, "* "));
+        for start in ["* ", "* a"] {
+            let mut e = Editing::new("n", "");
+            for c in start.chars() {
+                e.insert_text(&c.to_string());
+            }
+            assert_eq!(e.doc.blocks[0].kind, Kind::Bulleted, "typing {start:?}");
+            let mut e = Editing::new("n", "");
+            for c in start.chars() {
+                let p = e.sel.caret;
+                e.replace_range(p, p, &c.to_string());
+            }
+            assert_eq!(e.doc.blocks[0].kind, Kind::Bulleted, "replace_range {start:?}");
+        }
         let mut e = Editing::new("n", "hello world\n");
         e.replace_range(Pos::new(0, 6), Pos::new(0, 11), "there");
         assert_eq!(e.doc.plain_text(), "hello there");
