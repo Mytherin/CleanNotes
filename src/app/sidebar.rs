@@ -394,3 +394,58 @@ pub fn menu_look(ui: &mut Ui, p: &Palette) {
     ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
     ui.style_mut().text_styles.insert(egui::TextStyle::Button, theme::font(14.0));
 }
+
+/// A popover menu item with a ">" at its end that opens `add_contents` to
+/// its right when hovered, as Apple's submenus do. (egui's own submenus
+/// only work inside its menus; in a popover `menu_button` drops down.)
+/// Clicking in the submenu closes the popover, being a click outside it.
+pub fn submenu(ui: &mut Ui, p: &Palette, label: &str, add_contents: impl FnOnce(&mut Ui)) {
+    let id = ui.id().with(("submenu", label));
+    // Which of this menu's submenus is open, and the last frame it was
+    // shown (so it isn't open again when the popover next opens).
+    let open_key = ui.id().with("open-submenu");
+    let frame = ui.ctx().cumulative_pass_nr();
+    let open_now = ui.data(|d| d.get_temp::<(egui::Id, u64)>(open_key)).is_some_and(|(o, f)| o == id && f + 1 >= frame);
+
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let btn = egui::Button::new(label).min_size(Vec2::new(ui.available_width(), 0.0));
+    let resp = ui.add(btn);
+    let r = resp.rect;
+    icons::paint(ui.painter(), Icon::ChevronRight, Rect::from_center_size(Pos2::new(r.right() - 14.0, r.center().y), Vec2::splat(13.0)), p.secondary);
+
+    // Open while hovered or while the pointer is in it; another item of
+    // the menu hovered closes it.
+    let sub_rect_key = id.with("rect");
+    let sub_rect = ui.data(|d| d.get_temp::<Rect>(sub_rect_key));
+    let pointer = ui.ctx().pointer_hover_pos();
+    let in_sub = open_now && pointer.zip(sub_rect).is_some_and(|(pos, s)| s.contains(pos));
+    let on_menu = pointer.is_some_and(|pos| ui.ctx().layer_id_at(pos) == Some(ui.layer_id()));
+    let open = resp.hovered() || resp.clicked() || in_sub || (open_now && !on_menu);
+    if !open {
+        if open_now {
+            ui.data_mut(|d| d.remove::<(egui::Id, u64)>(open_key));
+        }
+        return;
+    }
+    ui.data_mut(|d| d.insert_temp(open_key, (id, frame)));
+    if !resp.hovered() {
+        ui.painter().set(bg, egui::Shape::rect_filled(r, 7.0, p.hover));
+    }
+
+    // To its right, its first item level with this one; to its left if
+    // there's no room.
+    let screen = ui.ctx().screen_rect();
+    let width = sub_rect.map_or(180.0, |s| s.width());
+    let margin = 7.0; // the popover frame's margin and stroke
+    let x = if r.right() + margin + width <= screen.right() { r.right() + margin } else { r.left() - margin - width };
+    let top = (r.top() - margin).min(screen.bottom() - sub_rect.map_or(0.0, |s| s.height())).max(screen.top());
+    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(Pos2::new(x, top)).show(ui.ctx(), |ui| {
+        popover_frame(ui, p).show(ui, |ui| {
+            menu_look(ui, p);
+            ui.set_min_width(160.0);
+            egui::ScrollArea::vertical().max_height(screen.bottom() - top - 20.0).show(ui, add_contents);
+        });
+    });
+    ui.ctx().move_to_top(area.response.layer_id);
+    ui.data_mut(|d| d.insert_temp(sub_rect_key, area.response.rect));
+}

@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Align2, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{glass_button, menu_look, popover_frame, tool_button, truncate, NoteDrag};
+use super::sidebar::{glass_button, menu_look, popover_frame, submenu, tool_button, truncate, NoteDrag};
 use super::{list_time, App, Confirm, Location, Pane, TOOLBAR_H};
 use crate::icons::Icon;
 use crate::markdown;
@@ -62,19 +62,17 @@ impl App {
                     close = true;
                 }
                 ui.separator();
-                ui.menu_button("Sort By", |ui| {
+                submenu(ui, p, "Sort By", |ui| {
                     for o in crate::settings::SortBy::ALL {
                         if ui.radio(self.lib.settings.sort_by == o, o.label()).clicked() {
                             self.lib.settings.sort_by = o;
-                            ui.close_menu();
                         }
                     }
                 });
-                ui.menu_button("Group By Date", |ui| {
+                submenu(ui, p, "Group By Date", |ui| {
                     for (on, l) in [(true, "On"), (false, "Off")] {
                         if ui.radio(self.lib.settings.group_by_date == on, l).clicked() {
                             self.lib.settings.group_by_date = on;
-                            ui.close_menu();
                         }
                     }
                 });
