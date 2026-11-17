@@ -163,7 +163,7 @@ fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime
 
     // Notes emptied from Recently Deleted go first, so a pull doesn't bring
     // them back.
-    for t in snap.tombstones.iter().filter(|t| t.note) {
+    for t in snap.tombstones.iter().filter(|t| t.note && t.note_id.is_none()) {
         match backend.delete_note(&t.remote_id, t.revision.as_deref()) {
             Ok(()) => {}
             // Edited on another device since: it stays, and the pull below
@@ -182,9 +182,10 @@ fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime
     let mut finished = false;
     for round in 0..MAX_ROUNDS {
         let cursor_before = backend.cursor()?;
-        let remote = backend.pull()?;
+        let mut remote = backend.pull()?;
+        let deleted = round == 0 && delete_forgotten(backend, snap, &w, &mut remote, &mut out)?;
         reconcile(&mut w, account, remote, &deleting, now, &mut out.notices);
-        match push_notes(backend, &mut w, snap.attachments.as_deref()) {
+        match push_notes(backend, &mut w, snap.attachments.as_deref()).map(|(c, wrote)| (c, wrote || deleted)) {
             Ok((false, false)) => {
                 // Only the cursor from before the pull is known to be
                 // covered: one read now could include another device's
@@ -240,6 +241,43 @@ fn sync_changes(backend: &mut dyn Backend, snap: &AccountSnapshot, now: DateTime
     out.folders = w.folders;
     out.notes = w.notes;
     Ok(out)
+}
+
+/// Notes that went from this account before this device heard back about
+/// their upload (see [`Tombstone::note_id`]): deleted on the backend if it
+/// has them, and left out of `remote` so they aren't taken as new. Returns
+/// whether any were deleted.
+fn delete_forgotten(
+    backend: &mut dyn Backend,
+    snap: &AccountSnapshot,
+    w: &Store,
+    remote: &mut Snapshot,
+    out: &mut Outcome,
+) -> Result<bool> {
+    let forgotten: Vec<&Tombstone> = snap.tombstones.iter().filter(|t| t.note && t.note_id.is_some()).collect();
+    if forgotten.is_empty() {
+        return Ok(false);
+    }
+    let ids: HashSet<&str> = forgotten.iter().filter_map(|t| t.note_id.as_deref()).collect();
+    let mut deleted = false;
+    let mut kept = Vec::with_capacity(remote.notes.len());
+    for r in std::mem::take(&mut remote.notes) {
+        // (Still here under that id, e.g. moved away and back: it stays.)
+        let ours = w.notes.iter().any(|n| n.id == r.data.id || n.sync.remote_id.as_deref() == Some(&r.remote_id));
+        if !ids.contains(r.data.id.as_str()) || ours {
+            kept.push(r);
+            continue;
+        }
+        match backend.delete_note(&r.remote_id, Some(&r.revision)) {
+            Ok(()) => deleted = true,
+            // Changed since the pull: it stays, as a note new here.
+            Err(e) if e.is::<Conflict>() => kept.push(r),
+            Err(e) => return Err(e),
+        }
+    }
+    remote.notes = kept;
+    out.tombstones_done.extend(forgotten.into_iter().cloned());
+    Ok(deleted)
 }
 
 /// Uploads folder renames and new folders, parents first.
@@ -665,6 +703,7 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
                             remote_id: rid.clone(),
                             path: vec![],
                             revision: o.sync.revision.clone(),
+                            note_id: None,
                         });
                     }
                 }
@@ -684,6 +723,7 @@ pub fn apply(store: &mut Store, snap: &AccountSnapshot, out: Outcome) -> Vec<Str
                         remote_id: o.sync.remote_id.clone().unwrap(),
                         path: vec![],
                         revision: o.sync.revision.clone(),
+                        note_id: None,
                     });
                 }
             }

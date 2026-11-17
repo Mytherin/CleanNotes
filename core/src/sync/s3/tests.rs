@@ -350,6 +350,52 @@ fn two_devices_sync_through_s3() {
     assert!(log.iter().all(|l| l.starts_with("HEAD ")), "{log:?}");
 }
 
+fn s3_bodies(dev: &Device) -> Vec<String> {
+    let mut v: Vec<String> = dev.store.notes.iter().filter(|n| n.account == "s3").map(|n| n.body.clone()).collect();
+    v.sort();
+    v
+}
+
+/// The app quits after a sync wrote everything but before its outcome was
+/// recorded, and starts again: nothing is uploaded twice, nothing deleted
+/// meanwhile comes back.
+#[test]
+fn quitting_before_a_finished_sync_is_recorded_duplicates_nothing_on_s3() {
+    let server = FakeS3::start();
+    let mut laptop = Device::new(&server);
+    let mut phone = Device::new(&server);
+    let folder = laptop.store.ensure_folder_at("s3", &["Notes".into()]);
+    let edited = Note::new("s3", &folder, "# Edited\nbefore\n");
+    let edited_id = edited.id.clone();
+    laptop.store.notes.push(edited);
+    laptop.sync();
+    phone.sync();
+
+    laptop.store.notes.push(Note::new("s3", &folder, "# New\n"));
+    let purged = Note::new("s3", &folder, "# Deleted for good\n");
+    let purged_id = purged.id.clone();
+    laptop.store.notes.push(purged);
+    let n = laptop.store.note_mut(&edited_id).unwrap();
+    n.body = "# Edited\nafter\n".into();
+    n.touch();
+    let snap = AccountSnapshot::of(&laptop.store, "s3");
+    let out = sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    assert_eq!(out.error, None);
+    // Deleted for good while that sync uploaded it; then the app quits.
+    laptop.store.purge_note(&purged_id);
+    drop(out);
+    laptop.backend = backend(&server);
+
+    let notices = laptop.sync();
+    assert!(notices.is_empty(), "{notices:?}");
+    let expected = vec!["# Edited\nafter\n", "# New\n"];
+    assert_eq!(s3_bodies(&laptop), expected);
+    assert_eq!(backend(&server).pull().unwrap().notes.len(), 2, "nothing twice, nothing back on S3");
+    assert!(laptop.store.tombstones.is_empty());
+    assert!(phone.sync().is_empty());
+    assert_eq!(s3_bodies(&phone), expected);
+}
+
 fn note_gets(server: &FakeS3) -> usize {
     server.state().log.iter().filter(|l| l.starts_with("GET ") && l.contains("/notes/")).count()
 }
