@@ -747,6 +747,26 @@ impl Editing {
         Some(text)
     }
 
+    /// The pictures selected (their references, in order), when the
+    /// selection is pictures and nothing else (blank lines aside): copied,
+    /// they go on the system clipboard as pictures and files, not as text.
+    pub fn selected_images(&self) -> Vec<String> {
+        if self.sel.is_empty() {
+            return vec![];
+        }
+        let mut out = vec![];
+        for b in self.selected_blocks() {
+            for (c, s) in b.text.chars().zip(&b.styles) {
+                match &s.image {
+                    Some(name) => out.push(name.to_string()),
+                    None if c.is_whitespace() => {}
+                    None => return vec![],
+                }
+            }
+        }
+        out
+    }
+
     /// Cut: [`Editing::copy`], then delete the selection.
     pub fn cut(&mut self) -> Option<String> {
         let text = self.copy()?;
@@ -1064,8 +1084,15 @@ mod tests {
         // Typing goes on as text.
         e.insert_text("x");
         assert_eq!(e.doc.blocks[3].styles[0].image, None);
+        // Selected alone (its line with it, or not), it's a picture to copy;
+        // with text, it isn't.
+        e.set_selection(Pos::new(2, 0), Pos::new(3, 0));
+        assert_eq!(e.selected_images(), vec![name.clone()]);
+        e.set_selection(Pos::new(1, 0), Pos::new(2, 1));
+        assert!(e.selected_images().is_empty());
         // Copied and pasted inside the app, the image comes along.
         e.set_selection(Pos::new(2, 0), Pos::new(2, 1));
+        assert_eq!(e.selected_images(), vec![name.clone()]);
         let plain = e.copy().unwrap();
         e.set_caret(e.doc.end(), false);
         e.paste(&plain);

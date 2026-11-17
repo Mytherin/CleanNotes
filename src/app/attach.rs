@@ -140,6 +140,45 @@ impl App {
         }
     }
 
+    /// Copied pictures (their references) go on the system clipboard as
+    /// files, to paste into File Explorer (or back into a note, as they
+    /// are), and, one picture alone, as its pixels too, for apps that paste
+    /// pictures. The files are copies, as for opening one (a locked note's
+    /// decrypted, until notes are locked again).
+    pub fn copy_images(&mut self, refs: &[String]) {
+        let mut paths = Vec::new();
+        for (i, r) in refs.iter().enumerate() {
+            let label = if refs.len() == 1 { "Picture".to_owned() } else { format!("Picture {}", i + 1) };
+            match self.lib.open_attachment(r, &label) {
+                Ok(path) => paths.push(path),
+                Err(e) => self.push_notice(format!("The picture can't be copied: {e:#}.")),
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let Ok(mut cb) = arboard::Clipboard::new() else {
+            self.push_notice("The clipboard can't be used now.".into());
+            return;
+        };
+        let pixels = match &paths[..] {
+            [one] => std::fs::read(one).ok().and_then(|d| images::rgba_of(&d)),
+            _ => None,
+        };
+        // Setting the picture empties the clipboard; adding files doesn't
+        // (on Windows), so without a picture it's emptied first: what was
+        // copied before mustn't stay with them.
+        let pictured = pixels.is_some_and(|(width, height, rgba)| {
+            cb.set_image(arboard::ImageData { width, height, bytes: rgba.into() }).is_ok()
+        });
+        if !pictured {
+            let _ = cb.clear();
+        }
+        if cb.set().file_list(&paths).is_err() && !pictured {
+            self.push_notice("The picture can't be copied.".into());
+        }
+    }
+
     /// Paste with a picture (or files) on the clipboard and no text (text
     /// is pasted by the editor itself).
     pub fn paste_image(&mut self) {
@@ -180,6 +219,32 @@ mod tests {
         let id = app.selected.clone().unwrap();
         assert_eq!(app.lib.store.note(&id).unwrap().body, format!("![](attachments/{name})\n"));
         assert!(app.lib.attachment_path(&name).is_some());
+    }
+
+    /// Uses the real system clipboard (replacing what's on it), so it's run
+    /// by hand: `cargo test copied_pictures -- --ignored`.
+    #[test]
+    #[ignore]
+    fn copied_pictures_go_on_the_clipboard_as_files_and_pixels() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::for_test(&dir.path().join("data"));
+        app.new_note();
+        let png = images::png_from_rgba(2, 1, &[255, 0, 0, 255, 0, 0, 255, 255]).unwrap();
+        let name = app.lib.add_image(&png).unwrap();
+        app.copy_images(&[name]);
+        let mut cb = arboard::Clipboard::new().unwrap();
+        let files = cb.get().file_list().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name().unwrap(), "Picture.png");
+        assert_eq!(std::fs::read(&files[0]).unwrap(), png);
+        let img = cb.get_image().unwrap();
+        assert_eq!((img.width, img.height), (2, 1));
+        // Pasted back into a note, it's the same picture (no text in the way).
+        assert!(cb.get_text().map_or(true, |t| t.is_empty()));
+        app.paste_image();
+        app.flush_editor();
+        let id = app.selected.clone().unwrap();
+        assert_eq!(app.lib.store.note(&id).unwrap().body, format!("![](attachments/{})\n", cleannotes_core::attachments::name_for(&png, "png")));
     }
 
     #[test]

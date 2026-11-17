@@ -141,6 +141,18 @@ pub fn display_size(shown: Shown, width: f32, pixels_per_point: f32) -> Vec2 {
     }
 }
 
+/// A picture file's pixels (upright, full size) as RGBA, with its width
+/// and height: for copying it to the system clipboard.
+pub fn rgba_of(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    use image::ImageDecoder;
+    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?.into_decoder().ok()?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut img = image::DynamicImage::from_decoder(decoder).ok()?;
+    img.apply_orientation(orientation);
+    let rgba = img.to_rgba8();
+    Some((rgba.width() as usize, rgba.height() as usize, rgba.into_raw()))
+}
+
 /// An image file's bytes encoded as PNG (for a pasted picture).
 pub fn png_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
     let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba.to_vec())?;
