@@ -16,6 +16,27 @@ pub struct NoteDrag(pub Vec<String>);
 #[derive(Clone, Debug)]
 pub struct FolderDrag(pub String);
 
+/// The folders around a folder row in the sidebar, for dropping a folder
+/// in the gaps above and below it.
+#[derive(Clone, Copy)]
+struct Neighbours<'a> {
+    /// The next folder at the same level (`None`: it's the last).
+    next: Option<&'a str>,
+    /// The first folder inside it, if it shows any.
+    first_kid: Option<&'a str>,
+}
+
+/// The line showing where a dragged folder will go: across the sidebar at
+/// `y`, indented to `depth`, with a small ring at its start (as in Finder).
+fn insertion_line(ui: &Ui, p: &Palette, row: Rect, depth: usize, y: f32) {
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, ui.id().with("folder drop line")));
+    let painter = painter.with_clip_rect(ui.clip_rect());
+    let x0 = row.left() + 6.0 + depth as f32 * 16.0 + 16.0;
+    let stroke = egui::Stroke::new(2.0_f32, p.folder_selection);
+    painter.circle_stroke(Pos2::new(x0, y), 3.5, stroke);
+    painter.line_segment([Pos2::new(x0 + 3.5, y), Pos2::new(row.right() - 8.0, y)], stroke);
+}
+
 const ROW_H: f32 = 32.0;
 /// The gap around the floating sidebar panel.
 const INSET: f32 = 8.0;
@@ -192,9 +213,19 @@ impl App {
             }
             tree.iter().map(|(id, ..)| m.get(id.as_str()).copied().unwrap_or(0)).collect()
         };
+        // Where a folder dragged above or below each row would go: the next
+        // folder at its level, and the first folder inside it.
+        let neighbours: Vec<(Option<String>, Option<String>)> = (0..tree.len())
+            .map(|i| {
+                let depth = tree[i].1;
+                let next = tree[i + 1..].iter().find(|t| t.1 <= depth).filter(|t| t.1 == depth).map(|t| t.0.clone());
+                let first_kid = tree.get(i + 1).filter(|t| t.1 == depth + 1).map(|t| t.0.clone());
+                (next, first_kid)
+            })
+            .collect();
         // Hide folders inside collapsed ones.
         let mut hidden_below: Option<usize> = None;
-        for ((id, depth, name, default, has_kids), count) in tree.into_iter().zip(counts) {
+        for (((id, depth, name, default, has_kids), count), (next, first_kid)) in tree.into_iter().zip(counts).zip(neighbours) {
             if let Some(d) = hidden_below {
                 if depth > d {
                     continue;
@@ -205,7 +236,8 @@ impl App {
             if folded && has_kids {
                 hidden_below = Some(depth);
             }
-            self.folder_row(ui, p, &id, depth, &name, default, has_kids.then_some(folded), count);
+            let slots = Neighbours { next: next.as_deref(), first_kid: first_kid.as_deref() };
+            self.folder_row(ui, p, &id, depth, &name, default, has_kids.then_some(folded), count, slots);
         }
         let deleted = self.lib.store.notes.iter().filter(|n| n.account == account && n.deleted.is_some()).count();
         if deleted > 0 {
@@ -226,7 +258,18 @@ impl App {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn folder_row(&mut self, ui: &mut Ui, p: &Palette, id: &str, depth: usize, name: &str, default: bool, folded: Option<bool>, count: usize) {
+    fn folder_row(
+        &mut self,
+        ui: &mut Ui,
+        p: &Palette,
+        id: &str,
+        depth: usize,
+        name: &str,
+        default: bool,
+        folded: Option<bool>,
+        count: usize,
+        slots: Neighbours,
+    ) {
         let loc = Location::Folder(id.to_owned());
         let selected = self.location == loc && self.search.is_empty();
         let renaming = self.rename.as_ref().is_some_and(|r| r.folder == id);
@@ -275,22 +318,55 @@ impl App {
         if resp.double_clicked() && !default {
             self.rename = Some(Rename { folder: id.to_owned(), text: name.to_owned(), focus: true });
         }
-        // Notes dropped here move here.
-        if let Some(drag) = resp.dnd_release_payload::<NoteDrag>() {
-            self.move_notes(&drag.0, id);
+        // Notes dropped here move here. (Only take a payload of notes: egui
+        // drops whatever payload is taken, so this mustn't eat a folder.)
+        if resp.dnd_hover_payload::<NoteDrag>().is_some() {
+            if let Some(drag) = resp.dnd_release_payload::<NoteDrag>() {
+                self.move_notes(&drag.0, id);
+            }
         }
-        let account = self.lib.store.folder(id).map(|f| f.account.clone());
-        // Folders can be dragged into other folders (not the default one,
-        // which stays where it is).
+        let (account, parent) = match self.lib.store.folder(id) {
+            Some(f) => (Some(f.account.clone()), f.parent.clone()),
+            None => (None, None),
+        };
+        // Folders can be dragged into other folders, or between them to put
+        // them in order (not the default one, which stays where it is).
         if !default {
             resp.dnd_set_drag_payload(FolderDrag(id.to_owned()));
         }
-        if let Some(acc) = &account {
-            if resp.dnd_hover_payload::<FolderDrag>().is_some_and(|d| self.lib.can_move_folder(&d.0, acc, Some(id))) {
-                ui.painter().rect_stroke(resp.rect.shrink2(Vec2::new(6.0, 1.0)), 10.0, egui::Stroke::new(2.0_f32, p.folder_selection));
-            }
-            if let Some(d) = resp.dnd_release_payload::<FolderDrag>() {
-                self.move_folder(&d.0, acc, Some(id));
+        if let (Some(acc), Some(drag)) = (&account, resp.dnd_hover_payload::<FolderDrag>()) {
+            let pointer = ui.ctx().pointer_latest_pos().unwrap_or(resp.rect.center());
+            let t = (pointer.y - resp.rect.top()) / resp.rect.height();
+            // The top and bottom of the row are the gaps above and below it
+            // (below an open folder is above its first folder); the middle
+            // is the folder itself.
+            let gap = if t < 0.25 {
+                Some((parent.as_deref(), Some(id), depth, resp.rect.top()))
+            } else if t > 0.75 {
+                match (folded, slots.first_kid) {
+                    (Some(false), Some(kid)) => Some((Some(id), Some(kid), depth + 1, resp.rect.bottom())),
+                    _ => Some((parent.as_deref(), slots.next, depth, resp.rect.bottom())),
+                }
+            } else {
+                None
+            };
+            match gap {
+                Some((into, before, line_depth, y)) => {
+                    if self.lib.can_place_folder(&drag.0, acc, into, before) {
+                        insertion_line(ui, p, resp.rect, line_depth, y);
+                        if resp.dnd_release_payload::<FolderDrag>().is_some() {
+                            self.place_folder(&drag.0, acc, into, before);
+                        }
+                    }
+                }
+                None => {
+                    if self.lib.can_move_folder(&drag.0, acc, Some(id)) {
+                        ui.painter().rect_stroke(resp.rect.shrink2(Vec2::new(6.0, 1.0)), 10.0, egui::Stroke::new(2.0_f32, p.folder_selection));
+                        if resp.dnd_release_payload::<FolderDrag>().is_some() {
+                            self.move_folder(&drag.0, acc, Some(id));
+                        }
+                    }
+                }
             }
         }
         resp.context_menu(|ui| {

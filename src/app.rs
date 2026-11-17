@@ -518,6 +518,13 @@ impl App {
         self.lib.move_folder(id, account, parent);
     }
 
+    /// Moves a folder to just before `before` among `parent`'s folders (or
+    /// after the last), dragged there in the sidebar.
+    pub fn place_folder(&mut self, id: &str, account: &str, parent: Option<&str>, before: Option<&str>) {
+        self.flush_editor();
+        self.lib.place_folder(id, account, parent, before);
+    }
+
     /// Finishes naming a folder (a name that's taken says so instead).
     pub fn finish_rename(&mut self) {
         let Some(r) = self.rename.take() else { return };

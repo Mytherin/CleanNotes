@@ -92,6 +92,11 @@ pub struct Folder {
     /// nothing is in it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+    /// Where the user dragged the folder among its siblings (see
+    /// [`Store::child_folders`]). Kept on this device only: backends store
+    /// folders by path, so this isn't synced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
     #[serde(default)]
     pub sync: FolderSync,
 }
@@ -105,6 +110,7 @@ impl Folder {
             name: name.to_owned(),
             default: false,
             hidden: false,
+            position: None,
             sync: FolderSync::default(),
         }
     }
@@ -409,8 +415,9 @@ impl Store {
         out
     }
 
-    /// Folders of an account in sidebar order: depth first, by name, the
-    /// default folder first (left out if it was deleted and is empty).
+    /// Folders of an account in sidebar order: depth first, siblings as
+    /// [`Self::child_folders`] orders them (the default folder is left out if
+    /// it was deleted and is empty).
     /// Returns (folder, depth).
     pub fn folder_tree(&self, account: &str) -> Vec<(&Folder, usize)> {
         let mut out = Vec::new();
@@ -439,15 +446,27 @@ impl Store {
     }
 
     fn walk<'a>(&'a self, account: &str, parent: Option<&str>, depth: usize, out: &mut Vec<(&'a Folder, usize)>) {
-        let mut kids: Vec<&Folder> =
-            self.folders.iter().filter(|f| f.account == account && f.parent.as_deref() == parent).collect();
-        kids.sort_by(|a, b| b.default.cmp(&a.default).then_with(|| natural_cmp(&a.name, &b.name)));
-        for f in kids {
+        for f in self.child_folders(account, parent) {
             out.push((f, depth));
             if depth < 32 {
                 self.walk(account, Some(&f.id), depth + 1, out);
             }
         }
+    }
+
+    /// The folders right inside `parent` (or at the top of `account`), in
+    /// sidebar order: those the user dragged into place first, then the
+    /// default folder, then by name.
+    pub fn child_folders(&self, account: &str, parent: Option<&str>) -> Vec<&Folder> {
+        let mut kids: Vec<&Folder> =
+            self.folders.iter().filter(|f| f.account == account && f.parent.as_deref() == parent).collect();
+        kids.sort_by(|a, b| {
+            (a.position.is_none(), a.position)
+                .cmp(&(b.position.is_none(), b.position))
+                .then_with(|| b.default.cmp(&a.default))
+                .then_with(|| natural_cmp(&a.name, &b.name))
+        });
+        kids
     }
 
     /// A folder name not yet used among `parent`'s children: "New Folder",
