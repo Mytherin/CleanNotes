@@ -1012,6 +1012,11 @@ impl App {
     }
 }
 
+/// The search field's id, so others can tell when it has the keyboard.
+pub fn search_field_id() -> egui::Id {
+    egui::Id::new("search-field")
+}
+
 /// Consumes a press of `key` with exactly these modifiers (⌘ meaning Ctrl
 /// off macOS). Unlike egui's `consume_shortcut`, extra Shift/Alt don't match.
 pub fn consume_exact(i: &mut egui::InputState, modifiers: Modifiers, key: Key) -> bool {
