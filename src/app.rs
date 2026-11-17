@@ -211,6 +211,13 @@ impl App {
         format!("{:?}", self.location).hash(&mut h);
         format!("{:?}", self.lib.settings.sort_by).hash(&mut h);
         self.lib.settings.group_by_date.hash(&mut h);
+        // A Smart Folder shows what its filter (which can be edited) lets
+        // through; "edited in the last N days" changes with the time, as
+        // do the date sections.
+        if let Location::Smart(s) = &self.location {
+            format!("{:?}", self.lib.smart_folder(s)).hash(&mut h);
+            (chrono::Utc::now().timestamp() / 60).hash(&mut h);
+        }
         Local::now().date_naive().hash(&mut h);
         let key = h.finish();
         if let Some((k, sections)) = &self.sections_cache {
@@ -1157,6 +1164,16 @@ mod tests {
         let other = app.lib.store.ensure_folder_at(crate::model::LOCAL, &["Other".into()]);
         app.lib.store.notes.iter_mut().find(|n| n.id == ib).unwrap().folder = other;
         check(&mut app);
+
+        // A Smart Folder's list follows its filter when it's edited.
+        let filter = |t: &str| crate::settings::NoteFilter { tags: vec![t.into()], ..Default::default() };
+        let smart = app.lib.add_smart_folder("Tagged", filter("two"));
+        app.location = Location::Smart(smart.clone());
+        check(&mut app);
+        assert_eq!(app.cached_sections().into_iter().flat_map(|(_, ids)| ids).collect::<Vec<_>>(), vec![ib.clone()]);
+        app.lib.update_smart_folder(&smart, "Tagged", filter("nothing"));
+        check(&mut app);
+        assert!(app.cached_sections().into_iter().flat_map(|(_, ids)| ids).collect::<Vec<_>>().is_empty());
     }
 
     use crate::model::Note;
