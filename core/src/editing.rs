@@ -180,6 +180,23 @@ impl Editing {
         true
     }
 
+    /// The note's Markdown was edited by hand ("Edit as Markdown"): the
+    /// document becomes what it says. Unlike [`Editing::reload`] this is an
+    /// edit, undoable (typing in a row is one step), but the host stores
+    /// `md` itself, as written, rather than the app's own rendering of it,
+    /// so this doesn't mark the note changed.
+    pub fn set_markdown(&mut self, md: &str) {
+        if md == self.markdown_seen {
+            return;
+        }
+        self.checkpoint(Some(Group::Typing));
+        self.changed = false;
+        self.typing_style = None;
+        self.doc = markdown::from_markdown(md);
+        self.markdown_seen = md.to_owned();
+        self.sel = Selection { anchor: self.doc.clamp(self.sel.anchor), caret: self.doc.clamp(self.sel.caret) };
+    }
+
     /// The paragraph style at the caret (for the Format menu's checkmark).
     pub fn current_kind(&self) -> Kind {
         self.doc.blocks[self.sel.caret.block.min(self.doc.blocks.len() - 1)].kind
@@ -826,6 +843,20 @@ pub fn normalize_url(u: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_edited_by_hand_is_kept_as_written_and_can_be_undone() {
+        let mut e = Editing::new("n", "# Title\nbody\n");
+        e.set_markdown("# Title\n_body_\n");
+        // Stored as typed: nothing for the app to write back.
+        assert_eq!(e.take_markdown(), None);
+        assert_eq!(e.markdown_seen, "# Title\n_body_\n");
+        assert!(e.doc.blocks[1].runs().iter().all(|(_, s)| s.italic));
+        // The same text again is no edit.
+        e.set_markdown("# Title\n_body_\n");
+        e.command(Command::Undo);
+        assert_eq!(e.take_markdown().as_deref(), Some("# Title\nbody\n"));
+    }
 
     #[test]
     fn checklist_commands_act_on_the_checklist_at_the_caret() {

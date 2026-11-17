@@ -51,7 +51,8 @@ impl App {
         self.lock_button(ui, p, Pos2::new(search_left - 72.0, y));
 
         // The formatting buttons, in a glass capsule in the middle.
-        let editable = has_note && !read_only;
+        // (Edited as Markdown, a note is formatted by typing the markup.)
+        let editable = has_note && !read_only && !self.markdown_mode;
         let item = 40.0;
         let cap_w = item * 4.0 + 8.0;
         let room = (compose_right + 12.0, search_left - 100.0 - 12.0);
@@ -96,6 +97,10 @@ impl App {
         if read_only {
             self.deleted_banner(&mut child, p, &id);
         }
+        if self.markdown_mode {
+            self.markdown_pane(&mut child, p, &id, read_only);
+            return;
+        }
         self.find_bar(&mut child, p);
 
         let header = note_header_time(note.modified);
@@ -139,6 +144,61 @@ impl App {
             }
         }
         self.link_sheet(ui.ctx(), p);
+    }
+
+    /// "Edit as Markdown": the note's Markdown, as stored, in a plain text
+    /// field. What's typed there is the note.
+    fn markdown_pane(&mut self, ui: &mut Ui, p: &Palette, id: &str, read_only: bool) {
+        if self.markdown_source.as_ref().is_none_or(|(n, _)| n != id) {
+            // Start from the note as it's stored now.
+            self.flush_editor();
+            let Some(e) = &self.editor else { return };
+            self.markdown_source = Some((id.to_owned(), e.markdown_seen.clone()));
+        }
+        let Some(e) = &mut self.editor else { return };
+        let Some((_, text)) = &mut self.markdown_source else { return };
+        let font = egui::FontId::monospace((self.lib.settings.text_size * 0.92).round());
+        let before = text.clone();
+        let mut focused = false;
+        egui::ScrollArea::vertical()
+            .id_salt(("markdown", id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Frame::none().inner_margin(egui::Margin::symmetric(28.0, 16.0)).show(ui, |ui| {
+                    let size = Vec2::new(ui.available_width(), (ui.available_height() - 32.0).max(0.0));
+                    fn field<'t>(t: &'t mut dyn egui::TextBuffer, id: &str, font: &egui::FontId, p: &Palette, size: Vec2) -> egui::TextEdit<'t> {
+                        egui::TextEdit::multiline(t)
+                            .id(egui::Id::new(("markdown-source", id)))
+                            .font(font.clone())
+                            .text_color(p.text)
+                            .frame(false)
+                            .margin(Vec2::ZERO)
+                            .desired_width(f32::INFINITY)
+                            .min_size(size)
+                    }
+                    // Recently Deleted notes: shown, selectable, not editable.
+                    let resp = if read_only {
+                        ui.add(field(&mut text.as_str(), id, &font, p, size))
+                    } else {
+                        ui.add(field(text, id, &font, p, size))
+                    };
+                    if e.focus_requested {
+                        resp.request_focus();
+                        e.focus_requested = false;
+                    }
+                    focused = resp.has_focus();
+                });
+            });
+        if focused {
+            self.focus = Pane::Note;
+        }
+        if *text != before {
+            let md = text.clone();
+            if let Some(e) = &mut self.editor {
+                e.clock = ui.input(|i| i.time);
+            }
+            self.set_markdown(&md);
+        }
     }
 
     /// With several notes selected: a little stack of them and a count.
@@ -302,6 +362,12 @@ impl App {
                         self.delete_notes(ids.clone());
                         close = true;
                     }
+                }
+                ui.separator();
+                let label = if self.markdown_mode { "✓  Edit as Markdown" } else { "Edit as Markdown" };
+                if ui.add(egui::Button::new(label).shortcut_text(cmd_key!("Shift+E"))).clicked() {
+                    self.toggle_markdown_mode();
+                    close = true;
                 }
                 if close {
                     ui.memory_mut(|m| m.close_popup());

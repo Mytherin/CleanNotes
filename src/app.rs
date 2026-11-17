@@ -86,6 +86,10 @@ pub struct App {
     pub format_open: bool,
     /// The gallery shows the selected note full size.
     pub gallery_open: bool,
+    /// "Edit as Markdown": notes show (and are edited as) their Markdown.
+    pub markdown_mode: bool,
+    /// The open note's Markdown as being edited there: its id and text.
+    pub markdown_source: Option<(String, String)>,
     /// The lock screen and password sheets.
     pub lock: locked::LockUi,
     /// The tags in the notes, and the notes' fingerprint they were found
@@ -151,6 +155,8 @@ impl App {
             scroll_list: true,
             format_open: false,
             gallery_open: false,
+            markdown_mode: false,
+            markdown_source: None,
             lock: Default::default(),
             tag_cache: None,
             sections_cache: None,
@@ -552,6 +558,33 @@ impl App {
         }
     }
 
+    /// Turns "Edit as Markdown" on or off (for every note, until turned
+    /// off again).
+    pub fn toggle_markdown_mode(&mut self) {
+        self.flush_editor();
+        self.markdown_mode = !self.markdown_mode;
+        self.markdown_source = None;
+        self.format_open = false;
+        if let Some(e) = &mut self.editor {
+            e.find.open = false;
+            e.focus_requested = true;
+            self.focus = Pane::Note;
+        }
+    }
+
+    /// The open note's Markdown, edited by hand: stored as written.
+    pub fn set_markdown(&mut self, md: &str) {
+        let Some(e) = &mut self.editor else { return };
+        if self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_some()) {
+            return;
+        }
+        e.set_markdown(md);
+        let id = e.note_id.clone();
+        if self.lib.set_body(&id, md) == BodySet::Closed {
+            self.editor = None;
+        }
+    }
+
     pub fn push_notice(&mut self, s: String) {
         self.notices.push((s, Instant::now()));
     }
@@ -578,7 +611,10 @@ impl App {
                 // A locked note's text, if it still opens.
                 match self.lib.plain_body_now(&id) {
                     Some(text) => {
-                        self.editor.as_mut().unwrap().reload(&text);
+                        if self.editor.as_mut().unwrap().reload(&text) {
+                            // "Edit as Markdown" shows the new text.
+                            self.markdown_source = None;
+                        }
                     }
                     None => self.editor = None,
                 }
@@ -667,20 +703,26 @@ impl App {
         if pressed(alt_cmd, Key::F) {
             self.search_focus = true;
         }
+        if pressed(shift_cmd, Key::E) && self.selected.is_some() && self.multi.len() < 2 {
+            self.toggle_markdown_mode();
+        }
+        // Find in Note finds in the formatted note, not its Markdown.
+        let find_in_note = !self.markdown_mode;
         if pressed(cmd, Key::F) {
-            if let Some(e) = &mut self.editor {
-                e.find.open = true;
-                e.find.focus = true;
-            } else {
-                self.search_focus = true;
+            match &mut self.editor {
+                Some(e) if find_in_note => {
+                    e.find.open = true;
+                    e.find.focus = true;
+                }
+                _ => self.search_focus = true,
             }
         }
-        if pressed(cmd, Key::G) {
+        if pressed(cmd, Key::G) && find_in_note {
             if let Some(e) = &mut self.editor {
                 e.find_step(1);
             }
         }
-        if pressed(shift_cmd, Key::G) {
+        if pressed(shift_cmd, Key::G) && find_in_note {
             if let Some(e) = &mut self.editor {
                 e.find_step(-1);
             }
@@ -792,6 +834,9 @@ impl App {
     }
 
     pub fn editor_command(&mut self, c: Command) {
+        if self.markdown_mode {
+            return;
+        }
         if let Some(e) = &mut self.editor {
             if self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_some()) {
                 return;
@@ -1286,6 +1331,29 @@ mod tests {
 
     fn key(k: Key, modifiers: Modifiers) -> egui::Event {
         egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers }
+    }
+
+    #[test]
+    fn markdown_typed_in_edit_as_markdown_is_the_note() {
+        let (mut app, _dir) = app();
+        let home = app.home();
+        let a = app.add(&home, "# A\nplain\n");
+        app.go_to(Location::Folder(home));
+        app.select(Some(a.clone()));
+        app.toggle_markdown_mode();
+        assert!(app.markdown_mode);
+        app.set_markdown("# A\n_slanted_\n");
+        // Stored as typed, and the formatted note follows.
+        assert_eq!(app.lib.store.note(&a).unwrap().body, "# A\n_slanted_\n");
+        app.flush_editor();
+        assert_eq!(app.lib.store.note(&a).unwrap().body, "# A\n_slanted_\n");
+        let e = app.editor.as_ref().unwrap();
+        assert!(e.doc.blocks[1].runs().iter().all(|(_, s)| s.italic));
+        // Formatting commands are for the formatted note only.
+        app.editor_command(Command::SetKind(Kind::Title));
+        assert_eq!(app.editor.as_ref().unwrap().doc.blocks[1].kind, Kind::Body);
+        app.toggle_markdown_mode();
+        assert!(!app.markdown_mode && app.markdown_source.is_none());
     }
 
     #[test]

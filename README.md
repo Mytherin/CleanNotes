@@ -17,6 +17,7 @@ The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like i
 - **Recently Deleted** per account: notes stay 30 days, can be recovered, and can't be edited until they are (as in Apple Notes).
 - **Tags:** `#words` in notes become tags in the sidebar; a new note made in a tag carries it.
 - **Pinning, duplicating** (Ctrl+D), **copy as Markdown**, and a clipboard that keeps formatting within the app.
+- **Edit as Markdown** (Ctrl+Shift+E, or the note's "…" menu): notes show as the Markdown they're stored as, in a plain text field, and what you type there is saved as written. It stays on for every note until turned off.
 - **Settings** (⚙ or Ctrl+,), laid out like Apple Notes': default account, sort notes by (date edited, date created, title), new notes start with (Title, Heading, Subheading, Body), sort checked items (manually or automatically), default text size, group notes by date, show note count, and how often synced accounts check for changes. **Accounts** adds (+) and removes (−) sync accounts.
 - **Import from Evernote:** Settings → General → "Import from Evernote…" (or drop `.enex` files on the window) adds the notes of Evernote export files, also those made from Apple Notes, to an account of your choice, keeping their dates and formatting (headings, lists, checklists, monospaced text, tables, links). Each notebook (the file's name) becomes a folder, and its tags become #tags; in exports where every note has exactly one tag, as in those made from Apple Notes, that tag is the note's folder. Pictures become the note's own images, where they were; other attachments (PDFs, audio, …) are saved in the data folder's `Attachments` folder and linked from the note. Importing a file again skips the notes already imported.
 - Empty new notes are thrown away when you leave them, as in Apple Notes.
@@ -88,6 +89,7 @@ Ctrl on Windows and Linux is ⌘ on macOS.
 | Ctrl+Shift+N | New folder |
 | Ctrl+Alt+F | Search all notes |
 | Ctrl+F | Find in note (Enter / Shift+Enter, Ctrl+G / Ctrl+Shift+G for next / previous) |
+| Ctrl+Shift+E | Edit as Markdown, or back to the formatted note |
 | Ctrl+1 / Ctrl+2 | List / gallery view |
 | Ctrl+Alt+S | Show or hide folders |
 | Ctrl+D | Duplicate note |
