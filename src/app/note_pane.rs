@@ -167,7 +167,10 @@ impl App {
     /// The lock button, as in Apple Notes: a menu to lock the note, or, once
     /// a locked note is open, to close locked notes or remove its lock.
     fn lock_button(&mut self, ui: &mut Ui, p: &Palette, center: Pos2) {
-        let note = if self.multi.len() < 2 { self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned()) } else { None };
+        if self.multi.len() >= 2 {
+            return self.lock_selection_button(ui, p, center);
+        }
+        let note = self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned());
         let note = note.filter(|n| n.deleted.is_none() && !self.is_closed(&n.id));
         let open = note.as_ref().is_some_and(|n| self.is_locked(&n.id));
         let icon = if open { Icon::LockOpen } else { Icon::LockOutline };
@@ -198,6 +201,32 @@ impl App {
                     }
                 }
                 if close {
+                    ui.memory_mut(|m| m.close_popup());
+                }
+            });
+        });
+    }
+
+    /// The lock button with several notes selected: locks all of them that
+    /// aren't locked yet (the password is asked for once).
+    fn lock_selection_button(&mut self, ui: &mut Ui, p: &Palette, center: Pos2) {
+        let ids = self.selected_ids();
+        let to_lock = ids.iter().filter(|i| self.can_lock(i)).count();
+        let label = if to_lock == 1 { "Lock Note".to_owned() } else { format!("Lock {to_lock} Notes") };
+        let resp = glass_button(ui, p, center, Icon::LockOutline, &label, to_lock > 0);
+        let id = ui.id().with("note-lock");
+        if to_lock == 0 {
+            return;
+        }
+        if resp.clicked() {
+            ui.memory_mut(|m| m.toggle_popup(id));
+        }
+        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+            popover_frame(ui, p).show(ui, |ui| {
+                menu_look(ui, p);
+                ui.set_min_width(200.0);
+                if ui.button(&label).clicked() {
+                    self.lock_notes(&ids);
                     ui.memory_mut(|m| m.close_popup());
                 }
             });
