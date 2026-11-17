@@ -90,7 +90,7 @@ Ctrl on Windows and Linux is ⌘ on macOS.
 | Ctrl+Shift+N | New folder |
 | Ctrl+Alt+F | Search all notes |
 | Ctrl+F | Find in note (Enter / Shift+Enter, Ctrl+G / Ctrl+Shift+G for next / previous) |
-| Ctrl+Shift+E | Edit as Markdown, or back to the formatted note |
+| Ctrl+Shift+E | Edit as Markdown, or back to rich text ("Edit as Rich Text") |
 | Ctrl+1 / Ctrl+2 | List / gallery view |
 | Ctrl+Alt+S | Show or hide folders |
 | Ctrl+D | Duplicate note |
