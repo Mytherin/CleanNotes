@@ -844,11 +844,21 @@ impl Library {
     }
 
     /// Renames a folder. Errors with a message for a name that's taken.
-    pub fn rename_folder(&mut self, id: &str, name: &str) -> Result<(), String> {
+    /// Returns the id of the folder that now has the name: naming a folder
+    /// at the top level after the account's deleted "Notes" folder brings
+    /// that back, with what was in this folder moved into it.
+    pub fn rename_folder(&mut self, id: &str, name: &str) -> Result<String, String> {
         let name = name.trim().replace('/', "∕");
-        let Some(f) = self.store.folder(id).cloned() else { return Ok(()) };
+        let Some(f) = self.store.folder(id).cloned() else { return Ok(id.to_owned()) };
         if name.is_empty() || name == f.name {
-            return Ok(());
+            return Ok(id.to_owned());
+        }
+        if let Some(d) = self.store.default_folder(&f.account).filter(|d| {
+            d.id != f.id && f.parent.is_none() && !self.store.folder_shown(d) && d.name.eq_ignore_ascii_case(&name)
+        }) {
+            let default = d.id.clone();
+            self.merge_into_default(&f.id, &default);
+            return Ok(default);
         }
         let taken = self.store.folders.iter().any(|o| {
             o.id != f.id && o.account == f.account && o.parent == f.parent && o.name.eq_ignore_ascii_case(&name)
@@ -857,7 +867,41 @@ impl Library {
             return Err(format!("The name “{name}” is already taken. Please choose a different name."));
         }
         self.store.folder_mut(id).unwrap().name = name;
-        Ok(())
+        Ok(id.to_owned())
+    }
+
+    /// Brings back an account's deleted default folder in place of folder
+    /// `id` (in the same account): its notes and folders move into the
+    /// default folder, and `id` itself goes.
+    fn merge_into_default(&mut self, id: &str, default: &str) {
+        for n in self.store.notes.iter_mut().filter(|n| n.folder == id) {
+            n.folder = default.to_owned();
+            n.touch();
+            self.unsaved.insert(n.id.clone());
+        }
+        let kids: Vec<(String, String)> = self
+            .store
+            .folders
+            .iter()
+            .filter(|c| c.parent.as_deref() == Some(id))
+            .map(|c| (c.id.clone(), c.name.clone()))
+            .collect();
+        for (kid, kid_name) in kids {
+            let account = self.store.folder(kid.as_str()).unwrap().account.clone();
+            let name = self.store.unique_folder_name(&account, Some(default), &kid_name);
+            let k = self.store.folder_mut(&kid).unwrap();
+            k.parent = Some(default.to_owned());
+            k.name = name;
+        }
+        if let Some(f) = self.store.folder(id).cloned() {
+            if let Some(remote_id) = f.sync.remote_id.clone() {
+                let path = f.sync.synced_path.clone().unwrap_or_else(|| self.store.folder_path(id));
+                self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
+            }
+            self.store.folders.retain(|o| o.id != id);
+            self.settings.collapsed.retain(|c| c != id && *c != f.account && c != default);
+        }
+        self.store.folder_mut(default).unwrap().hidden = false;
     }
 
     /// Whether a folder can be moved into `parent` (a folder, or `None` for
@@ -2147,6 +2191,30 @@ mod tests {
         // As does making a folder called Notes, for good.
         assert_eq!(lib.new_folder(LOCAL, None, Some("notes")), notes);
         assert_eq!(shown(&lib), ["Notes", "Work"]);
+    }
+
+    #[test]
+    fn naming_a_new_folder_notes_brings_the_deleted_notes_folder_back() {
+        let (mut lib, _d) = lib();
+        let notes = lib.default_folder_id(LOCAL);
+        lib.new_folder(LOCAL, None, Some("Work"));
+        lib.delete_folder(&notes);
+        let shown = |lib: &Library| lib.store.folder_tree(LOCAL).iter().map(|(f, _)| f.name.clone()).collect::<Vec<_>>();
+        assert_eq!(shown(&lib), ["Work"]);
+
+        // The desktop app makes "New Folder", then renames it.
+        let fresh = lib.new_folder(LOCAL, None, None);
+        let n = add(&mut lib, &fresh, "# Kept\n");
+        let inner = lib.new_folder(LOCAL, Some(&fresh), Some("Inner"));
+        assert_eq!(lib.rename_folder(&fresh, "Notes"), Ok(notes.clone()));
+        assert!(lib.store.folder(&fresh).is_none(), "the new folder gives way to Notes");
+        assert_eq!(lib.store.note(&n).unwrap().folder, notes, "with its notes");
+        assert_eq!(lib.store.folder(&inner).unwrap().parent.as_deref(), Some(notes.as_str()), "and folders");
+        assert_eq!(shown(&lib), ["Notes", "Inner", "Work"]);
+
+        // Once it's back, the name is taken as usual.
+        let other = lib.new_folder(LOCAL, None, None);
+        assert!(lib.rename_folder(&other, "Notes").is_err());
     }
 
     #[test]

@@ -576,7 +576,7 @@ impl NotesCore {
     }
 
     pub fn rename_folder(&self, id: String, name: String) -> Result<(), CoreError> {
-        self.lib().rename_folder(&id, &name).map_err(failed)
+        self.lib().rename_folder(&id, &name).map(|_| ()).map_err(failed)
     }
 
     /// Whether a folder can go into `parent` (`None`: the top level of
