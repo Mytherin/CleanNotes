@@ -1,4 +1,5 @@
 import ImageIO
+import PDFKit
 import PhotosUI
 import QuickLook
 import SwiftUI
@@ -30,6 +31,8 @@ final class ParagraphMark: NSObject {
     let marker: String
     /// A table cell: where it is in its table.
     let cell: TableCell?
+    /// An attached file on a line of its own: drawn as a card.
+    let file: AttachedFile?
 
     init(_ p: Paragraph) {
         style = p.style
@@ -37,6 +40,7 @@ final class ParagraphMark: NSObject {
         checked = p.checked
         marker = p.marker
         cell = p.cell
+        file = p.file
     }
 
     var isList: Bool { !marker.isEmpty }
@@ -69,6 +73,55 @@ final class NoteImages {
     /// Locked notes closed: their pictures, decrypted, aren't kept.
     func forgetAll() {
         cache.removeAllObjects()
+        pdfs.removeAllObjects()
+        pages.removeAllObjects()
+        sizes.removeAll()
+    }
+
+    // ---- Attached files (PDFs' pages, for their cards) ----
+
+    private let pdfs = NSCache<NSString, PDFDocument>()
+    private let pages = NSCache<NSString, UIImage>()
+    private var sizes: [String: Int] = [:]
+
+    /// An attached PDF, if it's here and can be read (not an encrypted
+    /// one, say).
+    func pdf(_ reference: String) -> PDFDocument? {
+        if let d = pdfs.object(forKey: reference as NSString) { return d }
+        guard let data = data(reference) else { return nil }
+        sizes[reference] = data.count
+        guard let d = PDFDocument(data: data), !d.isLocked, d.pageCount > 0 else { return nil }
+        pdfs.setObject(d, forKey: reference as NSString)
+        return d
+    }
+
+    /// An attached file's size in bytes, if it's here.
+    func size(_ reference: String) -> Int? {
+        if let n = sizes[reference] { return n }
+        guard let data = data(reference) else { return nil }
+        sizes[reference] = data.count
+        return data.count
+    }
+
+    /// A PDF page's size in points, as it's shown (turned, if it is).
+    static func pageSize(_ page: PDFPage) -> CGSize {
+        let b = page.bounds(for: .cropBox).size
+        return page.rotation % 180 == 0 ? b : CGSize(width: b.height, height: b.width)
+    }
+
+    /// Page `index` of an attached PDF drawn on white, `height` points
+    /// high (sharp on this screen).
+    func page(_ reference: String, index: Int, height: CGFloat, scale: CGFloat) -> UIImage? {
+        let px = Int((height * scale).rounded())
+        let key = "\(reference):\(index):\(px)" as NSString
+        if let i = pages.object(forKey: key) { return i }
+        guard px > 0, let page = pdf(reference)?.page(at: index) else { return nil }
+        let size = Self.pageSize(page)
+        guard size.width > 0, size.height > 0 else { return nil }
+        let k = CGFloat(px) / size.height
+        let img = page.thumbnail(of: CGSize(width: size.width * k, height: CGFloat(px)), for: .cropBox)
+        pages.setObject(img, forKey: key)
+        return img
     }
 
     /// A box shown while a picture is on its way.
@@ -139,10 +192,10 @@ enum NoteTextRenderer {
     }
 
     /// One paragraph, with its line break if another follows.
-    static func attributed(_ p: Paragraph, textSize: Float, terminated: Bool, images: ImageLayout = .standard) -> NSAttributedString {
+    static func attributed(_ p: Paragraph, textSize: Float, terminated: Bool, images: ImageLayout = .standard, cards: Bool = true) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let mark = ParagraphMark(p)
-        let para = paragraphStyle(p, textSize: textSize)
+        let para = paragraphStyle(p, textSize: textSize, width: images.width, cards: cards)
         for run in p.runs {
             let attrs = attributes(p, run: run, textSize: textSize, mark: mark, para: para)
             if let name = run.image {
@@ -182,7 +235,10 @@ enum NoteTextRenderer {
     /// Space between a table cell's box and its text.
     static let cellPadding: CGFloat = 12
 
-    static func paragraphStyle(_ p: Paragraph, textSize: Float) -> NSParagraphStyle {
+    /// `width`: the text's (a large PDF's pages are as wide); `cards`:
+    /// attached files are drawn as cards (not when printing), room kept
+    /// around their names for them.
+    static func paragraphStyle(_ p: Paragraph, textSize: Float, width: CGFloat = ImageLayout.standard.width, cards: Bool = true) -> NSParagraphStyle {
         let body = bodySize(textSize)
         let s = NSMutableParagraphStyle()
         if p.cell != nil {
@@ -212,6 +268,9 @@ enum NoteTextRenderer {
         default: break
         }
         s.lineSpacing = p.style == .monospaced ? 0 : body * 0.08
+        if cards, let file = p.file {
+            FileCards.reserve(file, in: s, width: width - indent)
+        }
         return s
     }
 
@@ -272,7 +331,7 @@ enum NoteTextRenderer {
     static func printable(_ paragraphs: [Paragraph], textSize: Float) -> NSAttributedString {
         let out = NSMutableAttributedString()
         for (i, p) in paragraphs.enumerated() {
-            let line = NSMutableAttributedString(attributedString: attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count))
+            let line = NSMutableAttributedString(attributedString: attributed(p, textSize: textSize, terminated: i + 1 < paragraphs.count, cards: false))
             let marker = p.marker
             if !marker.isEmpty, let para = paragraphStyle(p, textSize: textSize).mutableCopy() as? NSMutableParagraphStyle {
                 // The marker hangs to the left of the text, as on screen.
@@ -303,8 +362,74 @@ enum NoteTextRenderer {
     }
 }
 
+/// Attached files' cards, as in Apple Notes: the file's name (the
+/// paragraph's text, still edited as text) in a rounded box, and below it
+/// a PDF's pages side by side (Medium, as usual) or its first page as wide
+/// as the note (Large); Small, and any other file, is the name with "PDF
+/// Document · 211 KB" below it and a small picture of it on the right.
+/// Room is kept with the paragraph's spacing and indents (the text stays
+/// the engine's); [`NotesLayoutManager`] draws the rest. A tap on the card
+/// opens the file in Quick Look.
+enum FileCards {
+    /// Inside the card, around its contents.
+    static let pad: CGFloat = 12
+    /// Between cards and the text around them.
+    static let margin: CGFloat = 6
+    /// Between the name and the pages below it.
+    static let gap: CGFloat = 8
+    /// A Medium card's pages' height.
+    static let pagesHeight: CGFloat = 200
+    /// A Small card's picture.
+    static let thumb = CGSize(width: 40, height: 52)
+    static var detailsFont: UIFont { .preferredFont(forTextStyle: .footnote) }
+
+    /// How it's shown here: a PDF that can't be read (not on this device
+    /// yet) is Small, as other files are.
+    static func view(_ f: AttachedFile) -> FileView {
+        f.pdf && f.view != .small && NoteImages.shared.pdf(f.reference) != nil ? f.view : .small
+    }
+
+    /// Keeps room in its paragraph's style for the card of `f`, `width`
+    /// wide.
+    static func reserve(_ f: AttachedFile, in s: NSMutableParagraphStyle, width: CGFloat) {
+        s.firstLineHeadIndent += pad
+        s.headIndent += pad
+        s.paragraphSpacingBefore = margin + pad
+        let below: CGFloat
+        switch view(f) {
+        case .small:
+            s.tailIndent = -(pad + thumb.width + gap)
+            below = max(detailsFont.lineHeight + 2, 0)
+        case .medium:
+            s.tailIndent = -pad
+            below = gap + pagesHeight
+        case .large:
+            s.tailIndent = -pad
+            below = gap + largeHeight(f, width: width - 2 * pad)
+        }
+        s.paragraphSpacing = below + pad + margin
+    }
+
+    /// A Large card's first page's height, `width` wide (no taller than
+    /// a screenful).
+    static func largeHeight(_ f: AttachedFile, width: CGFloat) -> CGFloat {
+        guard let page = NoteImages.shared.pdf(f.reference)?.page(at: 0) else { return pagesHeight }
+        let size = NoteImages.pageSize(page)
+        guard size.width > 0 else { return pagesHeight }
+        return min(max(width, 60) * size.height / size.width, 600)
+    }
+
+    /// "PDF Document · 211 KB".
+    static func details(_ f: AttachedFile, label: String) -> String {
+        let ext = (label.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).pathExtension.uppercased()
+        let kind = f.pdf ? "PDF Document" : ext.isEmpty ? "Document" : "\(ext) Document"
+        guard let n = NoteImages.shared.size(f.reference) else { return "\(kind) · Not on this device yet" }
+        return "\(kind) · \(ByteCountFormatter.string(fromByteCount: Int64(n), countStyle: .file))"
+    }
+}
+
 /// Draws list markers, checklist circles, quote bars and code block
-/// backgrounds next to the text.
+/// backgrounds next to the text, and attached files' cards.
 final class NotesLayoutManager: NSLayoutManager {
     var textSize: Float = 15
     /// The last paragraph's style when it's empty (it has no characters to
@@ -325,6 +450,9 @@ final class NotesLayoutManager: NSLayoutManager {
                 guard let mark = value as? ParagraphMark else { return }
                 let rects = lineRects(for: r, origin: origin)
                 guard let first = rects.first else { return }
+                if let file = mark.file {
+                    drawFileCard(file, chars: r, rects: rects, origin: origin)
+                }
                 if let cell = mark.cell {
                     drawCell(cell, rects: rects, origin: origin)
                     return
@@ -388,6 +516,97 @@ final class NotesLayoutManager: NSLayoutManager {
         if cell.row + 1 == cell.rows && cell.column + 1 == cell.columns {
             UIRectFill(CGRect(x: box.minX, y: box.maxY - line, width: box.width, height: line))
         }
+    }
+
+    /// Where an attached file's card is, from the line fragments its
+    /// paragraph `r` is laid out on (view coordinates); and the bottom of
+    /// its name's text, and where its text starts.
+    func fileCardFrame(chars r: NSRange, rects: [CGRect], origin: CGPoint) -> (card: CGRect, nameBottom: CGFloat, textX: CGFloat)? {
+        guard let first = rects.first, let last = rects.last, let storage = textStorage, r.length > 0 else { return nil }
+        let para = storage.attribute(.paragraphStyle, at: r.location, effectiveRange: nil) as? NSParagraphStyle
+        let padding = textContainers.first?.lineFragmentPadding ?? 0
+        let textX = first.minX + padding + (para?.headIndent ?? 0)
+        let pad = FileCards.pad
+        let top = lineFragmentUsedRect(forGlyphAt: glyphIndexForCharacter(at: r.location), effectiveRange: nil).minY + origin.y
+        let nameBottom = lineFragmentUsedRect(forGlyphAt: glyphIndexForCharacter(at: NSMaxRange(r) - 1), effectiveRange: nil).maxY + origin.y
+        let bottom = max(last.maxY - FileCards.margin, nameBottom + pad)
+        let left = textX - pad
+        let card = CGRect(x: left, y: max(top - pad, first.minY), width: first.maxX - padding - left, height: bottom - max(top - pad, first.minY))
+        return (card, nameBottom, textX)
+    }
+
+    /// An attached file's card (see [`FileCards`]) behind its name.
+    private func drawFileCard(_ f: AttachedFile, chars r: NSRange, rects: [CGRect], origin: CGPoint) {
+        guard let (card, nameBottom, textX) = fileCardFrame(chars: r, rects: rects, origin: origin) else { return }
+        let pad = FileCards.pad
+        let box = UIBezierPath(roundedRect: card, cornerRadius: 12)
+        UIColor.secondarySystemFill.setFill()
+        box.fill()
+        UIColor.separator.setStroke()
+        box.lineWidth = 0.5
+        box.stroke()
+        let scale = max(UITraitCollection.current.displayScale, 1)
+        switch FileCards.view(f) {
+        case .small:
+            let label = (textStorage?.string as NSString?)?.substring(with: r).trimmingCharacters(in: .newlines) ?? ""
+            let style = NSMutableParagraphStyle()
+            style.lineBreakMode = .byTruncatingTail
+            let attrs: [NSAttributedString.Key: Any] = [.font: FileCards.detailsFont, .foregroundColor: UIColor.secondaryLabel, .paragraphStyle: style]
+            let thumbX = card.maxX - pad - FileCards.thumb.width
+            let details = CGRect(x: textX, y: nameBottom + 1, width: max(thumbX - FileCards.gap - textX, 0), height: FileCards.detailsFont.lineHeight + 1)
+            (FileCards.details(f, label: label) as NSString).draw(with: details, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine], attributes: attrs, context: nil)
+            let spot = CGRect(x: thumbX, y: card.midY - FileCards.thumb.height / 2, width: FileCards.thumb.width, height: FileCards.thumb.height)
+            if f.pdf, let page = NoteImages.shared.pdf(f.reference)?.page(at: 0) {
+                let size = NoteImages.pageSize(page)
+                let k = min(spot.width / max(size.width, 1), spot.height / max(size.height, 1))
+                let fit = CGRect(x: spot.midX - size.width * k / 2, y: spot.midY - size.height * k / 2, width: size.width * k, height: size.height * k)
+                drawPage(NoteImages.shared.page(f.reference, index: 0, height: fit.height, scale: scale), in: fit)
+            } else {
+                let symbol = UIImage(systemName: "doc", withConfiguration: UIImage.SymbolConfiguration(pointSize: 30, weight: .light))?
+                    .withTintColor(.secondaryLabel, renderingMode: .alwaysOriginal)
+                if let symbol {
+                    symbol.draw(at: CGPoint(x: spot.midX - symbol.size.width / 2, y: spot.midY - symbol.size.height / 2))
+                }
+            }
+        case .medium, .large:
+            guard let doc = NoteImages.shared.pdf(f.reference) else { return }
+            let area = CGRect(x: textX, y: nameBottom + FileCards.gap, width: card.maxX - pad - textX, height: card.maxY - pad - nameBottom - FileCards.gap)
+            guard area.width > 0, area.height > 0, let ctx = UIGraphicsGetCurrentContext() else { return }
+            ctx.saveGState()
+            ctx.clip(to: area.insetBy(dx: -1, dy: -1))
+            if FileCards.view(f) == .large {
+                if let page = doc.page(at: 0) {
+                    let size = NoteImages.pageSize(page)
+                    let k = min(area.width / max(size.width, 1), area.height / max(size.height, 1))
+                    let fit = CGRect(x: area.midX - size.width * k / 2, y: area.minY, width: size.width * k, height: size.height * k)
+                    drawPage(NoteImages.shared.page(f.reference, index: 0, height: fit.height, scale: scale), in: fit)
+                }
+            } else {
+                // As many as fit, side by side (the last one cut off when
+                // there are more).
+                var x = area.minX
+                for i in 0..<doc.pageCount {
+                    guard x < area.maxX, let page = doc.page(at: i) else { break }
+                    let size = NoteImages.pageSize(page)
+                    let w = area.height * size.width / max(size.height, 1)
+                    let rect = CGRect(x: x, y: area.minY, width: w, height: area.height)
+                    drawPage(NoteImages.shared.page(f.reference, index: i, height: area.height, scale: scale), in: rect)
+                    x += w + FileCards.gap
+                }
+            }
+            ctx.restoreGState()
+        }
+    }
+
+    /// A page of a PDF on white, with a hairline round it.
+    private func drawPage(_ image: UIImage?, in rect: CGRect) {
+        UIColor.white.setFill()
+        UIRectFill(rect)
+        image?.draw(in: rect)
+        UIColor.separator.setStroke()
+        let edge = UIBezierPath(rect: rect.insetBy(dx: 0.25, dy: 0.25))
+        edge.lineWidth = 0.5
+        edge.stroke()
     }
 
     /// The line fragments a character range is laid out on (view
@@ -831,7 +1050,8 @@ struct NoteEditorView: UIViewRepresentable {
         /// The text view's width changed: pictures are fitted again.
         func widthChanged() {
             if rendering { return }
-            if editor.state().paragraphs.contains(where: { p in p.runs.contains { $0.image != nil } }) {
+            // (A large PDF's page is as wide as the text too.)
+            if editor.state().paragraphs.contains(where: { p in p.file != nil || p.runs.contains { $0.image != nil } }) {
                 render()
             }
         }
@@ -1120,29 +1340,38 @@ struct NoteEditorView: UIViewRepresentable {
 
         /// What a tap at a point hits: a checklist circle (its paragraph),
         /// or a link.
-        private func hit(_ point: CGPoint) -> (checkbox: UInt32?, link: URL?) {
-            guard let tv = textView, tv.storage.length > 0 else { return (nil, nil) }
+        /// What's at a point: a checklist circle (its paragraph), a link, or
+        /// an attached file's card outside its name (the file, and the name
+        /// it's shown with).
+        private func hit(_ point: CGPoint) -> (checkbox: UInt32?, link: URL?, file: (reference: String, label: String)?) {
+            let none: (checkbox: UInt32?, link: URL?, file: (reference: String, label: String)?) = (nil, nil, nil)
+            guard let tv = textView, tv.storage.length > 0 else { return none }
             let p = CGPoint(x: point.x - tv.textContainerInset.left, y: point.y - tv.textContainerInset.top)
             let lm = tv.notesLayout
             let glyph = lm.glyphIndex(for: p, in: tv.textContainer)
             let line = lm.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
-            guard p.y >= line.minY - 4, p.y <= line.maxY + 4 else { return (nil, nil) }
+            guard p.y >= line.minY - 4, p.y <= line.maxY + 4 else { return none }
             let char = lm.characterIndexForGlyph(at: glyph)
-            guard char < tv.storage.length else { return (nil, nil) }
+            guard char < tv.storage.length else { return none }
             if let mark = tv.storage.attribute(.cnParagraph, at: char, effectiveRange: nil) as? ParagraphMark, mark.style == .checklist {
                 let body = NoteTextRenderer.bodySize(textSize)
                 let x0 = CGFloat(mark.indent) * NoteTextRenderer.indentStep(body)
                 if p.x >= x0 - 8, p.x <= x0 + NoteTextRenderer.markerWidth(.checklist, body: body) {
                     let text = tv.storage.string as NSString
                     let start = text.paragraphRange(for: NSRange(location: char, length: 0)).location
-                    return (editor.paragraphAt(offset: UInt32(start)), nil)
+                    return (editor.paragraphAt(offset: UInt32(start)), nil, nil)
                 }
             }
             let glyphRect = lm.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: tv.textContainer)
             if glyphRect.insetBy(dx: -2, dy: -2).contains(p), let url = tv.storage.attribute(.link, at: char, effectiveRange: nil) as? URL {
-                return (nil, url)
+                return (nil, url, nil)
             }
-            return (nil, nil)
+            if let mark = tv.storage.attribute(.cnParagraph, at: char, effectiveRange: nil) as? ParagraphMark, let file = mark.file {
+                let text = tv.storage.string as NSString
+                let label = text.substring(with: text.paragraphRange(for: NSRange(location: char, length: 0))).trimmingCharacters(in: .newlines)
+                return (nil, nil, (file.reference, label))
+            }
+            return none
         }
 
         /// The whole text of the link at a point (an attached file's name).
@@ -1160,7 +1389,7 @@ struct NoteEditorView: UIViewRepresentable {
         func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
             guard let tv = textView else { return false }
             let h = hit(g.location(in: tv))
-            if h.checkbox != nil { return true }
+            if h.checkbox != nil || h.file != nil { return true }
             // Links open with a tap while not typing (typing, a tap puts
             // the caret in them).
             if h.link != nil && !tv.isFirstResponder { return true }
@@ -1183,6 +1412,8 @@ struct NoteEditorView: UIViewRepresentable {
                 editor.toggleCheck(paragraph: index, sortChecked: store.core.settings().sortChecked)
                 render()
                 edited()
+            } else if let file = h.file {
+                openAttachment(reference: file.reference, label: file.label)
             } else if let url = h.link {
                 let address = url.absoluteString
                 if url.scheme == nil, address.hasPrefix("attachments/") {
