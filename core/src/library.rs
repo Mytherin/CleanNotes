@@ -950,6 +950,7 @@ impl Library {
             let m = self.store.folder_mut(id).unwrap();
             m.parent = parent.map(str::to_owned);
             m.name = name;
+            m.position = None;
         } else {
             // Into another account: its notes move as notes moved there do
             // (gone from the old account, new in the new one), and its folders
@@ -974,6 +975,7 @@ impl Library {
                 if fid == id {
                     m.parent = parent.map(str::to_owned);
                     m.name = name.clone();
+                    m.position = None;
                 }
             }
             for (nid, deleted) in notes {
@@ -991,6 +993,49 @@ impl Library {
         }
         // Where it went opens up to show it.
         self.settings.collapsed.retain(|c| Some(c.as_str()) != parent && c != account);
+        true
+    }
+
+    /// Whether a folder can be dragged to just before `before` (one of
+    /// `parent`'s folders, or `None` for after the last) among `parent`'s
+    /// folders (or the top level of `account`): somewhere it can move to,
+    /// or a new place among its own siblings. Not the default folder.
+    pub fn can_place_folder(&self, id: &str, account: &str, parent: Option<&str>, before: Option<&str>) -> bool {
+        let Some(f) = self.store.folder(id) else { return false };
+        if f.default {
+            return false;
+        }
+        let kids: Vec<&str> = self.store.child_folders(account, parent).iter().map(|k| k.id.as_str()).collect();
+        if before.is_some_and(|b| !kids.contains(&b)) {
+            return false;
+        }
+        if f.account != account || f.parent.as_deref() != parent {
+            return self.can_move_folder(id, account, parent);
+        }
+        // Among its siblings: not right where it is already.
+        let at = kids.iter().position(|k| *k == id);
+        let next = at.and_then(|i| kids.get(i + 1).copied());
+        before != Some(id) && before != next
+    }
+
+    /// Moves a folder (as [`Self::move_folder`] does, if `parent` isn't
+    /// where it is) and puts it just before `before` among `parent`'s
+    /// folders, or after the last if `None`. Returns whether it moved.
+    pub fn place_folder(&mut self, id: &str, account: &str, parent: Option<&str>, before: Option<&str>) -> bool {
+        if !self.can_place_folder(id, account, parent, before) {
+            return false;
+        }
+        let f = self.store.folder(id).unwrap();
+        if (f.account != account || f.parent.as_deref() != parent) && !self.move_folder(id, account, parent) {
+            return false;
+        }
+        let mut order: Vec<String> =
+            self.store.child_folders(account, parent).into_iter().map(|k| k.id.clone()).filter(|k| k != id).collect();
+        let at = before.and_then(|b| order.iter().position(|k| k == b)).unwrap_or(order.len());
+        order.insert(at, id.to_owned());
+        for (i, k) in order.iter().enumerate() {
+            self.store.folder_mut(k).unwrap().position = Some(i as u32);
+        }
         true
     }
 
@@ -2242,6 +2287,43 @@ mod tests {
         assert_eq!(lib.store.folder(&plans).unwrap().parent, None);
         assert_eq!(lib.store.folder(&plans).unwrap().name, "Plans 2");
         assert_eq!(lib.store.folder(&other).unwrap().name, "plans");
+    }
+
+    #[test]
+    fn folders_can_be_put_in_order() {
+        let (mut lib, _d) = lib();
+        let names = |lib: &Library, parent: Option<&str>| {
+            lib.store.child_folders(LOCAL, parent).iter().map(|f| f.name.clone()).collect::<Vec<_>>()
+        };
+        let a = lib.new_folder(LOCAL, None, Some("A"));
+        let b = lib.new_folder(LOCAL, None, Some("B"));
+        let c = lib.new_folder(LOCAL, None, Some("C"));
+        let home = lib.default_folder_id(LOCAL);
+        assert_eq!(names(&lib, None), ["Notes", "A", "B", "C"]);
+        // C to the top, then A to the end.
+        assert!(lib.place_folder(&c, LOCAL, None, Some(&home)));
+        assert_eq!(names(&lib, None), ["C", "Notes", "A", "B"]);
+        assert!(lib.place_folder(&a, LOCAL, None, None));
+        assert_eq!(names(&lib, None), ["C", "Notes", "B", "A"]);
+        // Not to where it is already, and not the default folder.
+        assert!(!lib.can_place_folder(&a, LOCAL, None, None));
+        assert!(!lib.can_place_folder(&b, LOCAL, None, Some(&a)));
+        assert!(!lib.can_place_folder(&b, LOCAL, None, Some(&b)));
+        assert!(!lib.can_place_folder(&home, LOCAL, None, None));
+        // New folders go after the ones put in order.
+        lib.new_folder(LOCAL, None, Some("0"));
+        assert_eq!(names(&lib, None), ["C", "Notes", "B", "A", "0"]);
+        // Into another folder, at a place among its folders.
+        let x = lib.new_folder(LOCAL, Some(&b), Some("X"));
+        let y = lib.new_folder(LOCAL, Some(&b), Some("Y"));
+        assert!(lib.place_folder(&c, LOCAL, Some(&b), Some(&y)));
+        assert_eq!(names(&lib, Some(&b)), ["X", "C", "Y"]);
+        assert_eq!(names(&lib, None), ["Notes", "B", "A", "0"]);
+        // Not into itself.
+        assert!(!lib.can_place_folder(&b, LOCAL, Some(&b), Some(&x)));
+        // Moved elsewhere without a place, it goes after the ones in order.
+        assert!(lib.move_folder(&c, LOCAL, None));
+        assert_eq!(names(&lib, None), ["Notes", "B", "A", "0", "C"]);
     }
 
     #[test]
