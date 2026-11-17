@@ -121,6 +121,21 @@ pub struct Editor {
     /// The attached file (its paragraph) right-clicked: its menu is shown.
     file_menu: Option<usize>,
     pub rename_sheet: Option<RenameSheet>,
+    /// What ⌃K last cut (⌃Y puts it back), as on macOS.
+    kill: String,
+    /// Where the caret was left by the last ⌃K: another ⌃K from there adds
+    /// to `kill` instead of replacing it.
+    kill_at: Option<Pos>,
+    /// A scroll asked for by the keyboard (Home, End, Page Up/Down on
+    /// macOS scroll without moving the caret), done when the note is drawn.
+    scroll_request: Option<KeyScroll>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum KeyScroll {
+    Top,
+    Bottom,
+    Page(i32),
 }
 
 impl Deref for Editor {
@@ -148,7 +163,7 @@ impl Editor {
     }
 
     fn wrap(ed: Editing) -> Editor {
-        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None }
+        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None, kill: String::new(), kill_at: None, scroll_request: None }
     }
 
     pub fn id(&self) -> egui::Id {
@@ -390,6 +405,11 @@ impl Editor {
         let line = mac && m.mac_cmd;
         let extend = m.shift;
         let editable = !opts.read_only;
+        if mac {
+            if let Some(used) = self.mac_key(key, m, opts, ctx) {
+                return used;
+            }
+        }
 
         // Formatting shortcuts (Apple Notes'), Ctrl for ⌘ off macOS.
         if cmd && m.shift && !m.alt {
@@ -538,6 +558,179 @@ impl Editor {
             self.goal_x = None;
         }
         true
+    }
+
+    /// macOS's standard text keys (Cocoa's, as in Apple Notes and every
+    /// Mac text view): the Emacs-style ⌃ keys, ⌥↑/↓ by paragraph, ⌘⌫ and
+    /// ⌘⌦ to the line's edge, and Home, End and Page Up/Down, which scroll
+    /// without moving the caret. `None`: not one of them.
+    fn mac_key(&mut self, key: Key, m: Modifiers, opts: &Options, ctx: &egui::Context) -> Option<bool> {
+        let editable = !opts.read_only;
+        let extend = m.shift;
+        let caret = self.sel.caret;
+        let para_len = |b: usize| self.doc.blocks[b].len();
+        if m.ctrl && !m.mac_cmd && !m.alt {
+            let plain = Modifiers { ctrl: false, ..m };
+            match key {
+                // ⌃B ⌃F ⌃P ⌃N: as the arrows (with ⇧, selecting).
+                Key::B => return Some(self.key(Key::ArrowLeft, plain, opts, ctx)),
+                Key::F => return Some(self.key(Key::ArrowRight, plain, opts, ctx)),
+                Key::P => return Some(self.key(Key::ArrowUp, plain, opts, ctx)),
+                Key::N => return Some(self.key(Key::ArrowDown, plain, opts, ctx)),
+                // ⌃V: a page down, moving the caret.
+                Key::V => return Some(self.key(Key::PageDown, Modifiers { alt: true, ..plain }, opts, ctx)),
+                Key::H | Key::Backspace if !extend => return Some(self.key(Key::Backspace, Modifiers::NONE, opts, ctx)),
+                Key::D if !extend => return Some(self.key(Key::Delete, Modifiers::NONE, opts, ctx)),
+                // ⌃A ⌃E: the paragraph's start and end.
+                Key::A | Key::E => {
+                    let p = Pos::new(caret.block, if key == Key::A { 0 } else { para_len(caret.block) });
+                    self.goal_x = None;
+                    self.set_caret(p, extend);
+                }
+                Key::K if !extend => {
+                    if editable {
+                        self.kill_to_paragraph_end();
+                    }
+                }
+                Key::Y if !extend => {
+                    if editable && !self.kill.is_empty() {
+                        let k = self.kill.clone();
+                        self.paste(&k);
+                    }
+                }
+                Key::T if !extend => {
+                    if editable {
+                        self.transpose();
+                    }
+                }
+                // ⌃O: a new paragraph after the caret, which stays put.
+                Key::O if !extend => {
+                    if editable {
+                        self.enter();
+                        let p = self.doc.char_step(self.sel.caret, -1);
+                        self.set_caret(p, false);
+                    }
+                }
+                Key::L => self.reveal = true,
+                _ => return None,
+            }
+            return Some(true);
+        }
+        // ⌥↑ ⌥↓: to the start (end) of the paragraph, or of the one before
+        // (after) if already there.
+        if m.alt && !m.ctrl && !m.mac_cmd && matches!(key, Key::ArrowUp | Key::ArrowDown) {
+            let p = if key == Key::ArrowUp {
+                if caret.offset > 0 || caret.block == 0 { Pos::new(caret.block, 0) } else { Pos::new(caret.block - 1, 0) }
+            } else if caret.offset < para_len(caret.block) || caret.block + 1 == self.doc.blocks.len() {
+                Pos::new(caret.block, para_len(caret.block))
+            } else {
+                Pos::new(caret.block + 1, para_len(caret.block + 1))
+            };
+            self.goal_x = None;
+            self.set_caret(p, extend);
+            return Some(true);
+        }
+        // ⌘⌫ ⌘⌦ (fn⌘⌫): deletes to the start (end) of the line.
+        if m.mac_cmd && !m.ctrl && !m.alt && !m.shift && matches!(key, Key::Backspace | Key::Delete) {
+            if editable {
+                let back = key == Key::Backspace;
+                if self.sel.is_empty() {
+                    let edge = self.row_edge(caret, !back);
+                    if edge != caret {
+                        self.ed.set_selection(caret, edge);
+                    }
+                }
+                if back {
+                    self.backspace(false);
+                } else {
+                    self.delete_forward(false);
+                }
+            }
+            return Some(true);
+        }
+        if !m.ctrl && !m.mac_cmd {
+            match key {
+                // Home, End: scroll to the top or bottom (⇧: select to there).
+                Key::Home | Key::End if !m.alt => {
+                    let end = key == Key::End;
+                    if extend {
+                        self.goal_x = None;
+                        let p = if end { self.doc.end() } else { Pos::default() };
+                        self.set_caret(p, true);
+                    } else {
+                        self.scroll_request = Some(if end { KeyScroll::Bottom } else { KeyScroll::Top });
+                    }
+                    return Some(true);
+                }
+                // Page Up/Down scroll; with ⌥ or ⇧ the caret moves too.
+                Key::PageUp | Key::PageDown if !m.alt && !extend => {
+                    self.scroll_request = Some(KeyScroll::Page(if key == Key::PageUp { -1 } else { 1 }));
+                    return Some(true);
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The text from `a` to `b` (paragraphs joined by "\n").
+    fn text_between(&self, a: Pos, b: Pos) -> String {
+        let mut out = String::new();
+        for i in a.block..=b.block {
+            let text = &self.doc.blocks[i].text;
+            let from = if i == a.block { a.offset } else { 0 };
+            let to = if i == b.block { b.offset } else { usize::MAX };
+            out.extend(text.chars().skip(from).take(to.saturating_sub(from)));
+            if i < b.block {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// ⌃K: cuts to the end of the paragraph (at its end, the paragraph
+    /// break) into the kill buffer, not the clipboard.
+    fn kill_to_paragraph_end(&mut self) {
+        let (from, to) = if self.sel.is_empty() {
+            let c = self.sel.caret;
+            let len = self.doc.blocks[c.block].len();
+            (c, if c.offset < len { Pos::new(c.block, len) } else { self.doc.char_step(c, 1) })
+        } else {
+            (self.sel.start(), self.sel.end())
+        };
+        if from == to {
+            return;
+        }
+        let text = self.text_between(from, to);
+        if self.sel.is_empty() && self.kill_at == Some(from) {
+            self.kill.push_str(&text);
+        } else {
+            self.kill = text;
+        }
+        self.ed.set_selection(from, to);
+        self.delete_forward(false);
+        self.kill_at = Some(self.sel.caret);
+    }
+
+    /// ⌃T: swaps the characters on either side of the caret (at the end of
+    /// a paragraph, the last two), and moves past them.
+    fn transpose(&mut self) {
+        if !self.sel.is_empty() {
+            return;
+        }
+        let c = self.sel.caret;
+        let len = self.doc.blocks[c.block].len();
+        if len < 2 || c.offset == 0 {
+            return;
+        }
+        let mid = if c.offset >= len { self.doc.char_step(c, -1) } else { c };
+        let (a, b) = (self.doc.char_step(mid, -1), self.doc.char_step(mid, 1));
+        if a.block != c.block || b.block != c.block {
+            return;
+        }
+        let swapped = self.text_between(mid, b) + &self.text_between(a, mid);
+        self.ed.set_selection(a, b);
+        self.insert_text(&swapped);
     }
 
     // ---- Drawing and input ----------------------------------------------
@@ -996,6 +1189,20 @@ impl Editor {
                 ui.scroll_to_rect(r.expand(24.0), None);
                 self.reveal = false;
             }
+        }
+        match self.scroll_request.take() {
+            Some(KeyScroll::Page(dir)) => {
+                let page = (ui.clip_rect().height() - 40.0).max(40.0);
+                ui.scroll_with_delta(Vec2::new(0.0, -dir as f32 * page));
+            }
+            Some(KeyScroll::Top) => {
+                ui.scroll_to_rect(Rect::from_min_size(full.min, Vec2::splat(1.0)), Some(egui::Align::TOP));
+            }
+            Some(KeyScroll::Bottom) => {
+                let bottom = self.laid.iter().map(|l| l.rect.bottom()).fold(full.top(), f32::max);
+                ui.scroll_to_rect(Rect::from_min_size(Pos2::new(full.left(), bottom), Vec2::splat(1.0)), Some(egui::Align::BOTTOM));
+            }
+            None => {}
         }
         out
     }
@@ -1525,4 +1732,84 @@ mod tests {
         // (Not as text: that would replace them.)
         assert!(out.platform_output.copied_text.is_empty());
     }
+
+    #[test]
+    fn macos_text_keys_as_in_cocoa() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = images::ImageCache::new(dir.path().to_owned());
+        let pdf_cache = pdfs::PdfCache::new(dir.path().to_owned());
+        let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache, pdfs: &pdf_cache, can_attach: true };
+        let ctx = egui::Context::default();
+        let ctrl = Modifiers::CTRL;
+        let mut e = Editor::new("n", "Hello world\nSecond line\n");
+        let mut press = |e: &mut Editor, key, m| assert_eq!(e.mac_key(key, m, &opts, &ctx), Some(true), "{key:?}");
+        // ⌃E ⌃A: the paragraph's end and start; with ⇧, selecting.
+        e.sel = Selection::caret(Pos::new(0, 3));
+        press(&mut e, Key::E, ctrl);
+        assert_eq!(e.sel.caret, Pos::new(0, 11));
+        press(&mut e, Key::A, ctrl | Modifiers::SHIFT);
+        assert_eq!((e.sel.anchor, e.sel.caret), (Pos::new(0, 11), Pos::new(0, 0)));
+        // ⌃F ⌃B ⌃N ⌃P move like the arrows.
+        e.sel = Selection::caret(Pos::new(0, 0));
+        press(&mut e, Key::F, ctrl);
+        assert_eq!(e.sel.caret, Pos::new(0, 1));
+        press(&mut e, Key::B, ctrl);
+        assert_eq!(e.sel.caret, Pos::new(0, 0));
+        press(&mut e, Key::N, ctrl);
+        assert_eq!(e.sel.caret.block, 1);
+        press(&mut e, Key::P, ctrl);
+        assert_eq!(e.sel.caret.block, 0);
+        // ⌃K twice cuts the rest of the paragraph and its break; ⌃Y puts
+        // both back.
+        e.sel = Selection::caret(Pos::new(0, 5));
+        press(&mut e, Key::K, ctrl);
+        assert_eq!(e.doc.blocks[0].text, "Hello");
+        press(&mut e, Key::K, ctrl);
+        assert_eq!(e.doc.blocks[0].text, "HelloSecond line");
+        assert_eq!(e.kill, " world\n");
+        press(&mut e, Key::Y, ctrl);
+        assert_eq!((e.doc.blocks[0].text.as_str(), e.doc.blocks[1].text.as_str()), ("Hello world", "Second line"));
+        // ⌃T swaps the characters around the caret, at the end the last two.
+        e.sel = Selection::caret(Pos::new(1, 1));
+        press(&mut e, Key::T, ctrl);
+        assert_eq!(e.doc.blocks[1].text, "eScond line");
+        assert_eq!(e.sel.caret, Pos::new(1, 2));
+        e.sel = Selection::caret(Pos::new(1, 11));
+        press(&mut e, Key::T, ctrl);
+        assert_eq!(e.doc.blocks[1].text, "eScond lien");
+        // ⌃D ⌃H delete forward and back.
+        e.sel = Selection::caret(Pos::new(0, 5));
+        press(&mut e, Key::D, ctrl);
+        press(&mut e, Key::H, ctrl);
+        assert_eq!(e.doc.blocks[0].text, "Hellworld");
+        // ⌃O opens a paragraph after the caret, which stays.
+        press(&mut e, Key::O, ctrl);
+        assert_eq!((e.doc.blocks[0].text.as_str(), e.doc.blocks[1].text.as_str()), ("Hell", "world"));
+        assert_eq!(e.sel.caret, Pos::new(0, 4));
+        // ⌥↓ ⌥↑: paragraph by paragraph.
+        e.sel = Selection::caret(Pos::new(0, 2));
+        press(&mut e, Key::ArrowDown, Modifiers::ALT);
+        assert_eq!(e.sel.caret, Pos::new(0, 4));
+        press(&mut e, Key::ArrowDown, Modifiers::ALT);
+        assert_eq!(e.sel.caret, Pos::new(1, 5));
+        press(&mut e, Key::ArrowUp, Modifiers::ALT);
+        assert_eq!(e.sel.caret, Pos::new(1, 0));
+        press(&mut e, Key::ArrowUp, Modifiers::ALT);
+        assert_eq!(e.sel.caret, Pos::new(0, 0));
+        // ⌘⌫ deletes to the line's start (no layout: the paragraph's).
+        e.sel = Selection::caret(Pos::new(1, 3));
+        press(&mut e, Key::Backspace, Modifiers::MAC_CMD);
+        assert_eq!(e.doc.blocks[1].text, "ld");
+        press(&mut e, Key::Delete, Modifiers::MAC_CMD);
+        assert_eq!(e.doc.blocks[1].text, "");
+        // Home and Page Down scroll, leaving the caret.
+        e.sel = Selection::caret(Pos::new(0, 2));
+        press(&mut e, Key::Home, Modifiers::NONE);
+        press(&mut e, Key::PageDown, Modifiers::NONE);
+        assert_eq!(e.scroll_request, Some(KeyScroll::Page(1)));
+        assert_eq!(e.sel.caret, Pos::new(0, 2));
+        // ⌘ shortcuts aren't these.
+        assert_eq!(e.mac_key(Key::A, Modifiers::MAC_CMD, &opts, &ctx), None);
+    }
+
 }
