@@ -890,7 +890,7 @@ impl Library {
         if let Some(f) = self.store.folder(id).cloned() {
             if let Some(remote_id) = f.sync.remote_id.clone() {
                 let path = f.sync.synced_path.clone().unwrap_or_else(|| self.store.folder_path(id));
-                self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
+                self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None, note_id: None });
             }
             self.store.folders.retain(|o| o.id != id);
             self.settings.collapsed.retain(|c| c != id && *c != f.account && c != default);
