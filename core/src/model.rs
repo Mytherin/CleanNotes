@@ -274,6 +274,9 @@ impl Store {
                 f.default = false;
                 f.name = unique.clone();
                 f.parent = None;
+                // Its place was among the old account's folders: it goes
+                // after the local account's own.
+                f.position = None;
             } else if f.parent.is_none() {
                 f.parent = Some(top.clone());
             }

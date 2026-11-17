@@ -416,6 +416,8 @@ mod tests {
         let sn = "sn1";
         let mut notes_folder = Folder::default_for(sn);
         notes_folder.sync.remote_id = Some("r-notes".into());
+        // Put first among its account's folders by dragging.
+        notes_folder.position = Some(0);
         let work = Folder::new(sn, None, "Work");
         let sub = Folder::new(sn, Some(&work.id), "2026");
         let mut a = Note::new(sn, &notes_folder.id, "# A\n");
@@ -443,6 +445,10 @@ mod tests {
         assert!(store.notes.iter().all(|n| n.account == LOCAL));
         let path = |id: &str| store.folder_path(&store.note(id).unwrap().folder);
         assert_eq!(path(&ia), vec!["Standard Notes 2"]);
+        // After the local account's own folders, not above its Notes.
+        let top: Vec<String> = store.child_folders(LOCAL, None).iter().map(|f| f.name.clone()).collect();
+        assert_eq!(top.first().map(String::as_str), Some("Notes"), "{top:?}");
+        assert_eq!(top.last().map(String::as_str), Some("Standard Notes 2"), "{top:?}");
         assert_eq!(path(&ib), vec!["Standard Notes 2", "Work", "2026"]);
         assert!(store.note(&ia).unwrap().sync.remote_id.is_none(), "nothing left to sync");
         assert!(store.folders.iter().all(|f| f.account == LOCAL && f.sync.remote_id.is_none()));
