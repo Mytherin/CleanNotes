@@ -521,8 +521,13 @@ impl App {
     /// Finishes naming a folder (a name that's taken says so instead).
     pub fn finish_rename(&mut self) {
         let Some(r) = self.rename.take() else { return };
-        if let Err(msg) = self.lib.rename_folder(&r.folder, &r.text) {
-            self.push_notice(msg);
+        match self.lib.rename_folder(&r.folder, &r.text) {
+            Err(msg) => self.push_notice(msg),
+            // Named after the deleted "Notes" folder, which came back instead.
+            Ok(id) if id != r.folder && matches!(&self.location, Location::Folder(l) if *l == r.folder) => {
+                self.go_to(Location::Folder(id));
+            }
+            Ok(_) => {}
         }
     }
 
