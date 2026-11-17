@@ -5,7 +5,7 @@
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, RichText, Ui, Vec2};
 
-use super::{modal, App};
+use super::{modal, App, Pane};
 use crate::editor::Editor;
 use crate::icons::{self, Icon};
 use crate::theme::{self, Palette};
@@ -141,12 +141,17 @@ impl App {
             egui::TextEdit::singleline(&mut self.lock.typed).password(true).hint_text("Password").margin(egui::vec2(8.0, 6.0)),
         );
         if self.lock.focus {
-            // Searching all notes can land on a locked note: typing goes on
-            // in the search field rather than jumping to the password.
-            if !ui.memory(|m| m.has_focus(super::search_field_id())) {
+            // Going through the list with ↑/↓ (or searching) can land on a
+            // locked note: as in Apple Notes the keys stay with the list (or
+            // the search field) rather than jumping to the password.
+            // Return or Tab in the list moves here.
+            if self.focus == Pane::Note && !ui.memory(|m| m.has_focus(super::search_field_id())) {
                 te.request_focus();
             }
             self.lock.focus = false;
+        }
+        if te.gained_focus() {
+            self.focus = Pane::Note;
         }
         let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
         let btn = Rect::from_center_size(c + Vec2::new(0.0, 166.0), Vec2::new(120.0, 30.0));
@@ -477,6 +482,52 @@ mod tests {
         assert!(!app.has_unlocked() && app.is_closed(&id));
         assert!(app.editor.is_none());
         assert!(app.lock.sheet.is_none(), "no password left in an open sheet");
+    }
+
+    /// One frame of the keys and the note pane (the lock screen).
+    fn run_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        let raw = egui::RawInput { events, ..Default::default() };
+        let _ = ctx.run(raw, |ctx| {
+            app.shortcuts(ctx);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(id) = app.selected.clone().filter(|s| app.is_closed(s)) {
+                    let p = Palette::get(ctx);
+                    let area = ui.max_rect();
+                    app.lock_screen(ui, &p, area, &id);
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn arrows_go_on_through_the_list_past_a_locked_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, a) = app_with_note(dir.path(), "# A\n");
+        set_password(&mut app, &a, "pw");
+        let folder = app.lib.default_folder_id(crate::model::LOCAL);
+        let n = Note::new(crate::model::LOCAL, &folder, "# B\n");
+        let b = n.id.clone();
+        app.lib.store.notes.push(n);
+        app.lock_now();
+        app.shown = vec![a.clone(), b.clone()];
+        app.select(Some(a.clone()));
+        app.focus = Pane::List;
+        let down = egui::Event::Key { key: Key::ArrowDown, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        // The locked note shows its lock screen without taking the keys…
+        run_frame(&mut app, &ctx, vec![]);
+        run_frame(&mut app, &ctx, vec![]);
+        assert!(!ctx.wants_keyboard_input(), "the password field mustn't take focus");
+        // …so ↓ goes on to the next note.
+        run_frame(&mut app, &ctx, vec![down]);
+        assert_eq!(app.selected.as_deref(), Some(b.as_str()));
+        // Return in the list goes to the password field.
+        app.select(Some(a.clone()));
+        let enter = egui::Event::Key { key: Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        run_frame(&mut app, &ctx, vec![enter]);
+        run_frame(&mut app, &ctx, vec![]);
+        assert!(app.focus == Pane::Note && ctx.wants_keyboard_input(), "Return opens the password field");
     }
 
     #[test]

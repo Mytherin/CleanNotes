@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Align2, Key, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{capsule_item, glass, glass_button, menu_look, popover_frame, submenu, tool_button};
+use super::sidebar::{capsule_item, glass, glass_button, popover_below, popover_frame, submenu, tool_button};
 use super::{modal, note_header_time, App, Confirm, Pane, TOOLBAR_H};
 use crate::doc::{Attr, Kind};
 use crate::editor::pdfs::{Pdf, Res};
@@ -261,30 +261,27 @@ impl App {
         if resp.clicked() {
             ui.memory_mut(|m| m.toggle_popup(id));
         }
-        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-            popover_frame(ui, p).show(ui, |ui| {
-                menu_look(ui, p);
-                ui.set_min_width(200.0);
-                let mut close = false;
-                if !open {
-                    if ui.button("Lock Note").clicked() {
-                        self.lock_note(&note.id);
-                        close = true;
-                    }
-                } else {
-                    if ui.button("Close All Locked Notes").clicked() {
-                        self.lock_now();
-                        close = true;
-                    }
-                    if ui.button("Remove Lock").clicked() {
-                        self.remove_lock(&note.id);
-                        close = true;
-                    }
+        popover_below(ui, p, id, &resp, |ui| {
+            ui.set_min_width(200.0);
+            let mut close = false;
+            if !open {
+                if ui.button("Lock Note").clicked() {
+                    self.lock_note(&note.id);
+                    close = true;
                 }
-                if close {
-                    ui.memory_mut(|m| m.close_popup());
+            } else {
+                if ui.button("Close All Locked Notes").clicked() {
+                    self.lock_now();
+                    close = true;
                 }
-            });
+                if ui.button("Remove Lock").clicked() {
+                    self.remove_lock(&note.id);
+                    close = true;
+                }
+            }
+            if close {
+                ui.memory_mut(|m| m.close_popup());
+            }
         });
     }
 
@@ -302,15 +299,12 @@ impl App {
         if resp.clicked() {
             ui.memory_mut(|m| m.toggle_popup(id));
         }
-        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-            popover_frame(ui, p).show(ui, |ui| {
-                menu_look(ui, p);
-                ui.set_min_width(200.0);
-                if ui.button(&label).clicked() {
-                    self.lock_notes(&ids);
-                    ui.memory_mut(|m| m.close_popup());
-                }
-            });
+        popover_below(ui, p, id, &resp, |ui| {
+            ui.set_min_width(200.0);
+            if ui.button(&label).clicked() {
+                self.lock_notes(&ids);
+                ui.memory_mut(|m| m.close_popup());
+            }
         });
     }
 
@@ -322,82 +316,79 @@ impl App {
         }
         let Some(note) = self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned()) else { return };
         let ids = vec![note.id.clone()];
-        egui::popup_below_widget(ui, id, resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-            popover_frame(ui, p).show(ui, |ui| {
-                menu_look(ui, p);
-                ui.set_min_width(220.0);
-                let mut close = false;
-                if note.deleted.is_some() {
-                    if ui.button("Recover Note").clicked() {
-                        self.recover_note(&note.id);
+        popover_below(ui, p, id, resp, |ui| {
+            ui.set_min_width(220.0);
+            let mut close = false;
+            if note.deleted.is_some() {
+                if ui.button("Recover Note").clicked() {
+                    self.recover_note(&note.id);
+                    close = true;
+                }
+                if ui.button("Delete Permanently…").clicked() {
+                    self.confirm = Some(Confirm::DeleteNotesForever(ids.clone()));
+                    close = true;
+                }
+            } else {
+                if ui.button(if note.pinned { "Unpin Note" } else { "Pin Note" }).clicked() {
+                    self.toggle_pin(&note.id);
+                    close = true;
+                }
+                if !self.is_locked(&note.id) {
+                    if ui.button("Lock Note").clicked() {
+                        self.lock_note(&note.id);
                         close = true;
                     }
-                    if ui.button("Delete Permanently…").clicked() {
-                        self.confirm = Some(Confirm::DeleteNotesForever(ids.clone()));
+                } else if !self.is_closed(&note.id) {
+                    if ui.button("Lock Now").clicked() {
+                        self.lock_now();
                         close = true;
                     }
-                } else {
-                    if ui.button(if note.pinned { "Unpin Note" } else { "Pin Note" }).clicked() {
-                        self.toggle_pin(&note.id);
-                        close = true;
-                    }
-                    if !self.is_locked(&note.id) {
-                        if ui.button("Lock Note").clicked() {
-                            self.lock_note(&note.id);
-                            close = true;
-                        }
-                    } else if !self.is_closed(&note.id) {
-                        if ui.button("Lock Now").clicked() {
-                            self.lock_now();
-                            close = true;
-                        }
-                        if ui.button("Remove Lock").clicked() {
-                            self.remove_lock(&note.id);
-                            close = true;
-                        }
-                    }
-                    ui.separator();
-                    if ui.add_enabled(self.can_attach(), egui::Button::new("Attach Image…")).clicked() {
-                        ui.memory_mut(|m| m.close_popup());
-                        self.choose_images();
-                    }
-                    if ui.add_enabled(self.can_attach(), egui::Button::new("Attach File…")).clicked() {
-                        ui.memory_mut(|m| m.close_popup());
-                        self.choose_files();
-                    }
-                    if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
-                        if let Some(e) = &mut self.editor {
-                            e.find.open = true;
-                            e.find.focus = true;
-                        }
-                        close = true;
-                    }
-                    submenu(ui, p, "Move to", |ui| self.move_to_menu(ui, &ids));
-                    if ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
-                        self.duplicate_note(&note.id);
-                        close = true;
-                    }
-                    let plain = self.plain_body(&note.id);
-                    if ui.add_enabled(plain.is_some(), egui::Button::new("Copy as Markdown")).clicked() {
-                        ui.ctx().copy_text(plain.unwrap_or_default());
-                        close = true;
-                    }
-                    ui.separator();
-                    if ui.add(egui::Button::new("Delete Note").shortcut_text(cmd_key!("Backspace"))).clicked() {
-                        self.delete_notes(ids.clone());
+                    if ui.button("Remove Lock").clicked() {
+                        self.remove_lock(&note.id);
                         close = true;
                     }
                 }
                 ui.separator();
-                let label = if self.markdown_mode { "Edit as Rich Text" } else { "Edit as Markdown" };
-                if ui.add(egui::Button::new(label).shortcut_text(cmd_key!("Shift+E"))).clicked() {
-                    self.toggle_markdown_mode();
+                if ui.add_enabled(self.can_attach(), egui::Button::new("Attach Image…")).clicked() {
+                    ui.memory_mut(|m| m.close_popup());
+                    self.choose_images();
+                }
+                if ui.add_enabled(self.can_attach(), egui::Button::new("Attach File…")).clicked() {
+                    ui.memory_mut(|m| m.close_popup());
+                    self.choose_files();
+                }
+                if ui.add(egui::Button::new("Find in Note").shortcut_text(cmd_key!("F"))).clicked() {
+                    if let Some(e) = &mut self.editor {
+                        e.find.open = true;
+                        e.find.focus = true;
+                    }
                     close = true;
                 }
-                if close {
-                    ui.memory_mut(|m| m.close_popup());
+                submenu(ui, p, "Move to", |ui| self.move_to_menu(ui, &ids));
+                if ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
+                    self.duplicate_note(&note.id);
+                    close = true;
                 }
-            });
+                let plain = self.plain_body(&note.id);
+                if ui.add_enabled(plain.is_some(), egui::Button::new("Copy as Markdown")).clicked() {
+                    ui.ctx().copy_text(plain.unwrap_or_default());
+                    close = true;
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Delete Note").shortcut_text(cmd_key!("Backspace"))).clicked() {
+                    self.delete_notes(ids.clone());
+                    close = true;
+                }
+            }
+            ui.separator();
+            let label = if self.markdown_mode { "Edit as Rich Text" } else { "Edit as Markdown" };
+            if ui.add(egui::Button::new(label).shortcut_text(cmd_key!("Shift+E"))).clicked() {
+                self.toggle_markdown_mode();
+                close = true;
+            }
+            if close {
+                ui.memory_mut(|m| m.close_popup());
+            }
         });
     }
 
