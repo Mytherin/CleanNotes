@@ -139,7 +139,11 @@ impl App {
             egui::TextEdit::singleline(&mut self.lock.typed).password(true).hint_text("Password").margin(egui::vec2(8.0, 6.0)),
         );
         if self.lock.focus {
-            te.request_focus();
+            // Searching all notes can land on a locked note: typing goes on
+            // in the search field rather than jumping to the password.
+            if !ui.memory(|m| m.has_focus(super::search_field_id())) {
+                te.request_focus();
+            }
             self.lock.focus = false;
         }
         let enter = te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));

@@ -400,7 +400,7 @@ impl App {
         let te_rect = Rect::from_min_max(Pos2::new(r.left() + 34.0, r.top() + 7.0), Pos2::new(r.right() - 28.0, r.bottom() - 7.0));
         let te = ui.put(
             te_rect,
-            egui::TextEdit::singleline(&mut self.search).hint_text("Search").frame(false).margin(egui::vec2(2.0, 2.0)),
+            egui::TextEdit::singleline(&mut self.search).id(super::search_field_id()).hint_text("Search").frame(false).margin(egui::vec2(2.0, 2.0)),
         );
         if te.lost_focus() && self.search.is_empty() {
             self.search_open = false;
