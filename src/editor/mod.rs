@@ -959,6 +959,35 @@ mod tests {
     }
 
     #[test]
+    fn typing_star_space_starts_a_bulleted_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = images::ImageCache::new(dir.path().to_owned());
+        let mut e = Editor::new("n", "Title\n\n");
+        e.sel = Selection::caret(Pos::new(1, 0));
+        e.focus_requested = true;
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let shift = Modifiers::SHIFT;
+        let key = |key, modifiers| Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers };
+        let frames = [
+            vec![],
+            vec![key(Key::Num8, shift), Event::Text("*".into())],
+            vec![key(Key::Space, Modifiers::NONE), Event::Text(" ".into())],
+        ];
+        for events in frames {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = crate::theme::Palette::get(ctx);
+                    let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache, can_attach: true };
+                    e.show(ui, &p, &opts, "");
+                });
+            });
+        }
+        assert_eq!((e.doc.blocks[1].kind, e.doc.blocks[1].text.as_str()), (Kind::Bulleted, ""));
+    }
+
+    #[test]
     fn pictures_are_laid_out_and_pointed_at() {
         let dir = tempfile::tempdir().unwrap();
         let png = images::png_from_rgba(40, 20, &[200; 40 * 20 * 4]).unwrap();
