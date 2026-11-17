@@ -1,8 +1,11 @@
 # Builds CleanNotes for Windows, macOS and the iPhone, with downloads:
 #
+# It runs when a tag like v0.2.0 is pushed (git tag v0.2.0 && git push
+# origin v0.2.0), or by hand from Actions → Build → Run workflow.
+#
 # - Every run: the builds are artifacts of the run (Actions → the run →
 #   Artifacts).
-# - A tag like v0.2.0: they're also attached to a GitHub release.
+# - A tag: they're also attached to a GitHub release.
 #
 # Nothing is signed with an Apple certificate: the Mac app is signed ad hoc
 # (open it with right-click → Open the first time), and the iPhone app is an
@@ -12,9 +15,7 @@ name: Build
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
-  pull_request:
   workflow_dispatch:
 
 permissions:

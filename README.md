@@ -36,7 +36,7 @@ On Windows, `build.rs` embeds `assets/CleanNotes.ico` and version information in
 
 ## Downloads
 
-The [Build workflow](.github/workflows/build.yml) builds every push to `main` on GitHub Actions; the builds are the run's artifacts (Actions → the run → Artifacts). Pushing a tag like `v0.2.0` also attaches them to a GitHub release.
+The [Build workflow](.github/workflows/build.yml) runs on GitHub Actions when a tag like `v0.2.0` is pushed (`git tag v0.2.0 && git push origin v0.2.0`), or by hand from Actions → Build → Run workflow. The builds are the run's artifacts (Actions → the run → Artifacts), and a tag's are also attached to a GitHub release.
 
 - **Windows:** `CleanNotes.exe`, nothing to install.
 - **macOS:** `CleanNotes.dmg` with the app for Apple silicon and Intel Macs (`macos/make-app.sh` makes it on a Mac). It isn't signed with an Apple Developer ID, so the first time, open it with right-click → Open.
@@ -58,7 +58,7 @@ open CleanNotes.xcodeproj  # choose your team under Signing, then Run
 
 Run `build-rust.sh` once before `xcodegen`, since the project includes the generated `Generated/cleannotes_ffi.swift`. After that, Xcode runs the script before every build: a debug Rust build for Debug and a release build for Release. Set `CLEANNOTES_SEED=1` in the scheme's environment to start with example notes.
 
-**Tests:** ⌘U in Xcode, or `xcodebuild test -project CleanNotes.xcodeproj -scheme CleanNotes -destination 'platform=iOS Simulator,name=iPhone 16'`. `ios/CleanNotesTests` drives the real text view and the Rust engine together, typing as the keyboard does (lists started and ended, Backspace, emoji, undo, checklist commands, list markers, sharing), and checks after each edit that the two agree. The Build workflow runs them on every push and pull request. The engine's side of the same cases is in `cargo test` (`ffi/src/lib.rs`).
+**Tests:** ⌘U in Xcode, or `xcodebuild test -project CleanNotes.xcodeproj -scheme CleanNotes -destination 'platform=iOS Simulator,name=iPhone 16'`. `ios/CleanNotesTests` drives the real text view and the Rust engine together, typing as the keyboard does (lists started and ended, Backspace, emoji, undo, checklist commands, list markers, sharing), and checks after each edit that the two agree. The Build workflow runs them with every build (each tag, or by hand). The engine's side of the same cases is in `cargo test` (`ffi/src/lib.rs`).
 
 ### What it does, as in Apple Notes
 
