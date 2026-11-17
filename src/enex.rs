@@ -482,6 +482,7 @@ impl Converter<'_> {
             image: None,
             code: self.has(&["tt", "code", "kbd", "samp", "pre"]) || self.stack.iter().any(|e| e.mono),
             link: self.stack.iter().rev().find_map(|e| e.link.clone()),
+            link_title: None,
         }
     }
 

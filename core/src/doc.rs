@@ -89,9 +89,53 @@ pub struct Style {
     /// for it).
     pub code: bool,
     pub link: Option<Arc<str>>,
+    /// The link's title (`[text](url "title")`), part of the link. On an
+    /// attached file's link it's how its card is shown: see [`FileView`].
+    pub link_title: Option<Arc<str>>,
     /// An image: the character is [`crate::attachments::OBJECT`], shown as
     /// the attachment of this name.
     pub image: Option<Arc<str>>,
+}
+
+/// How an attached file's card is shown (Apple Notes' View As), kept in
+/// its link's title: `[trip.pdf](attachments/… "small")`. A PDF is
+/// [`FileView::Medium`] unless set; other files are always small.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileView {
+    /// Its name, type and size beside a small picture of it.
+    Small,
+    /// Its pages side by side, scrolled sideways.
+    #[default]
+    Medium,
+    /// Its pages as wide as the note, one at a time.
+    Large,
+}
+
+impl FileView {
+    pub fn from_title(title: Option<&str>) -> FileView {
+        match title.map(str::trim) {
+            Some(t) if t.eq_ignore_ascii_case("small") => FileView::Small,
+            Some(t) if t.eq_ignore_ascii_case("large") => FileView::Large,
+            _ => FileView::Medium,
+        }
+    }
+
+    /// The link title it's kept as (none for the usual view).
+    pub fn title(self) -> Option<&'static str> {
+        match self {
+            FileView::Small => Some("small"),
+            FileView::Medium => None,
+            FileView::Large => Some("large"),
+        }
+    }
+}
+
+/// An attached file's name as shown: no line breaks or objects, trimmed;
+/// `None` if that leaves nothing.
+fn file_label(label: &str) -> Option<String> {
+    let label: String = label.chars().map(|c| if c.is_control() || c == crate::attachments::OBJECT { ' ' } else { c }).collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
 }
 
 /// A character attribute that can be switched on and off.
@@ -496,6 +540,7 @@ impl Doc {
         let mut s = b.styles.get(i).cloned().unwrap_or_default();
         if p.offset == 0 || p.offset == b.len() {
             s.link = None;
+            s.link_title = None;
         }
         // Typing next to an image is text.
         s.image = None;
@@ -516,9 +561,81 @@ impl Doc {
     /// attachment (`attachments/<reference>`). Returns the new caret.
     pub fn insert_file(&mut self, p: Pos, reference: &str, label: &str) -> Pos {
         let style = Style { link: Some(Arc::from(format!("{}{reference}", crate::attachments::URL_PREFIX))), ..Style::default() };
-        let label: String = label.chars().map(|c| if c.is_control() || c == crate::attachments::OBJECT { ' ' } else { c }).collect();
-        let label = if label.trim().is_empty() { "Attachment" } else { label.trim() };
-        self.insert_line_of(p, label, &style)
+        let label = file_label(label).unwrap_or_else(|| "Attachment".to_owned());
+        self.insert_line_of(p, &label, &style)
+    }
+
+    /// If paragraph `block` is an attached file (only a link to it, as
+    /// [`Doc::insert_file`] makes it), the attachment's reference.
+    pub fn file_at(&self, block: usize) -> Option<&str> {
+        let b = self.blocks.get(block)?;
+        if b.kind.is_cell() || b.kind == Kind::Monospaced {
+            return None;
+        }
+        let first = b.styles.first()?;
+        let url = first.link.as_deref()?;
+        if b.styles.iter().any(|s| s.link != first.link || s.link_title != first.link_title || s.image.is_some()) {
+            return None;
+        }
+        crate::attachments::file_link_ref(url)
+    }
+
+    /// How the attached file of paragraph `block` is shown (see
+    /// [`Doc::file_at`]).
+    pub fn file_view(&self, block: usize) -> FileView {
+        let title = self.blocks.get(block).and_then(|b| b.styles.first()).and_then(|s| s.link_title.as_deref());
+        FileView::from_title(title)
+    }
+
+    /// Shows the attached file of paragraph `block` by another name, its
+    /// link kept. Returns the position after it, or `None` if it isn't one
+    /// or the name is empty.
+    pub fn rename_file(&mut self, block: usize, label: &str) -> Option<Pos> {
+        self.file_at(block)?;
+        let label = file_label(label)?;
+        let b = &mut self.blocks[block];
+        let first = &b.styles[0];
+        let style = Style { link: first.link.clone(), link_title: first.link_title.clone(), ..Style::default() };
+        let n = b.len();
+        b.remove(0, n);
+        b.insert(0, &label, &style);
+        Some(Pos::new(block, b.len()))
+    }
+
+    /// Shows the attached file of paragraph `block` as `view`. Whether it
+    /// is one.
+    pub fn set_file_view(&mut self, block: usize, view: FileView) -> bool {
+        if self.file_at(block).is_none() {
+            return false;
+        }
+        let title = view.title().map(Arc::from);
+        for s in &mut self.blocks[block].styles {
+            s.link_title = title.clone();
+        }
+        true
+    }
+
+    /// Removes paragraph `block` (an attachment's), the caret going to the
+    /// start of what follows. Between two tables, or alone, it's emptied
+    /// instead (the tables would join). Returns the new caret.
+    pub fn remove_paragraph(&mut self, block: usize) -> Pos {
+        let cell = |i: Option<usize>| i.and_then(|i| self.blocks.get(i)).is_some_and(|b| b.kind.is_cell());
+        let between_tables = cell(block.checked_sub(1)) && cell(Some(block + 1));
+        if self.blocks.len() == 1 || between_tables || cell(Some(block)) {
+            let b = &mut self.blocks[block];
+            let n = b.len();
+            b.remove(0, n);
+            if !b.kind.is_cell() {
+                b.kind = Kind::Body;
+            }
+            return Pos::new(block, 0);
+        }
+        self.blocks.remove(block);
+        // (There's always a paragraph after a table.)
+        if self.blocks.last().is_some_and(|b| b.kind.is_cell()) {
+            self.blocks.push(Block::default());
+        }
+        Pos::new(block.min(self.blocks.len() - 1), 0)
     }
 
     /// `text` in `style` at `p`, in a body paragraph of its own (below the

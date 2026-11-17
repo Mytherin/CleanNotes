@@ -144,11 +144,12 @@ fn inline_markdown(b: &Block) -> String {
             i += 1;
             continue;
         }
-        if s.link != cur.link {
+        if s.link != cur.link || (s.link.is_some() && s.link_title != cur.link_title) {
             close_all(&mut out, &mut cur);
             if let Some(url) = &s.link {
                 out.push('[');
                 cur.link = Some(url.clone());
+                cur.link_title = s.link_title.clone();
             }
         }
         if s.code {
@@ -240,6 +241,7 @@ fn switch(out: &mut String, cur: &mut Style, to: &Style) {
 
 fn close_all(out: &mut String, cur: &mut Style) {
     let link = cur.link.take();
+    let title = cur.link_title.take();
     switch(out, cur, &Style::default());
     if let Some(url) = link {
         out.push_str("](");
@@ -268,6 +270,16 @@ fn close_all(out: &mut String, cur: &mut Style) {
                 out.push(c);
             }
             out.push('>');
+        }
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            out.push_str(" \"");
+            for c in title.chars() {
+                if matches!(c, '"' | '\\') {
+                    out.push('\\');
+                }
+                out.push(if c == '\n' { ' ' } else { c });
+            }
+            out.push('"');
         }
         out.push(')');
     }
@@ -689,9 +701,10 @@ fn inline_into(b: &mut Block, chars: &[char], style: &mut Style) {
                 i = end;
             }
             '[' => {
-                if let Some((text_end, url, end)) = find_link(chars, i) {
+                if let Some((text_end, url, title, end)) = find_link(chars, i) {
                     let saved = style.clone();
                     style.link = Some(Arc::from(url.as_str()));
+                    style.link_title = title.map(|t| Arc::from(t.as_str()));
                     inline_into(b, &chars[i + 1..text_end], style);
                     // Styles left open inside the link end with it.
                     *style = saved;
@@ -712,14 +725,15 @@ fn inline_into(b: &mut Block, chars: &[char], style: &mut Style) {
 /// For a `!` at `bang` that starts `![…](attachments/<ref>)`: the reference
 /// (a name, or an encrypted picture's name and key) and the index after it.
 fn image_at(chars: &[char], bang: usize) -> Option<(String, usize)> {
-    let (_, url, end) = find_link(chars, bang + 1)?;
+    let (_, url, _, end) = find_link(chars, bang + 1)?;
     let name = url.strip_prefix(crate::attachments::URL_PREFIX)?;
     crate::attachments::is_ref(name).then(|| (name.to_owned(), end))
 }
 
-/// For a `[` at `open`: the index of the matching `]`, the URL, and the
-/// index after the closing `)` — if a whole `[text](url)` starts there.
-fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
+/// For a `[` at `open`: the index of the matching `]`, the URL, its title
+/// if it has one, and the index after the closing `)` — if a whole
+/// `[text](url)` or `[text](url "title")` starts there.
+fn find_link(chars: &[char], open: usize) -> Option<(usize, String, Option<String>, usize)> {
     let mut depth = 0;
     let mut i = open;
     let close = loop {
@@ -757,7 +771,8 @@ fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
             }
             j += 1;
         }
-        return (chars.get(j + 1) == Some(&')')).then_some((close, url, j + 2));
+        let (title, end) = link_title(chars, j + 1)?;
+        return Some((close, url, title, end));
     }
     let mut parens = 0;
     loop {
@@ -765,6 +780,7 @@ fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
             ')' if parens == 0 => break,
             ')' => parens -= 1,
             '(' => parens += 1,
+            ' ' if parens == 0 && !url.is_empty() => break,
             ' ' => return None,
             _ => {}
         }
@@ -772,7 +788,43 @@ fn find_link(chars: &[char], open: usize) -> Option<(usize, String, usize)> {
         j += 1;
     }
     // Kept as written: a URL may well hold "%20" itself.
-    Some((close, url, j + 1))
+    let (title, end) = link_title(chars, j)?;
+    Some((close, url, title, end))
+}
+
+/// After a link's URL, at `at`: its title (`"…"`, with `\` escapes) if it
+/// has one, and the index after the closing `)`. `None` if something else
+/// is there.
+fn link_title(chars: &[char], at: usize) -> Option<(Option<String>, usize)> {
+    let mut j = at;
+    while chars.get(j) == Some(&' ') {
+        j += 1;
+    }
+    if chars.get(j) == Some(&')') {
+        return Some((None, j + 1));
+    }
+    if j == at || chars.get(j) != Some(&'"') {
+        return None;
+    }
+    let mut title = String::new();
+    j += 1;
+    loop {
+        match *chars.get(j)? {
+            '"' => break,
+            '\\' if chars.get(j + 1).is_some_and(|c| c.is_ascii_punctuation()) => {
+                title.push(chars[j + 1]);
+                j += 2;
+                continue;
+            }
+            c => title.push(c),
+        }
+        j += 1;
+    }
+    j += 1;
+    while chars.get(j) == Some(&' ') {
+        j += 1;
+    }
+    (chars.get(j) == Some(&')')).then_some((Some(title), j + 1))
 }
 
 /// The note's title: its first line with text, without markup.
@@ -1148,6 +1200,22 @@ mod tests {
             d.blocks.push(around);
             doc_round_trip(&d);
         }
+    }
+
+    #[test]
+    fn link_titles_round_trip() {
+        round_trip("[a](https://x.y \"Home\") and [b](<a b> \"say \\\"hi\\\"\") and [c](https://x.y)\n");
+        let b = &parse_inline("[go](http://a.b  \"t\" ) now");
+        assert_eq!((b.styles[0].link.as_deref(), b.styles[0].link_title.as_deref()), (Some("http://a.b"), Some("t")));
+        assert_eq!((b.styles[1].link_title.as_deref(), b.styles[3].link_title.as_deref()), (Some("t"), None));
+        assert_eq!(b.text, "go now");
+        // Not a title: not a link.
+        assert_eq!(parse_inline("[go](http://a.b c)").text, "[go](http://a.b c)");
+        assert_eq!(parse_inline("[go](http://a.b \"c)").text, "[go](http://a.b \"c)");
+        // Same address, another title: two links.
+        let st = |t: Option<&str>| Style { link: Some(Arc::from("u")), link_title: t.map(Arc::from), ..Style::default() };
+        let b = Block::styled(Kind::Body, &[("a", st(Some("x"))), ("b", st(None))]);
+        assert_eq!(to_markdown(&Doc::new(vec![b])), "[a](u \"x\")[b](u)\n");
     }
 
     #[test]

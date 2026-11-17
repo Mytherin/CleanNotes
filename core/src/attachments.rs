@@ -251,7 +251,8 @@ fn ref_spans(md: &str) -> Vec<(std::ops::Range<usize>, &str)> {
     let mut from = 0;
     while let Some(i) = md[from..].find(&needle) {
         let start = from + i + needle.len();
-        let len = md[start..].find(')').unwrap_or(md.len() - start);
+        // (Up to the `)`, or the space before a title: `… "small")`.)
+        let len = md[start..].find([')', ' ']).unwrap_or(md.len() - start);
         let r = &md[start..start + len];
         if is_ref(r) {
             out.push((start..start + len, r));

@@ -61,6 +61,13 @@ pub enum Command {
     /// already, and the name to show) at the caret, in place of the
     /// selection: a link to it on a line of its own.
     InsertFile { reference: String, label: String },
+    /// The attached file of paragraph `block` (see
+    /// [`crate::doc::Doc::file_at`]): removed, with its line.
+    DeleteFile { block: usize },
+    /// …: shown by another name (Rename Attachment).
+    RenameFile { block: usize, label: String },
+    /// …: shown as `view` (View As).
+    SetFileView { block: usize, view: crate::doc::FileView },
 }
 
 /// Text from outside (typed, pasted from another app) can't hold images:
@@ -518,7 +525,10 @@ impl Editing {
                         self.sel = Selection::caret(end);
                     }
                 } else {
-                    self.doc.restyle(self.sel.start(), self.sel.end(), |s| s.link = url.clone());
+                    self.doc.restyle(self.sel.start(), self.sel.end(), |s| {
+                        s.link = url.clone();
+                        s.link_title = None;
+                    });
                 }
             }
             Command::Undo => self.undo(),
@@ -553,6 +563,30 @@ impl Editing {
                 let at = self.delete_selection();
                 let p = self.doc.insert_file(at, &reference, &label);
                 self.sel = Selection::caret(p);
+            }
+            Command::DeleteFile { block } => {
+                if self.doc.file_at(block).is_none() {
+                    return;
+                }
+                self.checkpoint(None);
+                let p = self.doc.remove_paragraph(block);
+                self.sel = Selection::caret(p);
+            }
+            Command::RenameFile { block, label } => {
+                let mut renamed = self.doc.clone();
+                if let Some(p) = renamed.rename_file(block, &label) {
+                    if renamed.blocks[block] != self.doc.blocks[block] {
+                        self.checkpoint(None);
+                        self.doc = renamed;
+                        self.sel = Selection::caret(p);
+                    }
+                }
+            }
+            Command::SetFileView { block, view } => {
+                if self.doc.file_at(block).is_some() && self.doc.file_view(block) != view {
+                    self.checkpoint(None);
+                    self.doc.set_file_view(block, view);
+                }
             }
             Command::AddRowAbove
             | Command::AddRowBelow
@@ -782,7 +816,7 @@ impl Editing {
         self.checkpoint(None);
         let style = self.doc.style_at(self.sel.start());
         let at = self.delete_selection();
-        let end = self.doc.insert(at, &text, &Style { link: None, ..style });
+        let end = self.doc.insert(at, &text, &Style { link: None, link_title: None, ..style });
         self.sel = Selection::caret(end);
     }
 
@@ -1102,6 +1136,48 @@ mod tests {
         // A name that isn't an attachment's does nothing.
         e.command(Command::InsertFile { reference: "../x.pdf".into(), label: "x".into() });
         assert!(e.take_markdown().is_none());
+    }
+
+    #[test]
+    fn attached_files_are_viewed_renamed_and_deleted() {
+        use crate::doc::FileView;
+        let name = crate::attachments::name_for(b"%PDF", "pdf");
+        let mut e = Editing::new("n", &format!("# Trip\n[pass.pdf](attachments/{name})\nafter\n"));
+        assert_eq!(e.doc.file_at(1), Some(name.as_str()));
+        assert_eq!((e.doc.file_at(0), e.doc.file_at(2)), (None, None));
+        assert_eq!(e.doc.file_view(1), FileView::Medium);
+
+        // View As: kept in the link's title, which syncs with the note.
+        e.command(Command::SetFileView { block: 1, view: FileView::Small });
+        let md = e.take_markdown().unwrap();
+        assert_eq!(md, format!("# Trip\n[pass.pdf](attachments/{name} \"small\")\nafter\n"));
+        assert_eq!(crate::attachments::refs_in(&md), vec![name.clone()]);
+        assert_eq!(Editing::new("n", &md).doc.file_view(1), FileView::Small);
+        e.command(Command::SetFileView { block: 1, view: FileView::Small });
+        assert!(e.take_markdown().is_none(), "no change, no undo step");
+
+        // Rename: the link (and its view) kept; an empty name does nothing.
+        e.command(Command::RenameFile { block: 1, label: " Boarding \"pass\"\n.pdf ".into() });
+        let md = e.take_markdown().unwrap();
+        assert_eq!(md, format!("# Trip\n[Boarding \"pass\" .pdf](attachments/{name} \"small\")\nafter\n"));
+        assert_eq!(e.sel, Selection::caret(Pos::new(1, 20)));
+        e.command(Command::RenameFile { block: 1, label: "  ".into() });
+        e.command(Command::RenameFile { block: 2, label: "x".into() });
+        assert!(e.take_markdown().is_none());
+
+        // Delete: the line goes; undo brings it back as it was.
+        e.command(Command::DeleteFile { block: 1 });
+        assert_eq!(e.take_markdown().unwrap(), "# Trip\nafter\n");
+        assert_eq!(e.sel, Selection::caret(Pos::new(1, 0)));
+        e.command(Command::Undo);
+        assert_eq!(e.take_markdown().unwrap(), md);
+        e.command(Command::DeleteFile { block: 0 });
+        assert!(e.take_markdown().is_none(), "not an attachment");
+
+        // Typing after it isn't part of the link, nor its title.
+        e.set_caret(Pos::new(1, e.doc.blocks[1].len()), false);
+        e.insert_text("!");
+        assert!(e.take_markdown().unwrap().contains(" \"small\")!\n"));
     }
 
     #[test]
