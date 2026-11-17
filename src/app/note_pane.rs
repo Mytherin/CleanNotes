@@ -112,6 +112,7 @@ impl App {
             read_only,
             highlight: &highlight,
             images: &self.images,
+            pdfs: &self.pdfs,
             can_attach,
         };
         let Some(editor) = &mut self.editor else { return };

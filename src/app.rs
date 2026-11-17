@@ -13,6 +13,7 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use crate::db::{self, Secrets};
 use crate::doc::Kind;
 use crate::editor::images::ImageCache;
+use crate::editor::pdfs::PdfCache;
 use crate::editor::{Command, Editor};
 use crate::settings::{ListView, Settings};
 use crate::theme::{self, Palette};
@@ -99,6 +100,7 @@ pub struct App {
     sections_cache: Option<(u64, Vec<(String, Vec<String>)>)>,
     /// Pictures in notes, loaded.
     pub images: ImageCache,
+    pub pdfs: PdfCache,
 }
 
 impl App {
@@ -136,6 +138,7 @@ impl App {
     fn with(lib: Library) -> Self {
         App {
             images: ImageCache::new(lib.attachments_dir()),
+            pdfs: PdfCache::new(lib.attachments_dir()),
             lib,
             location: Location::Folder(String::new()),
             selected: None,
@@ -668,6 +671,7 @@ impl App {
         }
         if ticked.attachments {
             self.images.retry_missing();
+            self.pdfs.retry_missing();
         }
         // Checked (in `tick`) before this frame's input counts: coming back
         // to a window left minimized for an hour brings input with it.

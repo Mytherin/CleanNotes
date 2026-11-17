@@ -111,6 +111,7 @@ impl App {
     pub(super) fn after_lock_now(&mut self) {
         let any = self.editor.as_ref().is_some_and(|e| self.lib.is_locked(&e.note_id));
         self.images.forget_sealed();
+        self.pdfs.forget_sealed();
         self.lock.typed.clear();
         self.lock.error = None;
         // A password sheet left open mustn't stay filled in.
