@@ -364,7 +364,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                let label = if self.markdown_mode { "✓  Edit as Markdown" } else { "Edit as Markdown" };
+                let label = if self.markdown_mode { "Edit as Rich Text" } else { "Edit as Markdown" };
                 if ui.add(egui::Button::new(label).shortcut_text(cmd_key!("Shift+E"))).clicked() {
                     self.toggle_markdown_mode();
                     close = true;
