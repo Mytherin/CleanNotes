@@ -233,6 +233,29 @@ pub struct Store {
     pub folders: Vec<Folder>,
     pub notes: Vec<Note>,
     pub tombstones: Vec<Tombstone>,
+    /// Where each note is in `notes`, so [`Store::note`] isn't a scan.
+    pub index: NoteIndex,
+}
+
+/// A hint of where each note is in [`Store::notes`]. `notes` is changed in
+/// many places, so it's never trusted: a position is used only if the note
+/// there has the id, and the hint is redone when it's found out of date.
+/// (The notes list looks up every note every frame; with thousands of
+/// notes, scanning for each made a frame take 30 ms, and an idle window
+/// use 12% of a CPU.)
+#[derive(Default)]
+pub struct NoteIndex(std::sync::Mutex<std::collections::HashMap<String, usize>>);
+
+impl Clone for NoteIndex {
+    fn clone(&self) -> Self {
+        NoteIndex::default()
+    }
+}
+
+impl std::fmt::Debug for NoteIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NoteIndex")
+    }
 }
 
 impl Store {
@@ -346,11 +369,27 @@ impl Store {
     }
 
     pub fn note(&self, id: &str) -> Option<&Note> {
-        self.notes.iter().find(|n| n.id == id)
+        self.note_position(id).map(|i| &self.notes[i])
     }
 
     pub fn note_mut(&mut self, id: &str) -> Option<&mut Note> {
-        self.notes.iter_mut().find(|n| n.id == id)
+        self.note_position(id).map(|i| &mut self.notes[i])
+    }
+
+    /// Where the note is in `notes` (the first, as a scan would find).
+    fn note_position(&self, id: &str) -> Option<usize> {
+        let mut index = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = index.get(id) {
+            if self.notes.get(i).is_some_and(|n| n.id == id) {
+                return Some(i);
+            }
+        }
+        let i = self.notes.iter().position(|n| n.id == id)?;
+        index.clear();
+        for (i, n) in self.notes.iter().enumerate().rev() {
+            index.insert(n.id.clone(), i);
+        }
+        Some(i)
     }
 
     pub fn default_folder(&self, account: &str) -> Option<&Folder> {
@@ -503,7 +542,7 @@ impl Store {
 
     /// Deletes a note for good, leaving a tombstone if its backend has it.
     pub fn purge_note(&mut self, id: &str) -> Option<Note> {
-        let i = self.notes.iter().position(|n| n.id == id)?;
+        let i = self.note_position(id)?;
         let n = self.notes.remove(i);
         self.forget_note(&n);
         Some(n)

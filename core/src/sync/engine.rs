@@ -80,7 +80,7 @@ impl AccountSnapshot {
     }
 
     fn as_store(&self) -> Store {
-        Store { accounts: vec![], folders: self.folders.clone(), notes: self.notes.clone(), tombstones: vec![] }
+        Store { accounts: vec![], folders: self.folders.clone(), notes: self.notes.clone(), tombstones: vec![], ..Default::default() }
     }
 
     /// Anything to upload.

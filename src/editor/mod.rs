@@ -983,7 +983,10 @@ impl Editor {
         }
         if let Some(r) = self.caret_rect(self.sel.caret) {
             let r = Rect::from_min_size(r.min, Vec2::new(2.0, r.height()));
-            if focused {
+            // In a window that isn't active the caret isn't shown (as on
+            // the Mac), so nothing is drawn again just to blink it.
+            let active_window = ui.input(|i| i.focused);
+            if focused && active_window {
                 let since = now - self.last_activity;
                 let visible = since < 0.5 || (since * 1.0).fract() < 0.55;
                 if visible {
