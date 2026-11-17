@@ -1105,7 +1105,8 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, p: &Palette, add: impl FnOnce(&mu
                 .inner_margin(egui::Margin::same(18.0))
                 .rounding(12.0),
         )
-        .show(ctx, add)
+        // A tall sheet (the S3 form) scrolls in a small window.
+        .show(ctx, |ui| egui::ScrollArea::vertical().max_height((screen.height() - 80.0).max(100.0)).show(ui, add).inner)
         .and_then(|r| r.inner)
 }
 
