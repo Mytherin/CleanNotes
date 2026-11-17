@@ -31,8 +31,11 @@ struct LockedNoteView: View {
                     .foregroundStyle(.red)
                     .multilineTextAlignment(.center)
             }
+            // A plain yellow text button, as in Apple Notes (not a filled one).
             Button("View Note") { viewNote() }
-                .buttonStyle(.borderedProminent)
+                .font(.body.weight(.semibold))
+                .buttonStyle(.borderless)
+                .tint(Color.notesAccent)
                 .padding(.top, 6)
             Spacer()
             Spacer()
