@@ -5,3 +5,7 @@
 xcuserdata/
 DerivedData/
 /xcbuild/
+# Made by XcodeGen from project.yml.
+/CleanNotes/CleanNotes.entitlements
+/CleanNotesShare/Info.plist
+/CleanNotesShare/CleanNotesShare.entitlements

@@ -98,6 +98,14 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
           mkdir -p ../dist/Payload
           cp -R xcbuild/Release-iphoneos/CleanNotes.app ../dist/Payload/
+          # Signed ad hoc with its entitlements (the App Group the app and its
+          # share extension share), so the tools that sign it again with an
+          # Apple ID (Sideloadly, AltStore) know to give it that group. The
+          # extension first, then the app around it.
+          codesign --force --sign - --entitlements CleanNotesShare/CleanNotesShare.entitlements \
+            ../dist/Payload/CleanNotes.app/PlugIns/CleanNotesShare.appex
+          codesign --force --sign - --entitlements CleanNotes/CleanNotes.entitlements \
+            ../dist/Payload/CleanNotes.app
           (cd ../dist && zip -qr CleanNotes-unsigned.ipa Payload && rm -rf Payload)
       - name: Build for the iOS Simulator
         working-directory: ios

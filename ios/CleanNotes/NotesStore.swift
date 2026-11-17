@@ -67,6 +67,9 @@ final class NotesStore: ObservableObject {
 
     /// The app came to the foreground.
     func becameActive() {
+        // What was shared from other apps while away.
+        importShared()
+        writeShareCatalog()
         tick()
         core.syncAll()
         timer?.invalidate()
@@ -80,6 +83,8 @@ final class NotesStore: ObservableObject {
     func resignedActive() {
         saveEditor()
         core.saveNow()
+        // The share extension lists the notes as they are now.
+        writeShareCatalog()
         timer?.invalidate()
         timer = nil
     }
