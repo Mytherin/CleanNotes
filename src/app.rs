@@ -822,7 +822,13 @@ impl App {
             ),
             Confirm::RemoveAccount(id) => (
                 format!("Remove the account “{}”?", store.account(id).map_or("", |a| a.name.as_str())),
-                "Its notes are removed from this computer. They stay where they're synced to.".to_owned(),
+                if id == crate::model::LOCAL {
+                    let n = self.lib.account_note_count(id);
+                    let notes = if n == 1 { "Its 1 note is".to_owned() } else { format!("Its {n} notes are") };
+                    format!("{notes} deleted for good: they're only on this computer. You can add the account back from Settings → Accounts → +, empty.")
+                } else {
+                    "Its notes are removed from this computer. They stay where they're synced to.".to_owned()
+                },
                 "Remove",
             ),
         };
@@ -863,7 +869,7 @@ impl App {
         self.flush_editor();
         self.lib.remove_account(id);
         if !self.lib.location_exists(&self.location) {
-            let f = self.lib.default_folder_id(crate::model::LOCAL);
+            let f = self.lib.default_folder_id(&self.lib.fallback_account());
             self.go_to(Location::Folder(f));
         } else {
             self.prune_missing();

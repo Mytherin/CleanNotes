@@ -223,7 +223,7 @@ impl App {
 
     fn accounts_tab(&mut self, ui: &mut Ui, p: &Palette) {
         if self.settings_ui.selected.as_ref().map_or(true, |s| self.lib.store.account(s).is_none()) {
-            self.settings_ui.selected = Some(LOCAL.to_owned());
+            self.settings_ui.selected = Some(self.lib.store.home_account());
         }
         let selected = self.settings_ui.selected.clone().unwrap();
         ui.horizontal_top(|ui| {
@@ -253,7 +253,7 @@ impl App {
                         self.settings_ui.sheet = Some(Sheet::Choose);
                         self.settings_ui.error = None;
                     }
-                    let can_remove = selected != LOCAL;
+                    let can_remove = self.lib.can_remove_account(&selected);
                     if ui.add_enabled(can_remove, egui::Button::new(" − ")).on_hover_text("Remove Account").clicked() {
                         self.confirm = Some(Confirm::RemoveAccount(selected.clone()));
                     }
@@ -421,6 +421,8 @@ impl App {
         let mut next: Option<Sheet> = None;
         let mut add_sqlite: Option<(String, String)> = None;
         let mut start_s3: Option<(s3::Config, s3::Keys, String)> = None;
+        let mut add_local = false;
+        let local_gone = self.lib.store.account(LOCAL).is_none();
         let sheet = self.settings_ui.sheet.as_mut().unwrap();
         modal(ctx, "add-account", p, |ui| {
             ui.set_width(400.0);
@@ -454,6 +456,13 @@ impl App {
                             .and_then(|d| d.document_dir().map(|p| p.join("CleanNotes.db")))
                             .unwrap_or_else(|| "CleanNotes.db".into());
                         next = Some(Sheet::Sqlite(SqliteForm { name: String::new(), path: default.display().to_string() }));
+                    }
+                    if local_gone {
+                        ui.add_space(6.0);
+                        if choice(ui, crate::model::local_account_name(), "Notes kept only on this computer, not synced") {
+                            add_local = true;
+                            close = true;
+                        }
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -540,6 +549,10 @@ impl App {
             self.settings_ui.sheet = None;
             self.settings_ui.pending = None;
             self.settings_ui.error = None;
+        }
+        if add_local {
+            self.lib.add_local_account();
+            self.settings_ui.selected = Some(LOCAL.to_owned());
         }
         if let Some((config, keys, passphrase)) = start_s3 {
             let (tx, rx) = mpsc::channel();

@@ -129,7 +129,7 @@ Characters that would read as markup are escaped. Markdown written elsewhere is 
 
 ## Sync
 
-Like Apple Notes, every folder belongs to an **account**: *On My PC* (only on this computer) or a synced one. Add accounts under **Settings → Accounts → +**. Each one shows in the sidebar with its own folders and Recently Deleted.
+Like Apple Notes, every folder belongs to an **account**: *On My PC* (only on this computer) or a synced one. Add accounts under **Settings → Accounts → +**, and remove them with **−**. *On My PC* can be removed too, as long as another account is left: its notes are deleted for good (the confirmation says how many), and it can be added back, empty, from **+**. Each one shows in the sidebar with its own folders and Recently Deleted.
 
 Earlier versions could also sync with Bitwarden, iCloud (CloudKit) and Standard Notes. Those are gone: an account of one of them becomes a folder named after it in *On My PC*, with its folders and notes as they were here, and its saved sign-in is deleted. Nothing on the service itself is touched.
 

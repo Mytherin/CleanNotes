@@ -271,7 +271,7 @@ impl Library {
                 .clone()
                 .filter(|f| self.store.folder(f).is_some_and(|f| self.account_enabled(&f.account)))
                 .or_else(|| self.store.default_folder(&self.settings.default_account).map(|f| f.id.clone()))
-                .or_else(|| self.store.default_folder(LOCAL).map(|f| f.id.clone()))
+                .or_else(|| self.store.default_folder(&self.fallback_account()).map(|f| f.id.clone()))
                 .unwrap_or_default();
             Location::Folder(folder)
         };
@@ -557,7 +557,7 @@ impl Library {
             Location::Deleted(a) if self.account_enabled(a) => a.clone(),
             _ => self.settings.default_account.clone(),
         };
-        let account = if self.account_enabled(&account) { account } else { LOCAL.to_owned() };
+        let account = if self.account_enabled(&account) { account } else { self.fallback_account() };
         let folder = self.default_folder_id(&account);
         (account, folder)
     }
@@ -870,9 +870,40 @@ impl Library {
 
     // ---- Accounts ---------------------------------------------------------------
 
-    /// Removes a synced account and its notes from this device.
+    /// Whether an account can be removed: any but the last one.
+    pub fn can_remove_account(&self, id: &str) -> bool {
+        self.store.account(id).is_some() && self.store.accounts.len() > 1
+    }
+
+    /// How many notes (Recently Deleted included) an account has here.
+    pub fn account_note_count(&self, id: &str) -> usize {
+        self.store.notes.iter().filter(|n| n.account == id).count()
+    }
+
+    /// The account new notes fall back on: the default account if it's on,
+    /// else the local one or the first account that's on.
+    pub fn fallback_account(&self) -> String {
+        if self.account_enabled(&self.settings.default_account) {
+            return self.settings.default_account.clone();
+        }
+        let home = self.store.home_account();
+        if self.account_enabled(&home) {
+            return home;
+        }
+        self.store.accounts.iter().find(|a| a.enabled).map(|a| a.id.clone()).unwrap_or(home)
+    }
+
+    /// Adds "On My PC" back after it was removed.
+    pub fn add_local_account(&mut self) {
+        self.store.add_local();
+        self.save(true);
+    }
+
+    /// Removes an account and its notes from this device: a synced one's
+    /// stay where they're synced to; the local account's are gone for good.
+    /// The last account can't be removed.
     pub fn remove_account(&mut self, id: &str) {
-        if id == LOCAL {
+        if !self.can_remove_account(id) {
             return;
         }
         self.worker.forget(id);
@@ -884,7 +915,7 @@ impl Library {
         self.store.tombstones.retain(|t| t.account != id);
         self.store.accounts.retain(|a| a.id != id);
         if self.settings.default_account == id {
-            self.settings.default_account = LOCAL.to_owned();
+            self.settings.default_account = self.store.home_account();
         }
         self.sync_errors.remove(id);
         self.needs_sign_in.remove(id);
@@ -1527,6 +1558,51 @@ mod tests {
         assert_eq!(lib.store.note(&id).unwrap().body, body);
         assert!(lib.store.note(&id).unwrap().tags().contains(&"work".to_owned()));
         assert!(lib.visible_notes(&tag, "").contains(&id));
+    }
+
+    #[test]
+    fn on_my_pc_can_be_removed_and_added_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut lib = Library::for_test(dir.path());
+        let mut acc = lib.store.accounts[0].clone();
+        acc.id = "other".into();
+        acc.name = "Other".into();
+        lib.store.accounts.push(acc);
+        lib.store.ensure_local();
+        let home = lib.default_folder_id(LOCAL);
+        add(&mut lib, &home, "# Only here\n");
+        let theirs = lib.default_folder_id("other");
+        let mut n = Note::new("other", &theirs, "# Kept\n");
+        let kept = n.id.clone();
+        n.modified = Utc::now();
+        lib.store.notes.push(n);
+        lib.mark_changed(&kept);
+        lib.save(true);
+        assert_eq!(lib.account_note_count(LOCAL), 1);
+        // Removed: its notes and folders are gone, the other account's stay.
+        assert!(lib.can_remove_account(LOCAL));
+        lib.remove_account(LOCAL);
+        assert!(lib.store.account(LOCAL).is_none());
+        assert!(lib.store.notes.iter().all(|n| n.account != LOCAL));
+        assert!(lib.store.folders.iter().all(|f| f.account != LOCAL));
+        assert!(lib.store.note(&kept).is_some());
+        // New notes and startup fall back on the account that's left.
+        assert_eq!(lib.fallback_account(), "other");
+        assert_eq!(lib.new_note_target(&Location::All), ("other".to_owned(), theirs.clone()));
+        // It stays gone after a restart.
+        drop(lib);
+        let mut lib = Library::for_test(dir.path());
+        assert!(lib.store.account(LOCAL).is_none());
+        assert_eq!(lib.initial_location().0, Location::Folder(theirs));
+        // The last account can't be removed.
+        assert!(!lib.can_remove_account("other"));
+        lib.remove_account("other");
+        assert!(lib.store.account("other").is_some());
+        // Added back, empty, with its Notes folder.
+        lib.add_local_account();
+        assert!(lib.store.account(LOCAL).is_some());
+        assert_eq!(lib.account_note_count(LOCAL), 0);
+        assert!(lib.store.default_folder(LOCAL).is_some());
     }
 
     #[test]

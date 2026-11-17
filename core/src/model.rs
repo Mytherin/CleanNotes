@@ -230,7 +230,7 @@ impl Store {
     /// a folder with the account's name (its default folder, renamed), with
     /// nothing left to sync. Nothing on the service itself is touched.
     pub fn retire_account(&mut self, id: &str, name: &str) {
-        self.ensure_local();
+        self.add_local();
         let top = match self.folders.iter().find(|f| f.account == id && f.default) {
             Some(f) => f.id.clone(),
             None => {
@@ -271,11 +271,36 @@ impl Store {
         self.accounts.retain(|a| a.id != id);
     }
 
-    /// Makes sure the local account and every account's default folder exist.
+    /// Makes sure there is an account (the local one, on a new install or
+    /// once every account is gone) and that every account's default folder
+    /// exists. The local account can be removed while others remain.
     pub fn ensure_local(&mut self) {
+        if self.accounts.is_empty() {
+            self.add_local();
+        } else {
+            self.ensure_default_folders();
+        }
+    }
+
+    /// Adds the local account ("On My PC") back, if it isn't there.
+    pub fn add_local(&mut self) {
         if !self.accounts.iter().any(|a| a.id == LOCAL) {
             self.accounts.insert(0, Account::local());
         }
+        self.ensure_default_folders();
+    }
+
+    /// The account to fall back on: the local one if it's there, else the
+    /// first one.
+    pub fn home_account(&self) -> String {
+        if self.accounts.iter().any(|a| a.id == LOCAL) {
+            LOCAL.to_owned()
+        } else {
+            self.accounts.first().map(|a| a.id.clone()).unwrap_or_else(|| LOCAL.to_owned())
+        }
+    }
+
+    fn ensure_default_folders(&mut self) {
         for a in self.accounts.clone() {
             if !self.folders.iter().any(|f| f.account == a.id && f.default) {
                 self.folders.push(Folder::default_for(&a.id));
