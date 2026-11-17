@@ -3,7 +3,7 @@
 
 use eframe::egui::{self, Align2, Pos2, Rect, Sense, Ui, Vec2};
 
-use super::sidebar::{glass_button, menu_look, popover_frame, submenu, tool_button, truncate, NoteDrag};
+use super::sidebar::{glass_button, popover_below, submenu, tool_button, truncate, NoteDrag};
 use super::{list_time, App, Confirm, Location, Pane, TOOLBAR_H};
 use crate::icons::Icon;
 use crate::markdown;
@@ -50,39 +50,36 @@ impl App {
         if resp.clicked() {
             ui.memory_mut(|m| m.toggle_popup(id));
         }
-        egui::popup_below_widget(ui, id, &resp, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-            popover_frame(ui, p).show(ui, |ui| {
-                menu_look(ui, p);
-                ui.set_min_width(210.0);
-                let mut close = false;
-                let gallery = self.lib.settings.view == ListView::Gallery;
-                let (label, view) = if gallery { ("View as List", ListView::List) } else { ("View as Gallery", ListView::Gallery) };
-                if ui.add(egui::Button::new(label).shortcut_text(if gallery { cmd_key!("1") } else { cmd_key!("2") })).clicked() {
-                    self.lib.settings.view = view;
-                    close = true;
-                }
-                ui.separator();
-                submenu(ui, p, "Sort By", |ui| {
-                    for o in crate::settings::SortBy::ALL {
-                        if ui.radio(self.lib.settings.sort_by == o, o.label()).clicked() {
-                            self.lib.settings.sort_by = o;
-                        }
+        popover_below(ui, p, id, &resp, |ui| {
+            ui.set_min_width(210.0);
+            let mut close = false;
+            let gallery = self.lib.settings.view == ListView::Gallery;
+            let (label, view) = if gallery { ("View as List", ListView::List) } else { ("View as Gallery", ListView::Gallery) };
+            if ui.add(egui::Button::new(label).shortcut_text(if gallery { cmd_key!("1") } else { cmd_key!("2") })).clicked() {
+                self.lib.settings.view = view;
+                close = true;
+            }
+            ui.separator();
+            submenu(ui, p, "Sort By", |ui| {
+                for o in crate::settings::SortBy::ALL {
+                    if ui.radio(self.lib.settings.sort_by == o, o.label()).clicked() {
+                        self.lib.settings.sort_by = o;
                     }
-                });
-                submenu(ui, p, "Group By Date", |ui| {
-                    for (on, l) in [(true, "On"), (false, "Off")] {
-                        if ui.radio(self.lib.settings.group_by_date == on, l).clicked() {
-                            self.lib.settings.group_by_date = on;
-                        }
-                    }
-                });
-                if ui.checkbox(&mut self.lib.settings.show_note_count, "Show Note Count").clicked() {
-                    close = true;
-                }
-                if close {
-                    ui.memory_mut(|m| m.close_popup());
                 }
             });
+            submenu(ui, p, "Group By Date", |ui| {
+                for (on, l) in [(true, "On"), (false, "Off")] {
+                    if ui.radio(self.lib.settings.group_by_date == on, l).clicked() {
+                        self.lib.settings.group_by_date = on;
+                    }
+                }
+            });
+            if ui.checkbox(&mut self.lib.settings.show_note_count, "Show Note Count").clicked() {
+                close = true;
+            }
+            if close {
+                ui.memory_mut(|m| m.close_popup());
+            }
         });
         x
     }

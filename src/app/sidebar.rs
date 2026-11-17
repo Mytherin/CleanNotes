@@ -552,6 +552,32 @@ pub fn popover_frame(ui: &Ui, p: &Palette) -> egui::Frame {
         .inner_margin(egui::Margin::same(6.0))
 }
 
+/// A popover menu below `anchor`, open while `id` is egui's open popup:
+/// as `egui::popup_below_widget`, but in our frame only (egui's would draw
+/// a second border around it). Closed by Escape or a click outside it.
+pub fn popover_below<R>(ui: &Ui, p: &Palette, id: egui::Id, anchor: &egui::Response, add_contents: impl FnOnce(&mut Ui) -> R) -> Option<R> {
+    if !ui.memory(|m| m.is_popup_open(id)) {
+        return None;
+    }
+    let area = egui::Area::new(id)
+        .kind(egui::UiKind::Popup)
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor.rect.left_bottom() + Vec2::new(0.0, 4.0))
+        .pivot(Align2::LEFT_TOP)
+        .show(ui.ctx(), |ui| {
+            popover_frame(ui, p)
+                .show(ui, |ui| {
+                    menu_look(ui, p);
+                    ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), add_contents).inner
+                })
+                .inner
+        });
+    if ui.input(|i| i.key_pressed(Key::Escape)) || (anchor.clicked_elsewhere() && area.response.clicked_elsewhere()) {
+        ui.memory_mut(|m| m.close_popup());
+    }
+    Some(area.inner)
+}
+
 /// Menu items without a frame, highlighted when hovered (as in Apple's
 /// menus).
 pub fn menu_look(ui: &mut Ui, p: &Palette) {
