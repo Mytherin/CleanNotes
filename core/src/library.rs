@@ -137,6 +137,10 @@ struct LockKeys {
     /// The text of each unlocked note.
     unlocked: HashMap<String, String>,
     last_use: Option<Instant>,
+    /// Pictures encrypted or decrypted this session, each way (a plain
+    /// picture's name and its encrypted copy's reference, with its key), so
+    /// an editor still showing one gets the same other one each time.
+    refs: HashMap<String, String>,
 }
 
 pub struct Library {
@@ -612,6 +616,10 @@ impl Library {
         if let Some(r) = self.store_locked(id, md) {
             return r;
         }
+        // Encrypted pictures (an editor opened before "Remove Lock", or
+        // pasted from a locked note) are kept plainly in a plain note.
+        let (md, _) = self.convert_refs(md, false);
+        let md = md.as_str();
         let Some(n) = self.store.note_mut(id) else { return BodySet::Unchanged };
         if n.body == md {
             return BodySet::Unchanged;
@@ -978,6 +986,53 @@ impl Library {
         crate::attachments::save(&self.attachments_dir(), data)
     }
 
+    /// Saves an image to attach to the note `id`: encrypted, with a key of
+    /// its own, if the note is locked. Returns its reference, for
+    /// [`crate::editing::Command::InsertImage`].
+    pub fn add_image_to(&self, id: &str, data: &[u8]) -> anyhow::Result<String> {
+        if self.is_locked(id) {
+            crate::attachments::save_sealed(&self.attachments_dir(), data)
+        } else {
+            self.add_image(data)
+        }
+    }
+
+    /// An image's bytes by reference (decrypted in memory if it's a locked
+    /// note's), if this device has it.
+    pub fn attachment_data(&self, reference: &str) -> Option<Vec<u8>> {
+        crate::attachments::load(&self.attachments_dir(), reference)
+    }
+
+    /// `md` with its pictures encrypted (`seal`: for a locked note) or
+    /// decrypted (for a plain one), as files of their own; and whether all
+    /// of them could be (those not on this device yet are left as they are).
+    fn convert_refs(&mut self, md: &str, seal: bool) -> (String, bool) {
+        let dir = self.attachments_dir();
+        let cache = &mut self.lock.refs;
+        let mut all = true;
+        let out = crate::attachments::replace_refs(md, |r| {
+            if crate::attachments::is_sealed_ref(r) == seal {
+                return None;
+            }
+            if let Some(other) = cache.get(r) {
+                return Some(other.clone());
+            }
+            let made = if seal { crate::attachments::seal(&dir, r) } else { crate::attachments::unseal(&dir, r) };
+            match made {
+                Ok(other) => {
+                    cache.insert(r.to_owned(), other.clone());
+                    cache.insert(other.clone(), r.to_owned());
+                    Some(other)
+                }
+                Err(_) => {
+                    all = false;
+                    None
+                }
+            }
+        });
+        (out, all)
+    }
+
     /// Where an attachment's file is, if this device has it (a synced
     /// note's pictures may still be on their way).
     pub fn attachment_path(&self, name: &str) -> Option<PathBuf> {
@@ -1262,29 +1317,23 @@ impl Library {
         if ids.is_empty() {
             return LockNote::Locked;
         }
-        // Pictures aren't encrypted with the note (and a locked note's
-        // pictures couldn't be synced): such a note isn't locked.
-        let mut with_images = 0;
-        let mut plain = Vec::new();
-        for id in ids {
-            if self.plain_body_now(&id).is_some_and(|t| !crate::attachments::refs_in(&t).is_empty()) {
-                with_images += 1;
-            } else {
-                plain.push(id);
-            }
-        }
-        let ids = plain;
-        if ids.is_empty() {
-            self.push_notice("Notes with images can't be locked.".into());
-            return LockNote::Locked;
-        }
         if self.settings.lock_check.is_none() {
             return LockNote::ChoosePassword;
         }
         let Some((k, salt)) = self.current_keys() else { return LockNote::EnterPassword };
         let mut locked = 0;
+        // Notes whose pictures aren't all on this device yet (a sync is
+        // bringing them): they can't be encrypted, so the note isn't locked.
+        let mut missing = 0;
         for id in ids {
             let Some(text) = self.plain_body_now(&id) else { continue };
+            // Its pictures are encrypted too, each with a key of its own
+            // that goes in the sealed text.
+            let (text, all) = self.convert_refs(&text, true);
+            if !all {
+                missing += 1;
+                continue;
+            }
             let env = lock::seal(&k, &salt, &text);
             if let Some(n) = self.store.note_mut(&id) {
                 n.body = lock::locked_body(&text, &env);
@@ -1297,12 +1346,14 @@ impl Library {
         if locked > 0 {
             self.touch_lock();
             let what = if locked == 1 { "Note locked".to_owned() } else { format!("{locked} notes locked") };
-            let skipped = match with_images {
+            let skipped = match missing {
                 0 => String::new(),
-                1 => " A note with images wasn't locked.".to_owned(),
-                n => format!(" {n} notes with images weren't locked."),
+                1 => " A note whose images aren't on this device yet wasn't locked.".to_owned(),
+                n => format!(" {n} notes whose images aren't on this device yet weren't locked."),
             };
             self.push_notice(format!("{what}. Choose Lock Now to close locked notes.{skipped}"));
+        } else if missing > 0 {
+            self.push_notice("This note's images aren't on this device yet, so it can't be locked. Try again once they've synced.".into());
         }
         LockNote::Locked
     }
@@ -1323,6 +1374,9 @@ impl Library {
     /// editor's changes copied in first).
     pub fn remove_lock(&mut self, id: &str) {
         let Some(text) = self.lock.unlocked.remove(id) else { return };
+        // Its pictures are kept plainly again (any not on this device yet
+        // keep their keys in the text, and still show once they arrive).
+        let (text, _) = self.convert_refs(&text, false);
         if let Some(n) = self.store.note_mut(id) {
             n.body = text;
             n.touch_keep_date();
@@ -1336,6 +1390,7 @@ impl Library {
         let any = !self.lock.unlocked.is_empty();
         self.lock.unlocked.clear();
         self.lock.keys.clear();
+        self.lock.refs.clear();
         self.lock.current = None;
         any
     }
@@ -1417,6 +1472,10 @@ impl Library {
             // Never write a locked note's text out in the clear.
             return Some(BodySet::Unchanged);
         }
+        // Plain pictures (an editor opened before "Lock Note", or pasted
+        // from another note) are encrypted for it.
+        let (md, _) = self.convert_refs(md, true);
+        let md = md.as_str();
         if self.lock.unlocked.get(id).is_some_and(|t| t == md) {
             return Some(BodySet::Unchanged);
         }
@@ -1654,20 +1713,89 @@ mod tests {
     }
 
     #[test]
-    fn images_are_saved_once_and_their_notes_not_locked() {
-        let (mut lib, _d) = lib();
+    fn images_are_saved_once() {
+        let (lib, _d) = lib();
         let name = lib.add_image(b"\x89PNG\r\n\x1a\npicture").unwrap();
         assert_eq!(lib.add_image(b"\x89PNG\r\n\x1a\npicture").unwrap(), name);
         assert!(lib.add_image(b"not a picture").is_err());
         assert_eq!(std::fs::read(lib.attachment_path(&name).unwrap()).unwrap(), b"\x89PNG\r\n\x1a\npicture");
+        assert_eq!(lib.attachment_data(&name).unwrap(), b"\x89PNG\r\n\x1a\npicture");
         assert_eq!(lib.attachment_path(&crate::attachments::name_for(b"x", "png")), None);
+    }
+
+    #[test]
+    fn locked_notes_keep_their_pictures_encrypted() {
+        use crate::attachments;
+        const PIC: &[u8] = b"\x89PNG\r\n\x1a\nholiday";
+        const PIC2: &[u8] = b"\x89PNG\r\n\x1a\nboarding pass";
+        let (mut lib, _d) = lib();
         let home = lib.default_folder_id(LOCAL);
-        let id = add(&mut lib, &home, &format!("# Trip\n![](attachments/{name})\n"));
+        let name = lib.add_image(PIC).unwrap();
+        let plain_md = format!("# Trip\n![](attachments/{name})\n");
+        let id = add(&mut lib, &home, &plain_md);
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&id), LockNote::Locked);
+        assert!(lib.is_locked(&id));
+
+        // Stored: no picture in the clear, only its encrypted file's name
+        // beside the seal (for syncing it), never its key.
+        let body = lib.store.note(&id).unwrap().body.clone();
+        assert!(!body.contains(&name), "{body}");
+        let refs = attachments::refs_in_body(&body);
+        assert_eq!(refs.len(), 1);
+        assert!(refs[0].ends_with(".enc"));
+        let blob = std::fs::read(attachments::path(&lib.attachments_dir(), &refs[0])).unwrap();
+        assert!(attachments::verify(&refs[0], &blob) && !blob.windows(PIC.len()).any(|w| w == PIC));
+
+        // Open, the note shows the encrypted picture, decrypted in memory.
+        let md = lib.plain_body_now(&id).unwrap();
+        let sealed = attachments::image_refs_in(&md).pop().unwrap();
+        assert!(attachments::is_sealed_ref(&sealed) && !body.contains(sealed.split('#').nth(1).unwrap()));
+        assert_eq!(lib.attachment_data(&sealed).unwrap(), PIC);
+        assert_eq!(lib.attachment_path(&sealed), None, "never handed out as a file");
+
+        // The editor still showing the plain picture saves the same
+        // encrypted one (not a new copy each time).
+        assert_eq!(lib.set_body(&id, &plain_md), BodySet::Unchanged);
+        // Pictures added to a locked note are encrypted from the start.
+        let added = lib.add_image_to(&id, PIC2).unwrap();
+        assert!(attachments::is_sealed_ref(&added));
+        assert!(!attachments::exists(&lib.attachments_dir(), &attachments::name_for(PIC2, "png")));
+        assert_eq!(lib.set_body(&id, &format!("{md}{}\n", attachments::markdown(&added))), BodySet::Changed);
+        assert_eq!(attachments::refs_in_body(&lib.store.note(&id).unwrap().body).len(), 2);
+
+        // A new password: the pictures' keys are in the text, so they open.
+        lib.change_password("pw", "pw2", "").unwrap();
+        lib.lock_now();
+        assert_eq!(lib.attachment_data(&added).unwrap(), PIC2, "a reference holds its key");
+        lib.unlock(&id, "pw2").unwrap();
+        let md = lib.plain_body_now(&id).unwrap();
+        assert_eq!(attachments::image_refs_in(&md), vec![sealed.clone(), added.clone()]);
+
+        // Remove Lock: plain pictures again.
+        lib.remove_lock(&id);
+        let body = lib.store.note(&id).unwrap().body.clone();
+        assert_eq!(body, format!("# Trip\n![](attachments/{name})\n![](attachments/{})\n", attachments::name_for(PIC2, "png")));
+        assert_eq!(lib.attachment_data(&attachments::name_for(PIC2, "png")).unwrap(), PIC2);
+        // An editor still showing the encrypted ones saves the plain ones.
+        assert_eq!(lib.set_body(&id, &md), BodySet::Unchanged);
+    }
+
+    #[test]
+    fn a_note_whose_pictures_havent_arrived_isnt_locked() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let lost = crate::attachments::name_for(b"\x89PNG\r\n\x1a\nelsewhere", "png");
+        let a = add(&mut lib, &home, &format!("# A\n![](attachments/{lost})\n"));
+        let b = add(&mut lib, &home, "# B\n");
         lib.set_password("pw", "").unwrap();
         lib.take_notices();
-        assert_eq!(lib.lock_note(&id), LockNote::Locked);
-        assert!(!lib.is_locked(&id));
-        assert_eq!(lib.take_notices(), vec!["Notes with images can't be locked.".to_owned()]);
+        assert_eq!(lib.lock_notes(&[a.clone(), b.clone()]), LockNote::Locked);
+        assert!(!lib.is_locked(&a) && lib.is_locked(&b));
+        assert_eq!(
+            lib.take_notices(),
+            vec!["Note locked. Choose Lock Now to close locked notes. A note whose images aren't on this device yet wasn't locked.".to_owned()]
+        );
     }
 
     #[test]

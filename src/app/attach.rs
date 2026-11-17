@@ -3,8 +3,8 @@
 //!
 //! Each picture is saved in the attachments folder (see
 //! [`cleannotes_core::attachments`]) and put at the caret, on a line of its
-//! own. Locked notes can't have pictures (they wouldn't be encrypted with
-//! the note), nor can deleted ones be changed.
+//! own. A locked note's pictures are encrypted, each with a key of its own
+//! kept in the note's sealed text. Deleted notes can't be changed.
 
 use std::path::{Path, PathBuf};
 
@@ -25,15 +25,13 @@ impl App {
     /// Whether pictures can be added to the open note now.
     pub fn can_attach(&self) -> bool {
         let Some(e) = &self.editor else { return false };
-        self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_none()) && !self.is_locked(&e.note_id)
+        self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_none())
     }
 
     /// Why pictures can't be added to the open note, for a notice.
     fn why_not_attach(&self) -> Option<&'static str> {
         let e = self.editor.as_ref()?;
-        if self.is_locked(&e.note_id) {
-            Some("Images can't be added to locked notes.")
-        } else if self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_some()) {
+        if self.lib.store.note(&e.note_id).is_some_and(|n| n.deleted.is_some()) {
             Some("Deleted notes can't be edited. To edit this note, recover it first.")
         } else {
             None
@@ -48,8 +46,9 @@ impl App {
             }
             return;
         }
+        let Some(id) = self.editor.as_ref().map(|e| e.note_id.clone()) else { return };
         for (label, data) in pictures {
-            match self.lib.add_image(&data) {
+            match self.lib.add_image_to(&id, &data) {
                 Ok(name) => self.editor_command(Command::InsertImage(name)),
                 Err(e) => self.push_notice(format!("{label} can't be attached: {e:#}.")),
             }

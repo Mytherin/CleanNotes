@@ -11,6 +11,15 @@
 //! editor's [`crate::doc::Doc`] it is one character, [`OBJECT`] (as in a
 //! system text view's attachments), whose [`crate::doc::Style::image`] is
 //! the file's name.
+//!
+//! **Encrypted pictures.** A locked note's pictures are kept encrypted
+//! (see [`crate::lock::seal_bytes`]), each with a random key of its own, in
+//! a file named by the SHA-256 of the *encrypted* bytes, with the extension
+//! `enc`. The note's text refers to one with its key after a `#`:
+//! `![](attachments/<sha256>.enc#<key in hex>)`. That text is sealed with
+//! the note, so only whoever opens the note can see the picture, while a
+//! sync carries the file like any other (it can check it against its name
+//! without the key). A reference, here, is a name or such a name and key.
 
 use std::path::{Path, PathBuf};
 
@@ -119,26 +128,185 @@ pub fn write(dir: &Path, name: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// An image's Markdown.
-pub fn markdown(name: &str) -> String {
-    format!("![]({URL_PREFIX}{name})")
+/// An image's Markdown (for a name or a reference with its key).
+pub fn markdown(reference: &str) -> String {
+    format!("![]({URL_PREFIX}{reference})")
 }
 
-/// The attachments a note's Markdown shows, in order, each once.
-pub fn refs_in(md: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let needle = format!("]({URL_PREFIX}");
-    let mut rest = md;
-    while let Some(i) = rest.find(&needle) {
-        let after = &rest[i + needle.len()..];
-        let end = after.find(')').unwrap_or(after.len());
-        let name = &after[..end];
-        if is_name(name) && !out.iter().any(|n| n == name) {
-            out.push(name.to_owned());
+/// The extension of an encrypted picture's file.
+pub const SEALED_EXT: &str = "enc";
+
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Whether `r` is an image's reference: an attachment's name, or an
+/// encrypted picture's name with its key (`<name>.enc#<64 hex digits>`).
+pub fn is_ref(r: &str) -> bool {
+    match r.split_once('#') {
+        None => is_name(r),
+        Some((name, key)) => is_name(name) && name.ends_with(&format!(".{SEALED_EXT}")) && is_hex64(key),
+    }
+}
+
+/// A reference's file name, and the key if it's an encrypted picture's.
+pub fn split_ref(r: &str) -> (&str, Option<[u8; 32]>) {
+    match r.split_once('#') {
+        Some((name, key)) if is_ref(r) => {
+            let mut k = [0u8; 32];
+            for (i, b) in k.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&key[2 * i..2 * i + 2], 16).unwrap_or(0);
+            }
+            (name, Some(k))
         }
-        rest = after;
+        _ => (r, None),
+    }
+}
+
+/// Whether `r` is an encrypted picture's reference (with its key).
+pub fn is_sealed_ref(r: &str) -> bool {
+    is_ref(r) && r.contains('#')
+}
+
+/// Each image reference in `md`: where it is (its bytes) and what it is.
+fn ref_spans(md: &str) -> Vec<(std::ops::Range<usize>, &str)> {
+    let needle = format!("]({URL_PREFIX}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = md[from..].find(&needle) {
+        let start = from + i + needle.len();
+        let len = md[start..].find(')').unwrap_or(md.len() - start);
+        let r = &md[start..start + len];
+        if is_ref(r) {
+            out.push((start..start + len, r));
+        }
+        from = start;
     }
     out
+}
+
+/// The attachments' files a note's Markdown shows, in order, each once
+/// (names only: an encrypted picture's key is left out).
+pub fn refs_in(md: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, r) in ref_spans(md) {
+        let name = split_ref(r).0;
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
+/// The image references a note's Markdown shows, in order, each once
+/// (encrypted pictures' with their keys).
+pub fn image_refs_in(md: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, r) in ref_spans(md) {
+        if !out.iter().any(|n| n == r) {
+            out.push(r.to_owned());
+        }
+    }
+    out
+}
+
+/// The attachments' files a note's stored body needs: those its Markdown
+/// shows, or a locked note's, listed beside its sealed text (see
+/// [`crate::lock::Envelope::att`]). What a sync uploads and downloads.
+pub fn refs_in_body(body: &str) -> Vec<String> {
+    match crate::lock::parse(body) {
+        Some(env) => {
+            let mut out: Vec<String> = Vec::new();
+            for a in env.att {
+                if is_name(&a) && !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+            out
+        }
+        None => refs_in(body),
+    }
+}
+
+/// `md` with each image reference `f` gives another for replaced.
+pub fn replace_refs(md: &str, mut f: impl FnMut(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut last = 0;
+    for (span, r) in ref_spans(md) {
+        if let Some(new) = f(r) {
+            out.push_str(&md[last..span.start]);
+            out.push_str(&new);
+            last = span.end;
+        }
+    }
+    out.push_str(&md[last..]);
+    out
+}
+
+/// A line of Markdown without its images.
+pub fn without_images(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut last = 0;
+    for (span, _) in ref_spans(line) {
+        // An image is `![…](attachments/<ref>)`; a plain link is kept.
+        let bracket = span.start - URL_PREFIX.len() - 2;
+        if let Some(open) = line[last..bracket].rfind("![").map(|i| last + i) {
+            out.push_str(&line[last..open]);
+            last = (span.end + 1).min(line.len());
+        }
+    }
+    out.push_str(&line[last..]);
+    out
+}
+
+/// Whether `dir` has the file of the image reference `r`.
+pub fn ref_exists(dir: &Path, r: &str) -> bool {
+    is_ref(r) && exists(dir, split_ref(r).0)
+}
+
+/// An image's bytes, by reference: read from `dir`, and decrypted (in
+/// memory) if it's an encrypted picture. `None` if the file isn't here,
+/// or doesn't decrypt.
+pub fn load(dir: &Path, r: &str) -> Option<Vec<u8>> {
+    if !is_ref(r) {
+        return None;
+    }
+    let (name, key) = split_ref(r);
+    let data = std::fs::read(path(dir, name)).ok()?;
+    match key {
+        None => Some(data),
+        Some(k) => crate::lock::open_bytes(&k, &data).ok(),
+    }
+}
+
+/// Saves an image encrypted with a new key of its own and returns its
+/// reference (with the key), for a locked note. As [`save`], it must be a
+/// picture of a known type.
+pub fn save_sealed(dir: &Path, data: &[u8]) -> Result<String> {
+    if data.len() > MAX_BYTES {
+        bail!("the image is too large (over {} MB)", MAX_BYTES / (1024 * 1024));
+    }
+    if image_ext(data).is_none() {
+        bail!("that isn't an image CleanNotes can show (PNG, JPEG, GIF, WebP, BMP or HEIC)");
+    }
+    let key = crate::lock::new_blob_key();
+    let blob = crate::lock::seal_bytes(&key, data);
+    let name = name_for(&blob, SEALED_EXT);
+    write(dir, &name, &blob)?;
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!("{name}#{hex}"))
+}
+
+/// The encrypted picture's bytes saved as a plain attachment: its name.
+pub fn unseal(dir: &Path, r: &str) -> Result<String> {
+    let Some(data) = load(dir, r) else { bail!("the picture isn't on this device yet") };
+    save(dir, &data)
+}
+
+/// A plain attachment saved encrypted: its reference (with the key).
+pub fn seal(dir: &Path, name: &str) -> Result<String> {
+    let Some(data) = load(dir, name) else { bail!("the picture isn't on this device yet") };
+    save_sealed(dir, &data)
 }
 
 #[cfg(test)]
@@ -179,5 +347,44 @@ mod tests {
         let b = name_for(b"b", "jpg");
         let md = format!("# x\n![]({URL_PREFIX}{a}) and ![]({URL_PREFIX}{b})\n![]({URL_PREFIX}{a})\n[link](attachments/../../etc)\n");
         assert_eq!(refs_in(&md), vec![a, b]);
+    }
+
+    #[test]
+    fn sealed_pictures_are_encrypted_on_disk_and_load_with_their_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = save_sealed(dir.path(), PNG).unwrap();
+        assert!(is_ref(&r) && is_sealed_ref(&r));
+        let (name, key) = split_ref(&r);
+        assert!(name.ends_with(".enc") && key.is_some());
+        let on_disk = std::fs::read(path(dir.path(), name)).unwrap();
+        assert!(verify(name, &on_disk), "named by the encrypted bytes");
+        assert!(!on_disk.windows(4).any(|w| w == b"\x89PNG"));
+        assert_eq!(load(dir.path(), &r).unwrap(), PNG);
+        assert!(ref_exists(dir.path(), &r));
+        // Its name alone (as a sync knows it) doesn't open it.
+        assert_eq!(load(dir.path(), name).unwrap(), on_disk);
+        let wrong = format!("{name}#{}", "0".repeat(64));
+        assert_eq!(load(dir.path(), &wrong), None);
+        // Back to a plain attachment, the same as saving it plainly.
+        assert_eq!(unseal(dir.path(), &r).unwrap(), name_for(PNG, "png"));
+        assert!(save_sealed(dir.path(), b"text").is_err());
+        // Keys only go with encrypted pictures, and must be whole.
+        let plain = name_for(PNG, "png");
+        assert!(!is_ref(&format!("{plain}#{}", "0".repeat(64))));
+        assert!(!is_ref(&format!("{name}#{}", "0".repeat(63))));
+        assert!(!is_ref(&format!("{name}#{}", "A".repeat(64))));
+    }
+
+    #[test]
+    fn references_with_keys_are_found_and_replaced() {
+        let a = name_for(b"a", "png");
+        let s = format!("{}#{}", name_for(b"s", "enc"), "c".repeat(64));
+        let md = format!("x ![](attachments/{a}) y\n![](attachments/{s})\n");
+        assert_eq!(refs_in(&md), vec![a.clone(), name_for(b"s", "enc")]);
+        assert_eq!(image_refs_in(&md), vec![a.clone(), s.clone()]);
+        let out = replace_refs(&md, |r| (r == s).then(|| "Z".repeat(1)));
+        assert_eq!(out, format!("x ![](attachments/{a}) y\n![](attachments/Z)\n"));
+        assert_eq!(without_images(&format!("x ![](attachments/{a}) y ![](attachments/{s})")), "x  y ");
+        assert_eq!(without_images("![](attachments/nope) z"), "![](attachments/nope) z");
     }
 }

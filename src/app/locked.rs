@@ -110,6 +110,7 @@ impl App {
     /// After locked notes closed (Lock Now, or a while without use).
     pub(super) fn after_lock_now(&mut self) {
         let any = self.editor.as_ref().is_some_and(|e| self.lib.is_locked(&e.note_id));
+        self.images.forget_sealed();
         self.lock.typed.clear();
         self.lock.error = None;
         // A password sheet left open mustn't stay filled in.
@@ -327,6 +328,27 @@ mod tests {
         assert!(matches!(app.lock.sheet, Some(Sheet::Set { .. })), "the first lock asks for a password");
         app.sheet_action(SheetAction::Set(pw.into(), "the usual".into(), vec![id.to_owned()])).unwrap();
         app.lock.sheet = None;
+    }
+
+    #[test]
+    fn pictures_attached_to_a_locked_note_are_encrypted() {
+        use cleannotes_core::attachments;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = app_with_note(dir.path(), "# Passport\n");
+        set_password(&mut app, &id, "hunter2");
+        assert!(app.is_locked(&id) && app.can_attach());
+        let png = crate::editor::images::png_from_rgba(1, 1, &[1, 2, 3, 255]).unwrap();
+        app.attach_images(vec![("scan".into(), png.clone())]);
+        app.flush_editor();
+        let body = app.lib.store.note(&id).unwrap().body.clone();
+        assert!(lock::is_locked(&body));
+        let files = attachments::refs_in_body(&body);
+        assert!(files.len() == 1 && files[0].ends_with(".enc"), "{body}");
+        // Nothing of it in the clear on disk.
+        assert!(!attachments::exists(&app.lib.attachments_dir(), &attachments::name_for(&png, "png")));
+        let md = app.lib.plain_body_now(&id).unwrap();
+        let r = attachments::image_refs_in(&md).pop().unwrap();
+        assert_eq!(app.lib.attachment_data(&r).unwrap(), png);
     }
 
     #[test]

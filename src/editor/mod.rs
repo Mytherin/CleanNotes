@@ -714,9 +714,10 @@ impl Editor {
         if resp.double_clicked() {
             if let Some(pt) = pointer {
                 if let Some(img) = self.image_at(pt) {
-                    // A picture opens in the system's viewer.
+                    // A picture opens in the system's viewer (not a locked
+                    // note's: it would have to be written out decrypted).
                     let path = cleannotes_core::attachments::path(opts.images.dir(), &img.name);
-                    if path.is_file() {
+                    if cleannotes_core::attachments::is_name(&img.name) && path.is_file() {
                         out.open_image = Some(path);
                     }
                 } else {

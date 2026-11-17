@@ -55,14 +55,15 @@ impl ImageCache {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         match slots.remove(name) {
             None => {
-                if !attachments::exists(&self.dir, name) {
+                if !attachments::ref_exists(&self.dir, name) {
                     slots.insert(name.to_owned(), Slot::Missing);
                     return Shown::Missing;
                 }
                 slots.insert(name.to_owned(), Slot::Loading);
-                let (path, key, shared, ctx) = (attachments::path(&self.dir, name), name.to_owned(), self.slots.clone(), ctx.clone());
+                let (dir, key, shared, ctx) = (self.dir.clone(), name.to_owned(), self.slots.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let slot = match std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+                    // A locked note's picture is decrypted here, in memory.
+                    let slot = match attachments::load(&dir, &key).and_then(|b| decode(&b)) {
                         Some((img, size)) => Slot::Decoded(img, size),
                         None => Slot::Unreadable,
                     };
@@ -94,6 +95,11 @@ impl ImageCache {
     /// they're looked for again.
     pub fn retry_missing(&self) {
         self.slots.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, s| !matches!(s, Slot::Missing));
+    }
+
+    /// Locked notes closed: their pictures, decrypted, aren't kept.
+    pub fn forget_sealed(&self) {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner()).retain(|name, _| !attachments::is_sealed_ref(name));
     }
 }
 

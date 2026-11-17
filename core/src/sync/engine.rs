@@ -65,7 +65,7 @@ impl AccountSnapshot {
     /// a sync then pulls, even if nothing else changed, to fetch them.
     pub fn missing_attachments(&self) -> bool {
         let Some(dir) = &self.attachments else { return false };
-        self.notes.iter().any(|n| attachments::refs_in(&n.body).iter().any(|a| !attachments::exists(dir, a)))
+        self.notes.iter().any(|n| attachments::refs_in_body(&n.body).iter().any(|a| !attachments::exists(dir, a)))
     }
 
     pub fn of(store: &Store, account: &str) -> AccountSnapshot {
@@ -520,7 +520,7 @@ fn take_remote(n: &mut Note, r: &RemoteNote, folder: String) {
 /// pictures it can't get). Images this device doesn't have either are
 /// skipped: whoever added them uploads them.
 fn push_attachments(backend: &mut dyn Backend, dir: &Path, body: &str) -> Result<()> {
-    for name in attachments::refs_in(body) {
+    for name in attachments::refs_in_body(body) {
         if backend.has_attachment(&name)? {
             continue;
         }
@@ -539,7 +539,7 @@ fn push_attachments(backend: &mut dyn Backend, dir: &Path, body: &str) -> Result
 fn fetch_attachments(backend: &mut dyn Backend, dir: &Path, notes: &[Note]) -> (usize, Option<String>) {
     let mut wanted: Vec<String> = Vec::new();
     for n in notes {
-        for a in attachments::refs_in(&n.body) {
+        for a in attachments::refs_in_body(&n.body) {
             if !wanted.contains(&a) && !attachments::exists(dir, &a) {
                 wanted.push(a);
             }
