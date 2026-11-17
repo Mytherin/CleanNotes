@@ -118,11 +118,16 @@ impl Db {
         };
         let mut db = Db { conn, dir: dir.to_path_buf(), secrets, keyring_prefix, saved_meta: None, in_memory: Mutex::new(HashMap::new()) };
         db.move_secrets_out()?;
-        let (store, settings, retired) = db.load()?;
+        let (store, mut settings, retired) = db.load()?;
         if !retired.is_empty() {
             // Their sign-ins are of no more use.
             for id in &retired {
                 let _ = db.set_secret(id, None);
+            }
+            // New notes went there: now to the local account, where its
+            // notes are.
+            if retired.contains(&settings.default_account) {
+                settings.default_account = crate::model::LOCAL.to_owned();
             }
             db.save_all(&store, &settings)?;
         }
@@ -406,7 +411,7 @@ mod tests {
     #[test]
     fn accounts_of_removed_kinds_of_sync_become_local_folders() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut db, mut store, settings) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        let (mut db, mut store, mut settings) = Db::open(dir.path(), Secrets::Memory).unwrap();
         // An account saved by an older version, as it was in the file.
         let sn = "sn1";
         let mut notes_folder = Folder::default_for(sn);
@@ -421,6 +426,7 @@ mod tests {
         store.notes.extend([a, b]);
         // A folder with its name is at the top of the local account already.
         store.folders.push(Folder::new(LOCAL, None, "Standard Notes"));
+        settings.default_account = sn.into();
         db.save_all(&store, &settings).unwrap();
         db.conn
             .execute(
@@ -431,8 +437,9 @@ mod tests {
         db.set_secret(sn, Some("keys")).unwrap();
         drop(db);
 
-        let (db, store, _) = Db::open(dir.path(), Secrets::Memory).unwrap();
+        let (db, store, settings) = Db::open(dir.path(), Secrets::Memory).unwrap();
         assert!(store.account(sn).is_none());
+        assert_eq!(settings.default_account, LOCAL, "new notes go where its notes went");
         assert!(store.notes.iter().all(|n| n.account == LOCAL));
         let path = |id: &str| store.folder_path(&store.note(id).unwrap().folder);
         assert_eq!(path(&ia), vec!["Standard Notes 2"]);
