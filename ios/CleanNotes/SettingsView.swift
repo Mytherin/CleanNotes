@@ -102,6 +102,7 @@ struct SettingsView: View {
                         Button("Lock Now") {
                             store.saveEditor()
                             store.perform { $0.lockNow() }
+                            NoteImages.shared.forgetAll()
                         }
                     }
                 } header: {

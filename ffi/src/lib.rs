@@ -450,10 +450,24 @@ impl NotesCore {
         self.lib().add_image(&data).map_err(|e| failed(format!("{e:#}")))
     }
 
+    /// Saves a picture to attach to the note `id`: encrypted, with a key of
+    /// its own, if the note is locked. Returns its reference, for
+    /// [`EditorCommand::InsertImage`].
+    pub fn add_note_image(&self, id: String, data: Vec<u8>) -> Result<String, CoreError> {
+        self.lib().add_image_to(&id, &data).map_err(|e| failed(format!("{e:#}")))
+    }
+
     /// Where an attachment's file is, if this device has it yet (a synced
-    /// note's pictures may still be on their way).
+    /// note's pictures may still be on their way). Never a locked note's
+    /// picture: see [`NotesCore::attachment_data`].
     pub fn attachment_path(&self, name: String) -> Option<String> {
         self.lib().attachment_path(&name).map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// A picture's bytes by its reference (a locked note's decrypted, in
+    /// memory), if this device has it yet.
+    pub fn attachment_data(&self, name: String) -> Option<Vec<u8>> {
+        self.lib().attachment_data(&name)
     }
 
     /// Saves everything now (going to the background, quitting).
@@ -1830,5 +1844,28 @@ mod tests {
         assert!(err.to_string().contains("hint"));
         core.unlock(n.id.clone(), "pw".into()).unwrap();
         assert!(core.open_editor(n.id).is_some());
+    }
+
+    #[test]
+    fn a_locked_notes_pictures_through_the_bindings() {
+        let (core, _dir) = core();
+        let home = Place::Folder { id: core.lib().default_folder_id(LOCAL) };
+        let n = core.new_note(home);
+        core.lib().set_body(&n.id, "# Passport\n");
+        core.set_password("pw".into(), String::new()).unwrap();
+        assert_eq!(core.lock_note(n.id.clone()), LockOutcome::Locked);
+        let photo = b"\x89PNG\r\n\x1a\nscan".to_vec();
+        let r = core.add_note_image(n.id.clone(), photo.clone()).unwrap();
+        assert!(cleannotes_core::attachments::is_sealed_ref(&r));
+        let e = core.open_editor(n.id.clone()).unwrap();
+        e.command(EditorCommand::InsertImage { name: r.clone() });
+        assert!(core.save_editor(e));
+        // Shown from its bytes (decrypted), never handed out as a file.
+        assert_eq!(core.attachment_data(r.clone()).unwrap(), photo);
+        assert_eq!(core.attachment_path(r), None);
+        // A plain note's pictures are plain.
+        let plain = core.add_note_image("not-a-locked-note".into(), photo.clone()).unwrap();
+        assert!(cleannotes_core::attachments::is_name(&plain));
+        assert_eq!(core.attachment_data(plain).unwrap(), photo);
     }
 }

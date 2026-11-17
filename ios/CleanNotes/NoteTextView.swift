@@ -47,12 +47,13 @@ final class ParagraphMark: NSObject {
 final class NoteImages {
     static let shared = NoteImages()
     private let cache = NSCache<NSString, UIImage>()
-    /// Where an attachment's file is (the core knows), if it's here.
-    var path: (String) -> String? = { _ in nil }
+    /// An attachment's bytes (the core reads them, and decrypts a locked
+    /// note's in memory), if it's here.
+    var data: (String) -> Data? = { _ in nil }
 
     func image(_ name: String) -> UIImage? {
         if let i = cache.object(forKey: name as NSString) { return i }
-        guard let p = path(name), let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: p) as CFURL, nil) else { return nil }
+        guard let d = data(name), let src = CGImageSourceCreateWithData(d as CFData, nil) else { return nil }
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
@@ -62,6 +63,11 @@ final class NoteImages {
         let img = UIImage(cgImage: cg)
         cache.setObject(img, forKey: name as NSString)
         return img
+    }
+
+    /// Locked notes closed: their pictures, decrypted, aren't kept.
+    func forgetAll() {
+        cache.removeAllObjects()
     }
 
     /// A box shown while a picture is on its way.
@@ -834,11 +840,8 @@ struct NoteEditorView: UIViewRepresentable {
                 blockedEdit()
                 return
             }
-            if store.core.isLocked(id: editor.noteId()) {
-                store.show("Images can't be added to locked notes.")
-                return
-            }
-            guard let name = try? store.core.addImage(data: NoteImages.portable(data)) else {
+            // A locked note's pictures are encrypted (the core does it).
+            guard let name = try? store.core.addNoteImage(id: editor.noteId(), data: NoteImages.portable(data)) else {
                 store.show("That picture can't be added.")
                 return
             }
@@ -848,10 +851,6 @@ struct NoteEditorView: UIViewRepresentable {
         @objc fileprivate func photoTapped() {
             if readOnly {
                 blockedEdit()
-                return
-            }
-            if store.core.isLocked(id: editor.noteId()) {
-                store.show("Images can't be added to locked notes.")
                 return
             }
             var config = PHPickerConfiguration()

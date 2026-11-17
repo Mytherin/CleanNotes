@@ -533,7 +533,7 @@ impl Editing {
                 self.sel = Selection::caret(p);
             }
             Command::InsertImage(name) => {
-                if !crate::attachments::is_name(&name) {
+                if !crate::attachments::is_ref(&name) {
                     return;
                 }
                 self.checkpoint(None);

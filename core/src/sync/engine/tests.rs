@@ -447,6 +447,31 @@ fn pictures_go_up_once_and_damaged_ones_never_come_down() {
     assert_eq!(std::fs::read_dir(phone.att.path()).unwrap().count(), 1);
 }
 
+#[test]
+fn a_locked_notes_encrypted_pictures_sync_without_the_password() {
+    use crate::{attachments, lock};
+    let (_d, mut laptop, mut phone) = pair();
+    let pic = b"\x89PNG\r\n\x1a\nsecret picture".to_vec();
+    let r = attachments::save_sealed(laptop.att.path(), &pic).unwrap();
+    let (name, _) = attachments::split_ref(&r);
+    let text = format!("# Passport\n{}\n", attachments::markdown(&r));
+    let salt = lock::new_salt();
+    let keys = lock::derive("pw", &salt).unwrap();
+    laptop.add(&lock::locked_body(&text, &lock::seal(&keys, &salt, &text)));
+    laptop.sync();
+    // Only the encrypted file goes up, by the name beside the seal.
+    assert!(laptop.backend.has_attachment(name).unwrap());
+    phone.sync();
+    let blob = std::fs::read(attachments::path(phone.att.path(), name)).unwrap();
+    assert!(!blob.windows(pic.len()).any(|w| w == pic.as_slice()));
+    // Opened on the phone, the picture's key comes out of the note's text.
+    let body = &phone.store.notes.iter().find(|n| lock::is_locked(&n.body)).unwrap().body;
+    let env = lock::parse(body).unwrap();
+    let opened = lock::open(&lock::derive_for("pw", &env).unwrap(), &env).unwrap();
+    let r2 = attachments::image_refs_in(&opened).pop().unwrap();
+    assert_eq!(attachments::load(phone.att.path(), &r2).unwrap(), pic);
+}
+
 /// A backend where another device writes right after each pull, until the
 /// hook runs out.
 struct Racy<'a> {

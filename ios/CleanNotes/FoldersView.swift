@@ -40,6 +40,7 @@ struct FoldersView: View {
                         Button {
                             store.saveEditor()
                             store.perform { $0.lockNow() }
+                            NoteImages.shared.forgetAll()
                         } label: { Label("Lock Now", systemImage: "lock") }
                     }
                 } label: {

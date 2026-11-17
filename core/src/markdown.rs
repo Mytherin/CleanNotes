@@ -284,7 +284,7 @@ fn escape_char(out: &mut String, chars: &[char], styles: &[Style], i: usize) {
         // `!` right before a link to an attachment would make it an image.
         '!' => styles.get(i + 1).is_some_and(|n| {
             n.link != styles[i].link
-                && n.link.as_deref().and_then(|u| u.strip_prefix(crate::attachments::URL_PREFIX)).is_some_and(crate::attachments::is_name)
+                && n.link.as_deref().and_then(|u| u.strip_prefix(crate::attachments::URL_PREFIX)).is_some_and(crate::attachments::is_ref)
         }),
         // `_` only marks emphasis at the edge of a word.
         '_' => !prev.is_some_and(|p| p.is_alphanumeric()) || !next.is_some_and(|n| n.is_alphanumeric()),
@@ -709,12 +709,12 @@ fn inline_into(b: &mut Block, chars: &[char], style: &mut Style) {
     }
 }
 
-/// For a `!` at `bang` that starts `![…](attachments/<name>)`: the name and
-/// the index after it.
+/// For a `!` at `bang` that starts `![…](attachments/<ref>)`: the reference
+/// (a name, or an encrypted picture's name and key) and the index after it.
 fn image_at(chars: &[char], bang: usize) -> Option<(String, usize)> {
     let (_, url, end) = find_link(chars, bang + 1)?;
     let name = url.strip_prefix(crate::attachments::URL_PREFIX)?;
-    crate::attachments::is_name(name).then(|| (name.to_owned(), end))
+    crate::attachments::is_ref(name).then(|| (name.to_owned(), end))
 }
 
 /// For a `[` at `open`: the index of the matching `]`, the URL, and the
