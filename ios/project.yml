@@ -27,7 +27,17 @@ targets:
       - path: Generated/cleannotes_ffi.swift
         optional: true
         createIntermediateGroups: true
+      # Compiled into the share extension too.
+      - path: Shared
+    entitlements:
+      path: CleanNotes/CleanNotes.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.cleannotes.CleanNotes
     dependencies:
+      - target: CleanNotesShare
+        embed: true
+        codeSign: true
       - framework: build/CleanNotesCore.xcframework
         embed: false
         link: true
@@ -64,6 +74,47 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         CODE_SIGN_STYLE: Automatic
+  # The share extension: "Notes" in other apps' share sheets, to add what's
+  # shared (text, links, pictures, files) to a new note or one already there,
+  # as in Apple Notes. It leaves it in the App Group's inbox, and the app adds
+  # it when it next comes to the foreground (ios/Shared/ShareInbox.swift).
+  CleanNotesShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CleanNotesShare
+      - path: Shared
+    info:
+      path: CleanNotesShare/Info.plist
+      properties:
+        CFBundleDisplayName: Notes
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: ShareViewController
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsText: true
+              NSExtensionActivationSupportsWebURLWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 20
+              NSExtensionActivationSupportsMovieWithMaxCount: 5
+              NSExtensionActivationSupportsFileWithMaxCount: 20
+              NSExtensionActivationSupportsAttachmentsWithMaxCount: 20
+    entitlements:
+      path: CleanNotesShare/CleanNotesShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.cleannotes.CleanNotes
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cleannotes.CleanNotes.Share
+        PRODUCT_NAME: CleanNotesShare
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        APPLICATION_EXTENSION_API_ONLY: YES
   # Unit tests of the app's Swift (the text view against the Rust engine,
   # rendering, sharing), run in the app on the iOS Simulator:
   #   xcodebuild test -project CleanNotes.xcodeproj -scheme CleanNotes \
