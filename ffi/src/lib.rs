@@ -23,7 +23,7 @@ use cleannotes_core::library::{self, BodySet, Library, Location};
 use cleannotes_core::model::{new_id, LOCAL};
 use cleannotes_core::sync::{s3, BackendConfig};
 use cleannotes_core::settings::{self, SortBy, StartWith, TEXT_SIZES};
-use cleannotes_core::{dates, lock};
+use cleannotes_core::{attachments, dates, lock};
 
 uniffi::setup_scaffolding!();
 
@@ -1037,7 +1037,32 @@ pub struct Paragraph {
     pub marker: String,
     /// A table cell (its style is Body): where it is in its table.
     pub cell: Option<TableCell>,
+    /// An attached file on a line of its own (only a link to it): shown as
+    /// a card, a PDF with its pages.
+    pub file: Option<AttachedFile>,
     pub runs: Vec<TextRun>,
+}
+
+/// An attached file a paragraph is (see [`Paragraph::file`]).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct AttachedFile {
+    /// Its attachment (for [`NotesCore::attachment_data`]).
+    pub reference: String,
+    /// A PDF (by its name; a locked note's by the name it's shown with).
+    pub pdf: bool,
+    pub view: FileView,
+}
+
+/// How an attached file is shown (Apple Notes' View As). A PDF is Medium
+/// unless set; other files are always Small.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FileView {
+    /// Its name beside a small picture of it.
+    Small,
+    /// Its pages side by side.
+    Medium,
+    /// Its pages as wide as the note.
+    Large,
 }
 
 /// Where a table cell is. A table's cells are paragraphs in a row, row by
@@ -1173,7 +1198,7 @@ impl NoteEditor {
     pub fn state(&self) -> EditorState {
         let e = self.ed();
         let numbers = e.doc.list_numbers();
-        let paragraphs = e.doc.blocks.iter().enumerate().map(|(i, b)| paragraph(b, numbers[i], table_cell(&e.doc, i))).collect();
+        let paragraphs = e.doc.blocks.iter().enumerate().map(|(i, b)| paragraph(b, numbers[i], table_cell(&e.doc, i), attached_file(&e.doc, i))).collect();
         let (a, b) = (to_utf16(&e.doc, e.sel.start()), to_utf16(&e.doc, e.sel.end()));
         EditorState { paragraphs, selection_start: a, selection_end: b }
     }
@@ -1183,7 +1208,7 @@ impl NoteEditor {
         let e = self.ed();
         let i = index as usize;
         let b = e.doc.blocks.get(i)?;
-        Some(paragraph(b, e.doc.list_numbers()[i], table_cell(&e.doc, i)))
+        Some(paragraph(b, e.doc.list_numbers()[i], table_cell(&e.doc, i), attached_file(&e.doc, i)))
     }
 
     /// The paragraph the UTF-16 offset is in.
@@ -1378,7 +1403,24 @@ fn table_cell(d: &Doc, block: usize) -> Option<TableCell> {
     })
 }
 
-fn paragraph(b: &doc::Block, number: u32, cell: Option<TableCell>) -> Paragraph {
+/// Paragraph `i` as an attached file, if it's one.
+fn attached_file(d: &doc::Doc, i: usize) -> Option<AttachedFile> {
+    let reference = d.file_at(i)?.to_owned();
+    let label = &d.blocks[i].text;
+    let (name, _) = attachments::split_ref(&reference);
+    let pdf_name = |s: &str| s.len() > 4 && s.is_char_boundary(s.len() - 4) && s[s.len() - 4..].eq_ignore_ascii_case(".pdf");
+    let sealed = name.ends_with(&format!(".{}", attachments::SEALED_EXT));
+    let pdf = pdf_name(name) || (sealed && pdf_name(label.trim()));
+    let view = match d.file_view(i) {
+        _ if !pdf => FileView::Small,
+        doc::FileView::Small => FileView::Small,
+        doc::FileView::Medium => FileView::Medium,
+        doc::FileView::Large => FileView::Large,
+    };
+    Some(AttachedFile { reference, pdf, view })
+}
+
+fn paragraph(b: &doc::Block, number: u32, cell: Option<TableCell>, file: Option<AttachedFile>) -> Paragraph {
     let mono = b.kind == Kind::Monospaced;
     let chars: Vec<char> = b.text.chars().collect();
     // Plain URLs and #tags are shown as links and tags (not in code).
@@ -1425,6 +1467,7 @@ fn paragraph(b: &doc::Block, number: u32, cell: Option<TableCell>) -> Paragraph 
         number,
         marker: b.kind.list_marker(number),
         cell,
+        file,
         runs,
     }
 }
@@ -1799,6 +1842,31 @@ mod tests {
         assert!(p.runs.iter().any(|r| r.tag && r.text == "#shop"));
         assert!(p.runs.iter().any(|r| r.link.as_deref() == Some("https://x.org")));
         assert_eq!(s.paragraphs[1].number, 1);
+    }
+
+    #[test]
+    fn attached_files_are_cards_with_their_view() {
+        let (pdf, docx) = (format!("{}.pdf", "a".repeat(64)), format!("{}.docx", "b".repeat(64)));
+        let sealed = format!("{}.enc#{}", "c".repeat(64), "d".repeat(64));
+        let e = editor(&format!(
+            "[trip.pdf](attachments/{pdf})\n[trip.pdf](attachments/{pdf} \"large\")\n[x](attachments/{pdf} \"small\")\n\
+             [plan.docx](attachments/{docx} \"large\")\n[Taxes.PDF](attachments/{sealed})\nsee [trip.pdf](attachments/{pdf})\n"
+        ));
+        let files: Vec<_> = e.state().paragraphs.into_iter().map(|p| p.file.map(|f| (f.reference, f.pdf, f.view))).collect();
+        assert_eq!(
+            files,
+            vec![
+                Some((pdf.clone(), true, FileView::Medium)),
+                Some((pdf.clone(), true, FileView::Large)),
+                Some((pdf.clone(), true, FileView::Small)),
+                // Only a PDF shows its pages.
+                Some((docx, false, FileView::Small)),
+                Some((sealed, true, FileView::Medium)),
+                // A link among other text is no card.
+                None,
+            ]
+        );
+        assert_eq!(e.paragraph(1).unwrap().file.unwrap().view, FileView::Large);
     }
 
     #[test]
