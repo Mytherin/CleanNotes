@@ -19,6 +19,7 @@ mod editor;
 mod enex;
 mod fonts;
 mod icons;
+mod menu;
 mod theme;
 
 // The shared core (also the iPhone app's): notes, documents, storage, sync.

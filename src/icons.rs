@@ -37,6 +37,20 @@ pub enum Icon {
     Notes,
     /// A grid: insert a table.
     Table,
+    /// Menu items, as SF Symbols' scissors, doc.on.doc, clipboard,
+    /// square.and.arrow.up, a View As layout, pencil.line, eye,
+    /// arrow.up.forward.app, checkmark, photo and paperclip.
+    Cut,
+    Copy,
+    Paste,
+    Share,
+    ViewAs,
+    Rename,
+    Eye,
+    OpenApp,
+    Check,
+    Photo,
+    Paperclip,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -213,6 +227,80 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             let mut pts = vec![at(sx - 3.4, -1.0)];
             pts.extend(arc);
             pts.push(at(sx + 3.4, if open { -2.0 } else { -1.0 }));
+            line(p, &pts, s);
+        }
+        Icon::Cut => {
+            p.circle_stroke(at(-4.6, -3.4), 2.1 * u, s);
+            p.circle_stroke(at(-4.6, 3.4), 2.1 * u, s);
+            line(p, &[at(-2.8, -2.2), at(7.0, 4.2)], s);
+            line(p, &[at(-2.8, 2.2), at(7.0, -4.2)], s);
+        }
+        Icon::Copy => {
+            // The page behind: only its edges that show.
+            line(p, &[at(-2.0, 4.0), at(-5.0, 4.0), at(-5.0, -7.0), at(2.5, -7.0), at(2.5, -4.0)], s);
+            p.rect_stroke(Rect::from_min_max(at(-2.0, -4.0), at(5.5, 7.0)), 1.6 * u, s);
+        }
+        Icon::Paste => {
+            line(p, &[at(-2.5, -5.5), at(-5.5, -5.5), at(-5.5, 7.0), at(5.5, 7.0), at(5.5, -5.5), at(2.5, -5.5)], s);
+            p.rect_stroke(Rect::from_min_max(at(-2.8, -7.2), at(2.8, -4.0)), 1.0 * u, s);
+            p.rect_filled(Rect::from_min_max(at(-2.5, -1.5), at(3.0, 4.5)), 0.8 * u, color);
+        }
+        Icon::Share => {
+            line(p, &[at(-2.0, -2.0), at(-5.5, -2.0), at(-5.5, 7.0), at(5.5, 7.0), at(5.5, -2.0), at(2.0, -2.0)], s);
+            line(p, &[at(0.0, 3.0), at(0.0, -7.0)], s);
+            line(p, &[at(-2.8, -4.3), at(0.0, -7.0), at(2.8, -4.3)], s);
+        }
+        Icon::ViewAs => {
+            p.rect_stroke(Rect::from_min_max(at(-7.0, -5.0), at(-1.0, -0.8)), 1.0 * u, s);
+            p.rect_stroke(Rect::from_min_max(at(-7.0, 1.6), at(-1.0, 5.0)), 1.0 * u, s);
+            p.rect_stroke(Rect::from_min_max(at(1.5, -5.0), at(7.0, 5.0)), 1.0 * u, s);
+        }
+        Icon::Rename => {
+            line(p, &[at(-5.5, 5.5), at(-5.0, 3.0), at(4.0, -6.0), at(6.0, -4.0), at(-3.0, 5.0), at(-5.5, 5.5)], s);
+        }
+        Icon::Eye => {
+            let lid = |sign: f32| -> Vec<Pos2> {
+                (0..=16)
+                    .map(|i| {
+                        let x = -7.0 + 14.0 * i as f32 / 16.0;
+                        at(x, sign * 4.6 * (1.0 - (x / 7.0).powi(2)))
+                    })
+                    .collect()
+            };
+            line(p, &lid(-1.0), s);
+            line(p, &lid(1.0), s);
+            p.circle_stroke(c, 2.4 * u, s);
+            p.circle_filled(c, 1.0 * u, color);
+        }
+        Icon::OpenApp => {
+            line(p, &[at(-0.5, -6.0), at(-6.0, -6.0), at(-6.0, 6.0), at(6.0, 6.0), at(6.0, 0.5)], s);
+            line(p, &[at(-1.5, 1.5), at(6.0, -6.0)], s);
+            line(p, &[at(1.0, -6.0), at(6.0, -6.0), at(6.0, -1.0)], s);
+        }
+        Icon::Check => line(p, &[at(-5.5, 0.5), at(-1.8, 4.5), at(5.5, -5.0)], Stroke::new(s.width * 1.2, color)),
+        Icon::Photo => {
+            p.rect_stroke(Rect::from_min_max(at(-7.0, -5.5), at(7.0, 5.5)), 1.8 * u, s);
+            line(p, &[at(-7.0, 4.0), at(-2.5, -0.5), at(1.5, 3.0), at(3.5, 1.2), at(7.0, 4.5)], s);
+            p.circle_filled(at(3.0, -2.3), 1.3 * u, color);
+        }
+        Icon::Paperclip => {
+            // The wire: the long outer leg, the round bottom, the left leg,
+            // the round top and the short inner leg; tilted.
+            let (sin, cos) = 0.6f32.sin_cos();
+            let rot = |x: f32, y: f32| at(x * cos - y * sin, x * sin + y * cos);
+            let arc = |cx: f32, cy: f32, r: f32, from: f32, to: f32| -> Vec<Pos2> {
+                (0..=10)
+                    .map(|i| {
+                        let a = from + (to - from) * i as f32 / 10.0;
+                        rot(cx + r * a.cos(), cy + r * a.sin())
+                    })
+                    .collect()
+            };
+            let pi = std::f32::consts::PI;
+            let mut pts = vec![rot(2.8, -4.5)];
+            pts.extend(arc(0.0, 4.0, 2.8, 0.0, pi));
+            pts.extend(arc(-0.7, -4.8, 2.1, pi, 2.0 * pi));
+            pts.push(rot(1.4, 2.8));
             line(p, &pts, s);
         }
         Icon::More => {
