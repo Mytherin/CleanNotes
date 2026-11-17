@@ -520,8 +520,8 @@ impl App {
         let account = self.lib.store.folder(id).map(|f| f.account.clone());
         let gone = self.lib.delete_folder(id);
         if matches!(&self.location, Location::Folder(l) if gone.contains(l)) {
-            let default = account.map(|a| self.lib.default_folder_id(&a)).unwrap_or_default();
-            self.go_to(Location::Folder(default));
+            let home = account.map(|a| self.lib.home_folder_id(&a)).unwrap_or_default();
+            self.go_to(Location::Folder(home));
         } else {
             self.retain_visible(None);
         }

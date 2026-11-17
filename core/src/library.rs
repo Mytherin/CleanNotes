@@ -240,6 +240,12 @@ impl Library {
         self.store.default_folder(account).map(|f| f.id.clone()).unwrap_or_default()
     }
 
+    /// The folder an account's notes go to and its list opens on when none
+    /// is chosen: its Notes folder, unless that was deleted.
+    pub fn home_folder_id(&self, account: &str) -> String {
+        self.store.home_folder(account).map(|f| f.id.clone()).unwrap_or_default()
+    }
+
     /// Marks a note as changed outside the library's own methods (so it's
     /// saved).
     pub fn mark_changed(&mut self, id: &str) {
@@ -269,9 +275,9 @@ impl Library {
                 .settings
                 .last_folder
                 .clone()
-                .filter(|f| self.store.folder(f).is_some_and(|f| self.account_enabled(&f.account)))
-                .or_else(|| self.store.default_folder(&self.settings.default_account).map(|f| f.id.clone()))
-                .or_else(|| self.store.default_folder(&self.fallback_account()).map(|f| f.id.clone()))
+                .filter(|f| self.store.folder(f).is_some_and(|f| self.account_enabled(&f.account) && self.store.folder_shown(f)))
+                .or_else(|| self.store.home_folder(&self.settings.default_account).map(|f| f.id.clone()))
+                .or_else(|| self.store.home_folder(&self.fallback_account()).map(|f| f.id.clone()))
                 .unwrap_or_default();
             Location::Folder(folder)
         };
@@ -558,7 +564,7 @@ impl Library {
             _ => self.settings.default_account.clone(),
         };
         let account = if self.account_enabled(&account) { account } else { self.fallback_account() };
-        let folder = self.default_folder_id(&account);
+        let folder = self.home_folder_id(&account);
         (account, folder)
     }
 
@@ -812,6 +818,13 @@ impl Library {
     /// account, inside `parent` if given. Returns its id.
     pub fn new_folder(&mut self, account: &str, parent: Option<&str>, name: Option<&str>) -> String {
         let base = name.map(|n| n.trim().replace('/', "∕")).filter(|n| !n.is_empty()).unwrap_or_else(|| "New Folder".into());
+        // "Notes" where the deleted default folder was brings that back.
+        if let Some(d) = self.store.default_folder(account).filter(|d| d.hidden && parent.is_none() && d.name.eq_ignore_ascii_case(&base)) {
+            let id = d.id.clone();
+            self.store.folder_mut(&id).unwrap().hidden = false;
+            self.settings.collapsed.retain(|c| c != account);
+            return id;
+        }
         let name = self.store.unique_folder_name(account, parent, &base);
         let f = Folder::new(account, parent, &name);
         let id = f.id.clone();
@@ -839,12 +852,11 @@ impl Library {
     }
 
     /// Deletes a folder and the folders in it; their notes go to Recently
-    /// Deleted. Returns the folders deleted (none for a default folder).
+    /// Deleted. Returns the folders deleted. A default folder itself stays
+    /// (notes with nowhere else to go still land in it), just out of the
+    /// sidebar while it's empty.
     pub fn delete_folder(&mut self, id: &str) -> Vec<String> {
         let Some(f) = self.store.folder(id).cloned() else { return vec![] };
-        if f.default {
-            return vec![];
-        }
         let ids = self.store.folder_and_descendants(id);
         let default = self.default_folder_id(&f.account);
         let now = Utc::now();
@@ -857,14 +869,17 @@ impl Library {
             n.touch();
             self.unsaved.insert(n.id.clone());
         }
-        for fid in &ids {
+        for fid in ids.iter().filter(|fid| **fid != default) {
             let path = self.store.folder_path(fid);
             if let Some(remote_id) = self.store.folder(fid).and_then(|f| f.sync.remote_id.clone()) {
                 let path = self.store.folder(fid).and_then(|f| f.sync.synced_path.clone()).unwrap_or(path);
                 self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
             }
         }
-        self.store.folders.retain(|f| !ids.contains(&f.id));
+        self.store.folders.retain(|f| f.id == default || !ids.contains(&f.id));
+        if f.default {
+            self.store.folder_mut(id).unwrap().hidden = true;
+        }
         ids
     }
 
@@ -1847,8 +1862,35 @@ mod tests {
         assert_eq!(lib.delete_folder(&a).len(), 2);
         assert!(lib.store.folder(&sub).is_none());
         assert!(lib.store.note(&n).unwrap().deleted.is_some());
-        let home = lib.default_folder_id(LOCAL);
-        assert!(lib.delete_folder(&home).is_empty(), "the default folder stays");
+    }
+
+    #[test]
+    fn the_notes_folder_can_be_deleted_and_comes_back_when_used() {
+        let (mut lib, _d) = lib();
+        let notes = lib.default_folder_id(LOCAL);
+        let work = lib.new_folder(LOCAL, None, Some("Work"));
+        let n = add(&mut lib, &notes, "# Old\n");
+        let sub = lib.new_folder(LOCAL, Some(&notes), Some("Inside"));
+        let shown = |lib: &Library| lib.store.folder_tree(LOCAL).iter().map(|(f, _)| f.name.clone()).collect::<Vec<_>>();
+        assert_eq!(shown(&lib), ["Notes", "Inside", "Work"]);
+
+        assert_eq!(lib.delete_folder(&notes).len(), 2);
+        assert!(lib.store.note(&n).unwrap().deleted.is_some(), "its notes go to Recently Deleted");
+        assert!(lib.store.folder(&sub).is_none(), "so do its folders");
+        assert_eq!(shown(&lib), ["Work"], "Notes is out of the sidebar");
+        assert_eq!(lib.default_folder_id(LOCAL), notes, "but still there for notes with nowhere else to go");
+        assert_eq!(lib.new_note_target(&Location::All), (LOCAL.to_owned(), work.clone()), "new notes go elsewhere");
+        assert_eq!(lib.initial_location().0, Location::Folder(work.clone()));
+
+        // A note recovered into it brings it back while it has notes.
+        lib.recover_note(&n);
+        assert_eq!(shown(&lib), ["Notes", "Work"]);
+        lib.move_notes(&[n.clone()], &work);
+        assert_eq!(shown(&lib), ["Work"]);
+
+        // As does making a folder called Notes, for good.
+        assert_eq!(lib.new_folder(LOCAL, None, Some("notes")), notes);
+        assert_eq!(shown(&lib), ["Notes", "Work"]);
     }
 
     #[test]

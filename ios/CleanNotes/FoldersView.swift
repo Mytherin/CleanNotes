@@ -145,9 +145,7 @@ struct FoldersView: View {
                                 .padding(.leading, CGFloat(f.depth) * 18)
                         }
                         .swipeActions(edge: .trailing) {
-                            if !f.isDefault {
-                                Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
-                            }
+                            Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
                         }
                         .contextMenu { folderMenu(f, account: account) }
                     }
@@ -218,10 +216,8 @@ struct FoldersView: View {
                 Label(collapsed.contains(f.id) ? "Show Subfolders" : "Hide Subfolders", systemImage: "chevron.down")
             }
         }
-        if !f.isDefault {
-            Divider()
-            Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
-        }
+        Divider()
+        Button(role: .destructive) { deleting = f } label: { Label("Delete", systemImage: "trash") }
     }
 
     private func newFolder(account: String, parent: String?) {

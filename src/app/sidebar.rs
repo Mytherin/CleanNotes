@@ -232,7 +232,7 @@ impl App {
                 self.rename = Some(Rename { folder: id.to_owned(), text: name.to_owned(), focus: true });
                 ui.close_menu();
             }
-            if ui.add_enabled(!default, egui::Button::new("Delete Folder")).clicked() {
+            if ui.button("Delete Folder").clicked() {
                 self.confirm = Some(Confirm::DeleteFolder(id.to_owned()));
                 ui.close_menu();
             }

@@ -85,8 +85,13 @@ pub struct Folder {
     pub account: String,
     pub parent: Option<String>,
     pub name: String,
-    /// The account's "Notes" folder: can't be renamed or deleted.
+    /// The account's "Notes" folder: can't be renamed, and is never really
+    /// deleted (notes with nowhere else to go land in it).
     pub default: bool,
+    /// A default folder the user deleted: it stays out of the sidebar while
+    /// nothing is in it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
     #[serde(default)]
     pub sync: FolderSync,
 }
@@ -99,6 +104,7 @@ impl Folder {
             parent: parent.map(str::to_owned),
             name: name.to_owned(),
             default: false,
+            hidden: false,
             sync: FolderSync::default(),
         }
     }
@@ -404,11 +410,32 @@ impl Store {
     }
 
     /// Folders of an account in sidebar order: depth first, by name, the
-    /// default folder first. Returns (folder, depth).
+    /// default folder first (left out if it was deleted and is empty).
+    /// Returns (folder, depth).
     pub fn folder_tree(&self, account: &str) -> Vec<(&Folder, usize)> {
         let mut out = Vec::new();
         self.walk(account, None, 0, &mut out);
+        out.retain(|(f, _)| self.folder_shown(f));
         out
+    }
+
+    /// Whether a folder is in the sidebar: all are, but a default folder
+    /// the user deleted, while it has no notes or folders in it.
+    pub fn folder_shown(&self, f: &Folder) -> bool {
+        !f.hidden
+            || self.notes.iter().any(|n| n.folder == f.id && n.deleted.is_none())
+            || self.folders.iter().any(|c| c.parent.as_deref() == Some(f.id.as_str()))
+    }
+
+    /// Where an account's notes go and its list opens when no folder is
+    /// chosen: its default folder, or (once that's deleted) the first
+    /// folder in the sidebar, if any.
+    pub fn home_folder(&self, account: &str) -> Option<&Folder> {
+        let default = self.default_folder(account)?;
+        if self.folder_shown(default) {
+            return Some(default);
+        }
+        self.folder_tree(account).first().map(|(f, _)| *f).or(Some(default))
     }
 
     fn walk<'a>(&'a self, account: &str, parent: Option<&str>, depth: usize, out: &mut Vec<(&'a Folder, usize)>) {
