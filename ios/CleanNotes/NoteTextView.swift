@@ -5,6 +5,7 @@ import QuickLook
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
+import VisionKit
 
 // The note editor: a UITextView whose text is the shared editing engine's
 // document (the same one the desktop editor drives). Every edit goes to the
@@ -965,7 +966,7 @@ struct NoteEditorView: UIViewRepresentable {
         }
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIGestureRecognizerDelegate, PHPickerViewControllerDelegate, UIDocumentPickerDelegate, VNDocumentCameraViewControllerDelegate {
         let editor: NoteEditor
         let store: NotesStore
         let bridge: EditorBridge
@@ -1161,6 +1162,61 @@ struct NoteEditorView: UIViewRepresentable {
                     guard let data else { return }
                     DispatchQueue.main.async { self?.attachImage(data) }
                 }
+            }
+        }
+
+        // ---- Scanned documents ----
+
+        /// The document camera, as in Apple Notes: its pages are attached
+        /// as one PDF.
+        fileprivate func scanDocumentsTapped() {
+            if readOnly {
+                blockedEdit()
+                return
+            }
+            guard VNDocumentCameraViewController.isSupported else {
+                store.show("This device can't scan documents.")
+                return
+            }
+            let scanner = VNDocumentCameraViewController()
+            scanner.delegate = self
+            topController()?.present(scanner, animated: true)
+        }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController, didFinishWith scan: VNDocumentCameraScan) {
+            controller.dismiss(animated: true)
+            guard scan.pageCount > 0 else { return }
+            let pages = (0..<scan.pageCount).map { scan.imageOfPage(at: $0) }
+            // The PDF is made away from the main thread (a page is a
+            // full-resolution photo).
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let pdf = ScannedDocument.pdf(pages)
+                DispatchQueue.main.async { self?.attachScan(pdf) }
+            }
+        }
+
+        func documentCameraViewControllerDidCancel(_ controller: VNDocumentCameraViewController) {
+            controller.dismiss(animated: true)
+        }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController, didFailWithError error: Error) {
+            controller.dismiss(animated: true)
+            store.show("The document can't be scanned.")
+        }
+
+        /// Puts a scan's PDF at the caret, as an attached file.
+        func attachScan(_ pdf: Data?) {
+            let label = ScannedDocument.fileName
+            guard let pdf, !readOnly else {
+                store.show("The scan can't be attached.")
+                return
+            }
+            // A locked note's files are encrypted (the core does it).
+            do {
+                let reference = try store.core.addNoteFile(id: editor.noteId(), data: pdf, fileName: label)
+                command(.insertFile(reference: reference, label: label))
+            } catch {
+                store.show("The scan can't be attached.")
             }
         }
 
@@ -1443,9 +1499,13 @@ struct NoteEditorView: UIViewRepresentable {
                 },
             ]))
             table.accessibilityLabel = "Table"
+            // As in Apple Notes: photos, the two scanners, then files. The
+            // menu is made when it opens (scanning needs a camera, and Scan
+            // Text an editable note).
             let attach = UIBarButtonItem(image: UIImage(systemName: "paperclip"), menu: UIMenu(children: [
-                UIAction(title: "Choose Photo", image: UIImage(systemName: "photo.on.rectangle")) { [weak self] _ in self?.photoTapped() },
-                UIAction(title: "Attach File", image: UIImage(systemName: "doc")) { [weak self] _ in self?.fileTapped() },
+                UIDeferredMenuElement.uncached { [weak self] completion in
+                    completion(self?.attachMenuItems() ?? [])
+                },
             ]))
             attach.accessibilityLabel = "Attach"
             bar.items = [
@@ -1460,6 +1520,29 @@ struct NoteEditorView: UIViewRepresentable {
             ]
             bar.tintColor = .label
             return bar
+        }
+
+        /// The paperclip's menu.
+        private func attachMenuItems() -> [UIMenuElement] {
+            var items: [UIMenuElement] = [
+                UIAction(title: "Choose Photo", image: UIImage(systemName: "photo.on.rectangle")) { [weak self] _ in self?.photoTapped() },
+            ]
+            let scanDocuments = UIAction(title: "Scan Documents", image: UIImage(systemName: "doc.viewfinder")) { [weak self] _ in self?.scanDocumentsTapped() }
+            if !VNDocumentCameraViewController.isSupported { scanDocuments.attributes = .disabled }
+            items.append(scanDocuments)
+            if let tv = textView {
+                // The system's Live Text camera: what it reads is typed at
+                // the caret, as from the keyboard.
+                let scanText = UIAction.captureTextFromCamera(responder: tv, identifier: nil)
+                scanText.title = "Scan Text"
+                scanText.image = UIImage(systemName: "text.viewfinder")
+                if readOnly || !tv.canPerformAction(#selector(UIResponder.captureTextFromCamera(_:)), withSender: nil) {
+                    scanText.attributes = .disabled
+                }
+                items.append(scanText)
+            }
+            items.append(UIAction(title: "Attach File", image: UIImage(systemName: "doc")) { [weak self] _ in self?.fileTapped() })
+            return items
         }
 
         @objc private func formatTapped() { toggleFormatPanel() }
@@ -1525,5 +1608,39 @@ final class AttachmentPreview: NSObject, QLPreviewControllerDataSource {
 
     func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
         url as NSURL
+    }
+}
+
+/// A document camera's pages made into a PDF.
+enum ScannedDocument {
+    static let fileName = "Scanned Document.pdf"
+
+    /// The width of a page, in points: US Letter's, so a scanned sheet
+    /// prints at about its size.
+    static let pageWidth: CGFloat = 612
+
+    /// One page per image, each the image's shape, the image kept as JPEG
+    /// (a PDF of camera pixels would be tens of megabytes). Nil when there
+    /// are no pages.
+    static func pdf(_ pages: [UIImage], quality: CGFloat = 0.8) -> Data? {
+        let data = NSMutableData()
+        guard !pages.isEmpty,
+              let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: nil, nil) else { return nil }
+        var count = 0
+        for page in pages {
+            // jpegData bakes in the orientation, so the pixels are upright.
+            guard let jpeg = page.jpegData(compressionQuality: quality),
+                  let provider = CGDataProvider(data: jpeg as CFData),
+                  let image = CGImage(jpegDataProviderSource: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
+                  image.width > 0, image.height > 0 else { continue }
+            var box = CGRect(x: 0, y: 0, width: pageWidth, height: pageWidth * CGFloat(image.height) / CGFloat(image.width))
+            context.beginPage(mediaBox: &box)
+            context.draw(image, in: box)
+            context.endPage()
+            count += 1
+        }
+        context.closePDF()
+        return count > 0 ? data as Data : nil
     }
 }
