@@ -38,6 +38,9 @@ fn insertion_line(ui: &Ui, p: &Palette, row: Rect, depth: usize, y: f32) {
 }
 
 const ROW_H: f32 = 32.0;
+/// The Tags section's entry in the folded sections and folders (which are
+/// otherwise ids, none of which starts with "#").
+const TAGS_KEY: &str = "#tags";
 /// The gap around the floating sidebar panel.
 const INSET: f32 = 8.0;
 
@@ -435,8 +438,25 @@ impl App {
         if tags.is_empty() {
             return;
         }
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+        // Folded like an account: click the header; remembered with them.
+        let collapsed = self.lib.settings.collapsed.iter().any(|c| c == TAGS_KEY);
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
         ui.painter().text(Pos2::new(rect.left() + 16.0, rect.center().y + 2.0), Align2::LEFT_CENTER, "Tags", theme::bold_font(12.0), p.secondary);
+        if resp.hovered() {
+            let icon = if collapsed { Icon::ChevronRight } else { Icon::ChevronDown };
+            let right = Pos2::new(rect.right() - 16.0, rect.center().y + 2.0);
+            icons::paint(ui.painter(), icon, Rect::from_center_size(right, Vec2::splat(12.0)), p.secondary);
+        }
+        if resp.clicked() {
+            if collapsed {
+                self.lib.settings.collapsed.retain(|c| c != TAGS_KEY);
+            } else {
+                self.lib.settings.collapsed.push(TAGS_KEY.to_owned());
+            }
+        }
+        if collapsed {
+            return;
+        }
         ui.add_space(4.0);
         egui::Frame::none().inner_margin(egui::Margin { left: 12.0, right: 8.0, top: 0.0, bottom: 0.0 }).show(ui, |ui| ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);

@@ -185,7 +185,10 @@ struct FoldersView: View {
                 }
             }
             if !overview.tags.isEmpty {
-                Section("Tags") {
+                Section("Tags", isExpanded: Binding(
+                    get: { !collapsed.contains("#tags") },
+                    set: { open in if open { collapsed.remove("#tags") } else { collapsed.insert("#tags") } }
+                )) {
                     TagCloud(tags: overview.tags) { tag in path.append(.list(.tag(name: tag))) }
                 }
             }
