@@ -823,6 +823,10 @@ impl App {
                 if let Some(e) = &mut self.editor {
                     e.focus_requested = true;
                     self.focus = Pane::Note;
+                } else if self.selected.as_ref().is_some_and(|s| self.is_closed(s)) {
+                    // A locked note: to its password field.
+                    self.lock.focus = true;
+                    self.focus = Pane::Note;
                 }
             }
         }
