@@ -65,6 +65,11 @@ fn enex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
     if out.is_empty() {
         bail!("Choose a .enex file, or a folder of them.");
     }
+    // Each file once, however it was given (a folder and a file in it, the
+    // same file twice): else its notes would be added twice, as the check
+    // for notes already imported only knows those from before.
+    let mut seen = HashSet::new();
+    out.retain(|f| seen.insert(std::fs::canonicalize(f).unwrap_or_else(|_| f.clone())));
     Ok(out)
 }
 
@@ -288,6 +293,19 @@ mod tests {
         drop(app);
         let app = App::for_test(&dir.path().join("data"));
         assert_eq!(app.lib.store.notes.len(), 3);
+    }
+
+    #[test]
+    fn a_file_given_twice_is_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::for_test(&dir.path().join("data"));
+        let files = dir.path().join("enex");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::write(files.join("a.enex"), export(&note("One", "first", "Cats", "20190101T101010Z"))).unwrap();
+        // The folder, and the file in it (as dropped together, or typed).
+        let r = app.import_enex(&[files.clone(), files.join("a.enex"), files.join(".").join("a.enex")], crate::model::LOCAL).unwrap();
+        assert_eq!((r.notes, r.skipped), (1, 0));
+        assert_eq!(app.lib.store.notes.iter().filter(|n| n.title() == "One").count(), 1);
     }
 
     #[test]
