@@ -4,9 +4,9 @@ import XCTest
 
 /// The note editor as the app wires it: a real text view, the coordinator
 /// and the Rust editing engine, in a notes library of its own. Typing goes
-/// through `insertText` and `deleteBackward`, as the keyboard's does, so the
-/// text view's delegate decides what the text view and the engine do. After
-/// every edit the two must agree.
+/// key by key through the text view's delegate, as the keyboard's does, so
+/// the delegate decides what the text view and the engine do. After every
+/// edit the two must agree.
 final class NoteEditorTests: XCTestCase {
     private var dir: URL!
     private var store: NotesStore!
@@ -39,8 +39,31 @@ final class NoteEditorTests: XCTestCase {
     /// Types `text` a character at a time ("\n" is Return).
     private func type(_ text: String, into tv: NoteTextView) {
         for ch in text {
-            tv.insertText(String(ch))
+            key(String(ch), replacing: tv.selectedRange, in: tv)
         }
+    }
+
+    /// Backspace: the character (or selection) before the caret.
+    private func backspace(_ tv: NoteTextView) {
+        var r = tv.selectedRange
+        if r.length == 0 {
+            if r.location == 0 { return }
+            r = (tv.text as NSString).rangeOfComposedCharacterSequence(at: r.location - 1)
+        }
+        key("", replacing: r, in: tv)
+    }
+
+    /// One key, as the keyboard sends it: the delegate is asked first, and
+    /// only if it allows the change does the text view make it (and then say
+    /// it changed). `insertText`/`deleteBackward` called from a test don't
+    /// reliably ask the delegate (the text view isn't being edited), so the
+    /// engine would only see the text afterwards, without list handling.
+    private func key(_ s: String, replacing r: NSRange, in tv: NoteTextView) {
+        guard let d = tv.delegate else { return XCTFail("no delegate") }
+        guard d.textView?(tv, shouldChangeTextIn: r, replacementText: s) ?? true else { return }
+        tv.textStorage.replaceCharacters(in: r, with: NSAttributedString(string: s, attributes: tv.typingAttributes))
+        tv.selectedRange = NSRange(location: r.location + (s as NSString).length, length: 0)
+        d.textViewDidChange?(tv)
     }
 
     private func paragraphs(_ c: NoteEditorView.Coordinator) -> [Paragraph] {
@@ -93,7 +116,7 @@ final class NoteEditorTests: XCTestCase {
         let (tv, c) = newNote()
         type("T\n- a", into: tv)
         tv.selectedRange = NSRange(location: 2, length: 0)
-        tv.deleteBackward()
+        backspace(tv)
         let ps = paragraphs(c)
         XCTAssertEqual(ps.count, 2)
         XCTAssertEqual(ps[1].style, .body)
@@ -107,8 +130,8 @@ final class NoteEditorTests: XCTestCase {
         XCTAssertEqual(c.editor.plainText(), "a👍🏽b")
         XCTAssertEqual(c.editor.state().selectionStart, 6, "👍🏽 is four UTF-16 units")
         assertInStep(tv, c)
-        tv.deleteBackward()
-        tv.deleteBackward()
+        backspace(tv)
+        backspace(tv)
         XCTAssertEqual(c.editor.plainText(), "a")
         assertInStep(tv, c)
     }
