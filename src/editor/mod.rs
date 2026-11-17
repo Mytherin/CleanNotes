@@ -154,6 +154,11 @@ impl Editor {
         self.laid.iter().flat_map(|l| &l.images).find(|img| img.rect.contains(pt))
     }
 
+    /// The PDF preview under a point, if any.
+    fn preview_at(&self, pt: Pos2) -> Option<&layout::LaidPreview> {
+        self.laid.iter().filter_map(|l| l.preview.as_ref()).find(|pv| pv.page.rect.contains(pt))
+    }
+
     /// The position under a point (screen coordinates).
     fn pos_at(&self, pt: Pos2) -> Pos {
         if self.laid.is_empty() {
@@ -559,7 +564,7 @@ impl Editor {
                     let row_h = h + 2.0 * layout::CELL_PAD.y;
                     for (col, galley) in row.into_iter().enumerate() {
                         let rect = Rect::from_min_size(Pos2::new(left + col as f32 * col_w, y), Vec2::new(col_w, row_h));
-                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None, images: Vec::new() });
+                        laid.push(Laid { rect, origin: rect.min + layout::CELL_PAD, galley, checkbox: None, images: Vec::new(), preview: None });
                     }
                     y += row_h;
                     ys.push(y);
@@ -602,7 +607,7 @@ impl Editor {
                 let galley = ui.fonts(|f| f.layout_job(layout::job(&empty, body, p, width - indent, &Marks::default(), false)));
                 let h = iy - y - layout::IMAGE_GAP / 2.0;
                 let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-                laid.push(Laid { rect, origin: Pos2::new(left + indent, y), galley, checkbox: None, images });
+                laid.push(Laid { rect, origin: Pos2::new(left + indent, y), galley, checkbox: None, images, preview: None });
                 y += h + 1.0;
                 continue;
             }
@@ -610,9 +615,21 @@ impl Editor {
             let galley = ui.fonts(|f| f.layout_job(job));
             let mono_pad = if b.kind == Kind::Monospaced { 2.0 } else { 0.0 };
             let origin = Pos2::new(left + indent, y + mono_pad);
-            let h = galley.rect.height().max(layout::size(b.kind, body) * 1.2) + 2.0 * mono_pad;
+            let mut h = galley.rect.height().max(layout::size(b.kind, body) * 1.2) + 2.0 * mono_pad;
+            // A link to an attached PDF: its first page below it (once it's
+            // drawn; nothing if it isn't here or can't be read).
+            let preview = layout::pdf_link(b).and_then(|(reference, label)| {
+                let shown = opts.images.get(&ctx, &reference);
+                if !matches!(shown, images::Shown::Ready(..) | images::Shown::Loading) {
+                    return None;
+                }
+                let size = images::preview_size(shown, (width - indent - 4.0).max(40.0));
+                let rect = Rect::from_min_size(Pos2::new(left + indent, y + h + layout::PREVIEW_GAP), size);
+                h += size.y + 2.0 * layout::PREVIEW_GAP;
+                Some(layout::LaidPreview { page: layout::LaidImage { name: reference, shown, rect }, label })
+            });
             let rect = Rect::from_min_size(Pos2::new(left, y), Vec2::new(width, h));
-            laid.push(Laid { rect, origin, galley, checkbox: None, images: Vec::new() });
+            laid.push(Laid { rect, origin, galley, checkbox: None, images: Vec::new(), preview });
             y += h + 1.0;
         }
         let content = Rect::from_min_max(full.min, Pos2::new(full.right(), (y + 120.0).max(full.bottom())));
@@ -662,13 +679,21 @@ impl Editor {
                     painter.rect_filled(img.rect, 0.0, c.gamma_multiply(0.6));
                 }
             }
+            if let Some(pv) = &l.preview {
+                layout::paint_preview(&painter, pv, p);
+                // Selected with all of its link: tinted too.
+                if !self.sel.is_empty() && sel_start <= Pos::new(i, 0) && Pos::new(i, b.len()) <= sel_end {
+                    let c = if focused { p.text_selection } else { p.selection_inactive };
+                    painter.rect_filled(pv.page.rect, 0.0, c.gamma_multiply(0.6));
+                }
+            }
         }
         self.laid = laid;
 
         // ---- Pointer ----
         let pointer = ui.input(|i| i.pointer.interact_pos());
         let hover_link = resp.hovered().then(|| pointer.and_then(|pt| self.link_at(pt))).flatten();
-        if let Some(_) = &hover_link {
+        if hover_link.is_some() || (resp.hovered() && pointer.is_some_and(|pt| self.preview_at(pt).is_some())) {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         } else if resp.hovered() {
             let over_box = pointer.is_some_and(|pt| self.laid.iter().any(|l| l.checkbox.is_some_and(|r| r.contains(pt))) || self.image_at(pt).is_some());
@@ -744,6 +769,9 @@ impl Editor {
                     }
                     None => out.open_url = Some(url),
                 }
+            } else if let Some(pv) = pointer.and_then(|pt| self.preview_at(pt)) {
+                // A PDF's preview opens it, as its link does.
+                out.open_file = Some((pv.page.name.clone(), pv.label.clone()));
             }
         }
         self.context_menu(&resp, opts, &ctx, &mut out);
@@ -1057,6 +1085,55 @@ mod tests {
         // A picture that isn't here shows as a box, waiting for it.
         let cache = images::ImageCache::new(dir.path().join("elsewhere"));
         assert_eq!(cache.get(&ctx, &name), images::Shown::Missing);
+    }
+
+    #[test]
+    fn attached_pdfs_show_their_first_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let pdf = images::tests::test_pdf(612, 792);
+        let name = cleannotes_core::attachments::save_file(dir.path(), &pdf, "pass.pdf").unwrap();
+        let doc = cleannotes_core::attachments::save_file(dir.path(), b"PK\x03\x04", "notes.docx").unwrap();
+        let cache = images::ImageCache::new(dir.path().to_owned());
+        let md = format!("# Trip\n[pass.pdf](attachments/{name})\n[notes.docx](attachments/{doc})\nsee [pass.pdf](attachments/{name})\nafter\n");
+        let mut e = Editor::new("n", &md);
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let input = || egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 900.0))), ..Default::default() };
+        let frame = |e: &mut Editor, input: egui::RawInput| {
+            let mut out = Output::default();
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = crate::theme::Palette::get(ctx);
+                    let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache, can_attach: true };
+                    out = e.show(ui, &p, &opts, "");
+                });
+            });
+            out
+        };
+        // Drawn on a thread of its own: shown a few frames on.
+        for _ in 0..500 {
+            frame(&mut e, input());
+            if e.laid[1].preview.as_ref().is_some_and(|pv| matches!(pv.page.shown, images::Shown::Ready(..))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pv = e.laid[1].preview.as_ref().expect("the PDF has a preview");
+        assert!(matches!(pv.page.shown, images::Shown::Ready(_, s) if s == Vec2::new(612.0, 792.0)), "{:?}", pv.page.shown);
+        assert_eq!((pv.page.name.as_str(), pv.label.as_str()), (name.as_str(), "pass.pdf"));
+        let r = pv.page.rect;
+        assert_eq!(r.width(), images::PREVIEW_W);
+        // Below its link, which is text as before; the rest below it.
+        let link = e.laid[1].galley.rect.translate(e.laid[1].origin.to_vec2());
+        assert!(r.top() > link.bottom() && e.laid[2].rect.top() > r.bottom());
+        assert!(e.preview_at(r.center()).is_some());
+        // Other files, and a PDF linked inside text, are links only.
+        assert!(e.laid[2].preview.is_none() && e.laid[3].preview.is_none());
+        // A click on it opens the PDF.
+        let click = |pressed| egui::Event::PointerButton { pos: r.center(), button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        frame(&mut e, egui::RawInput { events: vec![egui::Event::PointerMoved(r.center()), click(true)], ..input() });
+        let out = frame(&mut e, egui::RawInput { events: vec![click(false)], ..input() });
+        assert_eq!(out.open_file, Some((name.clone(), "pass.pdf".to_owned())));
     }
 
     #[test]

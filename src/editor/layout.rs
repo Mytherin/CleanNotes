@@ -62,6 +62,58 @@ pub struct Laid {
     /// (character `i` is picture `i`). Its galley is then empty: the caret,
     /// clicks and selection go by these.
     pub images: Vec<LaidImage>,
+    /// A paragraph that's a link to an attached PDF: its first page, shown
+    /// below the link (the galley is the link as usual).
+    pub preview: Option<LaidPreview>,
+}
+
+/// An attached PDF's preview as laid out.
+pub struct LaidPreview {
+    /// The page (`name` is the attachment's reference).
+    pub page: LaidImage,
+    /// The link's text: the file's name.
+    pub label: String,
+}
+
+/// Space between a PDF's link and its preview, and below the preview.
+pub const PREVIEW_GAP: f32 = 6.0;
+
+/// If a paragraph is only a link to an attached PDF (as attaching one
+/// makes it), the attachment's reference and the link's text. (A PDF of a
+/// locked note is encrypted, its reference ending in `.enc`: its name
+/// tells.)
+pub fn pdf_link(b: &Block) -> Option<(String, String)> {
+    if matches!(b.kind, Kind::Monospaced) || b.kind.is_cell() {
+        return None;
+    }
+    let url = b.styles.first()?.link.clone()?;
+    if b.styles.iter().any(|s| s.link.as_deref() != Some(&*url) || s.image.is_some()) {
+        return None;
+    }
+    let reference = cleannotes_core::attachments::file_link_ref(&url)?;
+    let (name, _) = cleannotes_core::attachments::split_ref(reference);
+    let label = b.text.trim();
+    let pdf = |s: &str| s.len() > 4 && s[s.len() - 4..].eq_ignore_ascii_case(".pdf");
+    let sealed = name.ends_with(&format!(".{}", cleannotes_core::attachments::SEALED_EXT));
+    (pdf(name) || (sealed && pdf(label))).then(|| (reference.to_owned(), label.to_owned()))
+}
+
+/// Draws a PDF's first page as a sheet of paper, or a box while it's drawn.
+pub fn paint_preview(painter: &egui::Painter, pv: &LaidPreview, p: &Palette) {
+    use super::images::Shown;
+    let r = pv.page.rect;
+    let edge = Stroke::new(1.0_f32, theme::blend(p.bg, p.tertiary, 0.4));
+    match pv.page.shown {
+        Shown::Ready(tex, _) => {
+            painter.rect_filled(r.translate(Vec2::new(0.0, 1.5)).expand(1.0), 3.0, Color32::from_black_alpha(28));
+            painter.image(tex, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.rect_stroke(r, 0.0, edge);
+        }
+        _ => {
+            painter.rect(r, 4.0, p.code_bg, edge);
+            painter.text(r.center(), Align2::CENTER_CENTER, "Loading…", FontId::proportional(12.5), p.secondary);
+        }
+    }
 }
 
 /// A picture as laid out.

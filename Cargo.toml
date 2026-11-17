@@ -33,6 +33,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rfd = "0.15"
 # Pasting a picture (egui's clipboard only carries text).
 arboard = { version = "3", features = ["image-data"] }
+hayro = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
