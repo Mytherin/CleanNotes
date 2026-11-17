@@ -232,6 +232,11 @@ pub struct AccountItem {
     pub deleted_count: u32,
     /// An S3 account's bucket and folder.
     pub s3: Option<S3Settings>,
+    /// Any account but the last one can be removed.
+    pub can_remove: bool,
+    /// Its notes here, Recently Deleted included (what removing the local
+    /// account deletes).
+    pub note_count: u32,
 }
 
 /// Where an S3 account keeps its notes (no keys: those are in the
@@ -499,6 +504,8 @@ impl NotesCore {
                         BackendConfig::S3(c) => Some(S3Settings::of(c)),
                         _ => None,
                     },
+                    can_remove: lib.can_remove_account(&a.id),
+                    note_count: lib.account_note_count(&a.id) as u32,
                 }
             })
             .collect();
@@ -853,8 +860,15 @@ impl NotesCore {
         self.lib().any_syncing()
     }
 
+    /// Removes an account (any but the last): a synced one's notes stay
+    /// where they're synced to; the local account's are deleted for good.
     pub fn remove_account(&self, id: String) {
         self.lib().remove_account(&id);
+    }
+
+    /// Adds "On My iPhone" back, empty, after it was removed.
+    pub fn add_local_account(&self) {
+        self.lib().add_local_account();
     }
 
     /// Adds an S3 account after [`check_s3`], or with `again` (an
@@ -1462,6 +1476,31 @@ mod tests {
         assert_eq!(s3_of(&core).name, "Work notes");
         assert_eq!(core.lib().db.secret(&id).as_deref(), Some("k2"));
         assert_eq!(core.overview().accounts.len(), 2);
+    }
+
+    #[test]
+    fn on_my_iphone_can_be_removed_and_added_back() {
+        let (core, _dir) = core();
+        let local = |core: &NotesCore| core.overview().accounts.into_iter().find(|a| a.id == local_account_id());
+        // Alone, it can't be removed.
+        assert!(!local(&core).unwrap().can_remove);
+        let s3 = S3Settings { bucket: "notes".into(), region: "".into(), folder: "".into(), endpoint: Some("http://127.0.0.1:9/".into()), encrypted: false };
+        let id = core.add_s3_account(None, "Work".into(), S3Checked { settings: s3, secret: "k".into() });
+        let home = core.lib().default_folder_id(LOCAL);
+        let n = cleannotes_core::model::Note::new(LOCAL, &home, "# Only here\n");
+        core.lib().store.notes.push(n);
+        let a = local(&core).unwrap();
+        assert!(a.can_remove);
+        assert_eq!(a.note_count, 1);
+        core.remove_account(local_account_id());
+        assert!(local(&core).is_none());
+        // The S3 account is now the last one.
+        assert!(!core.overview().accounts[0].can_remove);
+        assert_eq!(core.overview().accounts[0].id, id);
+        core.add_local_account();
+        let a = local(&core).unwrap();
+        assert_eq!(a.note_count, 0);
+        assert!(a.can_remove);
     }
 
     fn editor(md: &str) -> Arc<NoteEditor> {

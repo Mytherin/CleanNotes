@@ -27,6 +27,9 @@ struct SettingsView: View {
                         }
                     }
                     NavigationLink("Add S3 Account") { S3AccountView(again: nil) }
+                    if !overview.accounts.contains(where: { $0.id == localAccountId() }) {
+                        Button("Add “On My iPhone”") { store.perform { $0.addLocalAccount() } }
+                    }
                 }
                 if overview.accounts.count > 1 {
                     Section {
@@ -168,7 +171,7 @@ struct SettingsView: View {
     }
 }
 
-/// A synced account: its state, Sync Now, Sign In Again, Remove.
+/// An account: its state, Sync Now and Sign In Again (if synced), Remove.
 struct AccountDetailView: View {
     @EnvironmentObject private var store: NotesStore
     @Environment(\.dismiss) private var dismiss
@@ -216,10 +219,15 @@ struct AccountDetailView: View {
                             NavigationLink("Change Access Key") { S3AccountView(again: a) }
                         }
                     }
+                }
+                // Any account but the last can be removed, "On My iPhone"
+                // too (its notes are deleted), as on the desktop.
+                if a.synced || a.canRemove {
                     Section {
                         Button("Remove Account", role: .destructive) { confirmRemove = true }
+                            .disabled(!a.canRemove)
                     } footer: {
-                        Text("Its notes are removed from this iPhone. They stay where they're synced to.")
+                        Text(removeFooter(a))
                     }
                 }
             }
@@ -230,10 +238,26 @@ struct AccountDetailView: View {
                     store.perform { $0.removeAccount(id: a.id) }
                     dismiss()
                 }
+            } message: {
+                Text(a.synced ? "Its notes are removed from this iPhone. They stay where they're synced to." : localRemoveMessage(a))
             }
         } else {
             ContentUnavailableView("No Account", systemImage: "person.crop.circle.badge.questionmark")
         }
+    }
+
+    private func removeFooter(_ a: AccountItem) -> String {
+        if !a.canRemove {
+            return "The last account can't be removed."
+        }
+        return a.synced
+            ? "Its notes are removed from this iPhone. They stay where they're synced to."
+            : "Its notes are only on this iPhone and are deleted for good. It can be added back, empty, in Settings."
+    }
+
+    private func localRemoveMessage(_ a: AccountItem) -> String {
+        let notes = a.noteCount == 1 ? "Its 1 note is" : "Its \(a.noteCount) notes are"
+        return "\(notes) deleted for good: they're only on this iPhone. You can add the account back, empty, in Settings."
     }
 }
 
