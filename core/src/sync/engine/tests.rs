@@ -242,6 +242,7 @@ fn deleting_a_folder_syncs() {
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Work".into()],
         revision: None,
+        note_id: None,
     });
     laptop.sync();
     assert!(laptop.store.folder_at(ACC, &["Work".into()]).is_none(), "not brought back by the pull");
@@ -270,6 +271,7 @@ fn notes_left_in_a_deleted_folder_end_up_in_the_same_place_everywhere() {
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Projects".into(), "Work".into()],
         revision: None,
+        note_id: None,
     });
     laptop.sync();
     phone.sync();
@@ -295,6 +297,7 @@ fn a_folder_deleted_here_stays_deleted_when_the_other_device_added_to_it() {
         remote_id: f.sync.remote_id.unwrap(),
         path: vec!["Work".into()],
         revision: None,
+        note_id: None,
     });
     // …while the phone adds a note to it.
     let pwork = phone.store.folder_at(ACC, &["Work".into()]).unwrap().id.clone();
@@ -592,4 +595,127 @@ fn deleting_for_good_while_a_sync_uploads_the_note_still_deletes_it() {
     phone.sync();
     assert!(laptop.bodies().is_empty());
     assert!(phone.bodies().is_empty());
+}
+
+/// Runs a sync to the end, then "quits" before its outcome is applied (or
+/// saved): the backend has everything, the store none of the bookkeeping.
+/// The app starts again with a new backend and the store as it was.
+fn sync_then_quit(dev: &mut Device, path: &std::path::Path) {
+    let snap = AccountSnapshot::of(&dev.store, ACC).with_attachments(dev.att.path());
+    let out = sync_account(&mut dev.backend, &snap, Utc::now()).unwrap();
+    assert_eq!(out.error, None);
+    dev.backend = SqliteBackend::open(&Config { path: path.into() }).unwrap();
+}
+
+fn folder_paths(dev: &Device) -> Vec<Vec<String>> {
+    let mut v: Vec<Vec<String>> =
+        dev.store.folders.iter().filter(|f| f.account == ACC).map(|f| dev.store.folder_path(&f.id)).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn quitting_before_a_finished_sync_is_recorded_duplicates_nothing() {
+    let (d, mut laptop, mut phone) = pair();
+    let path = d.path().join("shared.db");
+    let edited = laptop.add("# Edited\nbefore\n");
+    let old = laptop.store.ensure_folder_at(ACC, &["Old".into()]);
+    laptop.store.notes.push(Note::new(ACC, &old, "# In a renamed folder\n"));
+    let purged = laptop.add("# Deleted for good\n");
+    laptop.sync();
+    phone.sync();
+
+    // Offline changes of every kind, uploaded by a sync whose outcome the
+    // app never got to record.
+    laptop.add("# New\n");
+    let new_folder = laptop.store.ensure_folder_at(ACC, &["New".into()]);
+    laptop.store.notes.push(Note::new(ACC, &new_folder, "# New, in a new folder\n"));
+    laptop.edit(&edited, "# Edited\nafter\n");
+    laptop.store.folder_mut(&old).unwrap().name = "Renamed".into();
+    laptop.store.purge_note(&purged);
+    sync_then_quit(&mut laptop, &path);
+
+    let expected = vec!["# Edited\nafter\n", "# In a renamed folder\n", "# New\n", "# New, in a new folder\n"];
+    let notices = laptop.sync();
+    assert!(notices.is_empty(), "no \"both versions kept\": {notices:?}");
+    assert_eq!(laptop.bodies(), expected);
+    assert_eq!(laptop.backend.pull().unwrap().notes.len(), expected.len(), "nothing twice on the backend");
+    assert!(!AccountSnapshot::of(&laptop.store, ACC).has_local_changes(), "nothing left to upload");
+    assert!(phone.sync().is_empty());
+    assert_eq!(phone.bodies(), expected);
+    assert_eq!(folder_paths(&phone), folder_paths(&laptop));
+    assert_eq!(folder_paths(&laptop).iter().filter(|p| p.as_slice() == ["New"]).count(), 1);
+    assert!(!folder_paths(&laptop).contains(&vec!["Old".to_owned()]));
+}
+
+#[test]
+fn quitting_twice_in_a_row_duplicates_nothing() {
+    let (d, mut laptop, mut phone) = pair();
+    let path = d.path().join("shared.db");
+    laptop.add("# Once\n");
+    sync_then_quit(&mut laptop, &path);
+    sync_then_quit(&mut laptop, &path);
+    laptop.sync();
+    phone.sync();
+    assert_eq!(laptop.bodies(), vec!["# Once\n"]);
+    assert_eq!(phone.bodies(), vec!["# Once\n"]);
+}
+
+#[test]
+fn a_new_note_deleted_for_good_while_an_unrecorded_sync_uploaded_it_stays_deleted() {
+    let (d, mut laptop, mut phone) = pair();
+    let path = d.path().join("shared.db");
+    let id = laptop.add("# Never synced\n");
+    // A sync uploads it; meanwhile the user deletes it for good (no remote
+    // id yet, so no tombstone); then the app quits before the sync's
+    // outcome comes in.
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    let out = sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    assert_eq!(out.error, None);
+    laptop.store.purge_note(&id);
+    drop(out);
+    laptop.backend = SqliteBackend::open(&Config { path: path.into() }).unwrap();
+    laptop.sync();
+    phone.sync();
+    assert!(laptop.bodies().is_empty(), "came back: {:?}", laptop.bodies());
+    assert!(phone.bodies().is_empty());
+    assert!(laptop.backend.pull().unwrap().notes.is_empty());
+    assert!(laptop.store.tombstones.is_empty());
+}
+
+#[test]
+fn a_new_note_moved_to_another_account_while_an_unrecorded_sync_uploaded_it_leaves_it() {
+    let (d, mut laptop, mut phone) = pair();
+    let path = d.path().join("shared.db");
+    let id = laptop.add("# Moving\n");
+    let snap = AccountSnapshot::of(&laptop.store, ACC);
+    sync_account(&mut laptop.backend, &snap, Utc::now()).unwrap();
+    // Moved to the local account (as the app does) before the outcome came.
+    let n = laptop.store.note(&id).unwrap().clone();
+    laptop.store.forget_note(&n);
+    let local = laptop.store.default_folder(crate::model::LOCAL).unwrap().id.clone();
+    let n = laptop.store.note_mut(&id).unwrap();
+    n.account = crate::model::LOCAL.into();
+    n.folder = local;
+    n.sync = Default::default();
+    laptop.backend = SqliteBackend::open(&Config { path: path.into() }).unwrap();
+    laptop.sync();
+    phone.sync();
+    assert!(laptop.bodies().is_empty() && phone.bodies().is_empty(), "left the synced account");
+    assert_eq!(laptop.store.note(&id).unwrap().account, crate::model::LOCAL);
+}
+
+#[test]
+fn a_new_note_deleted_before_any_sync_costs_nothing_on_the_backend() {
+    let (_d, mut laptop, mut phone) = pair();
+    let keep = laptop.add("# Kept\n");
+    let gone = laptop.add("# Never uploaded\n");
+    laptop.store.purge_note(&gone);
+    assert_eq!(laptop.store.tombstones[0].note_id.as_deref(), Some(gone.as_str()));
+    laptop.sync();
+    phone.sync();
+    assert!(laptop.store.tombstones.is_empty(), "done with");
+    assert_eq!(phone.bodies(), vec!["# Kept\n"]);
+    // Another device's note isn't touched by it, nor one still here.
+    assert!(phone.store.note(&keep).is_some());
 }

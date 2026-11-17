@@ -611,7 +611,8 @@ impl Library {
     pub fn leave_note(&mut self, id: &str) -> bool {
         if self.fresh.contains(id) && self.store.note(id).is_some_and(|n| n.body.trim().is_empty()) {
             self.fresh.remove(id);
-            self.store.notes.retain(|n| n.id != id);
+            // (A sync may have uploaded it already.)
+            self.store.purge_note(id);
             self.unsaved.insert(id.to_owned());
             return true;
         }
@@ -803,15 +804,7 @@ impl Library {
         } else {
             // Into another account: deleted from the old one, made new in
             // the new one.
-            if let Some(remote_id) = &n.sync.remote_id {
-                self.store.tombstones.push(Tombstone {
-                    account: n.account.clone(),
-                    note: true,
-                    remote_id: remote_id.clone(),
-                    path: vec![],
-                    revision: n.sync.revision.clone(),
-                });
-            }
+            self.store.forget_note(&n);
             let n = self.store.note_mut(id).unwrap();
             n.account = target.account.clone();
             n.folder = target.id.clone();
@@ -966,7 +959,14 @@ impl Library {
                 let fo = self.store.folder(fid).unwrap();
                 if let Some(remote_id) = fo.sync.remote_id.clone() {
                     let path = fo.sync.synced_path.clone().unwrap_or(path);
-                    self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
+                    self.store.tombstones.push(Tombstone {
+                        account: f.account.clone(),
+                        note: false,
+                        remote_id,
+                        path,
+                        revision: None,
+                        note_id: None,
+                    });
                 }
             }
             for fid in &ids {
@@ -1062,7 +1062,14 @@ impl Library {
             let path = self.store.folder_path(fid);
             if let Some(remote_id) = self.store.folder(fid).and_then(|f| f.sync.remote_id.clone()) {
                 let path = self.store.folder(fid).and_then(|f| f.sync.synced_path.clone()).unwrap_or(path);
-                self.store.tombstones.push(Tombstone { account: f.account.clone(), note: false, remote_id, path, revision: None });
+                self.store.tombstones.push(Tombstone {
+                    account: f.account.clone(),
+                    note: false,
+                    remote_id,
+                    path,
+                    revision: None,
+                    note_id: None,
+                });
             }
         }
         self.store.folders.retain(|f| f.id == default || !ids.contains(&f.id));

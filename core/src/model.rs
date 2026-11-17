@@ -219,6 +219,12 @@ pub struct Tombstone {
     /// backend since (edited on another device), it isn't deleted there.
     #[serde(default)]
     pub revision: Option<String>,
+    /// For a note that had no remote id here (`remote_id` empty): its id.
+    /// A sync may have uploaded it without this device hearing back (the
+    /// app quit first); if the backend has a note by this id that this
+    /// device doesn't know, it's deleted there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -496,16 +502,35 @@ impl Store {
     pub fn purge_note(&mut self, id: &str) -> Option<Note> {
         let i = self.notes.iter().position(|n| n.id == id)?;
         let n = self.notes.remove(i);
-        if let Some(remote_id) = &n.sync.remote_id {
-            self.tombstones.push(Tombstone {
+        self.forget_note(&n);
+        Some(n)
+    }
+
+    /// A note that goes from its account (deleted for good, moved to another
+    /// account): leaves the tombstone that deletes it on the backend. One
+    /// that never synced may still be there (uploaded by a sync whose reply
+    /// never came in), so it's looked for by its id.
+    pub fn forget_note(&mut self, n: &Note) {
+        let tombstone = match &n.sync.remote_id {
+            Some(remote_id) => Tombstone {
                 account: n.account.clone(),
                 note: true,
                 remote_id: remote_id.clone(),
                 path: vec![],
                 revision: n.sync.revision.clone(),
-            });
-        }
-        Some(n)
+                note_id: None,
+            },
+            None if self.account(&n.account).is_some_and(|a| a.synced()) => Tombstone {
+                account: n.account.clone(),
+                note: true,
+                remote_id: String::new(),
+                path: vec![],
+                revision: None,
+                note_id: Some(n.id.clone()),
+            },
+            None => return,
+        };
+        self.tombstones.push(tombstone);
     }
 
     /// The note as the backend sees it.
@@ -607,5 +632,33 @@ mod tests {
         s.purge_note(&id);
         assert!(s.notes.is_empty());
         assert_eq!(s.tombstones.len(), 1);
+    }
+
+    #[test]
+    fn purging_a_never_synced_note_leaves_a_tombstone_by_id_only_in_a_synced_account() {
+        let mut s = Store::new_install();
+        let folder = s.default_folder(LOCAL).unwrap().id.clone();
+        let n = Note::new(LOCAL, &folder, "x");
+        let id = n.id.clone();
+        s.notes.push(n);
+        s.purge_note(&id);
+        assert!(s.tombstones.is_empty(), "a local account has no backend");
+
+        s.accounts.push(Account {
+            id: "acc".into(),
+            name: "Synced".into(),
+            backend: BackendConfig::Sqlite(crate::sync::sqlite::Config { path: "x.db".into() }),
+            enabled: true,
+            cursor: None,
+            last_sync: None,
+        });
+        let folder = s.ensure_folder_at("acc", &["Notes".into()]);
+        let n = Note::new("acc", &folder, "x");
+        let id = n.id.clone();
+        s.notes.push(n);
+        s.purge_note(&id);
+        assert_eq!(s.tombstones.len(), 1);
+        assert_eq!(s.tombstones[0].note_id.as_deref(), Some(id.as_str()));
+        assert!(s.tombstones[0].remote_id.is_empty());
     }
 }
