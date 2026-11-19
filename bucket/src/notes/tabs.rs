@@ -37,7 +37,7 @@ pub const ID_PREFIX: &str = "tab-";
 /// The sub-folder of an account's folder that tabs are kept in.
 pub const DIR: &str = "tabs";
 /// Where tabs saved without a collection go.
-pub const DEFAULT_COLLECTION: &str = "Saved";
+pub const DEFAULT_COLLECTION: &str = "Saved Tabs";
 
 /// The S3 prefix of the tabs of an account whose folder is
 /// `account_prefix` (`CleanNotes` → `CleanNotes/tabs`).
@@ -258,8 +258,8 @@ mod tests {
         assert_eq!(dir_prefix(""), "tabs");
         assert_eq!(legacy_folder(&p(&["CleanTabs", "Research", "Docs"])), p(&["Research", "Docs"]));
         assert_eq!(legacy_folder(&p(&["Tabs", "Research"])), p(&["Research"]));
-        assert_eq!(legacy_folder(&p(&["Tabs"])), p(&["Saved"]));
-        assert_eq!(legacy_folder(&p(&["Notes"])), p(&["Saved"]));
+        assert_eq!(legacy_folder(&p(&["Tabs"])), p(&["Saved Tabs"]));
+        assert_eq!(legacy_folder(&p(&["Notes"])), p(&["Saved Tabs"]));
     }
 
     #[test]
