@@ -1,7 +1,8 @@
 //! Optional encryption of an S3 folder's notes and folders with a key of
 //! your own.
 //!
-//! - The key comes from a passphrase with Argon2id (64 MiB, 3 passes). The
+//! - The key comes from a passphrase with Argon2id (46 MiB, 3 passes, as
+//!   CleanPassword; folders set up before kept 64 MiB). The
 //!   random salt and costs are in `<folder>/encryption.json`, with a check
 //!   value, so every device makes the same key and a wrong passphrase is
 //!   noticed. Only the key is kept (in the credential store), not the
@@ -19,10 +20,13 @@
 use anyhow::{anyhow, bail, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
+use cleanbucket::kdf::{self, Cost};
+use cleanbucket::seal as sealing;
 use serde::{Deserialize, Serialize};
+
+/// The least Argon2 memory a folder's `encryption.json` may ask for
+/// (tests use tiny costs).
+const MIN_MEMORY_KIB: u32 = if cfg!(test) { 8 } else { kdf::MIN_MEMORY_KIB };
 
 pub const MAGIC: &str = "CleanNotes-encrypted-1\n";
 pub const SETTINGS: &str = "encryption.json";
@@ -51,12 +55,11 @@ pub fn derive(passphrase: &str, s: &Settings) -> Result<[u8; 32]> {
         bail!("this folder is encrypted in a way this version of CleanNotes doesn't know");
     }
     let salt = B64.decode(&s.salt).map_err(|_| anyhow!("encryption.json is damaged"))?;
-    let params = argon2::Params::new(s.m, s.t, s.p, Some(32)).map_err(|e| anyhow!("argon2: {e}"))?;
-    let mut key = [0u8; 32];
-    argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
-        .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
-        .map_err(|e| anyhow!("argon2: {e}"))?;
-    Ok(key)
+    // A damaged or hostile encryption.json mustn't make this device
+    // allocate gigabytes, or make the key cheap to guess.
+    let cost = Cost { memory_kib: s.m, passes: s.t, lanes: s.p };
+    cost.check(MIN_MEMORY_KIB).map_err(|e| anyhow!("encryption.json: {e}"))?;
+    Ok(*kdf::derive(passphrase.as_bytes(), &salt, cost)?)
 }
 
 /// New settings (with a random salt) and the key for `passphrase`.
@@ -65,12 +68,11 @@ pub fn create(passphrase: &str) -> Result<(Settings, [u8; 32])> {
     #[cfg(test)]
     return create_with(passphrase, 64, 1);
     #[cfg(not(test))]
-    create_with(passphrase, 64 * 1024, 3)
+    create_with(passphrase, Cost::DEFAULT.memory_kib, Cost::DEFAULT.passes)
 }
 
 pub fn create_with(passphrase: &str, m: u32, t: u32) -> Result<(Settings, [u8; 32])> {
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
+    let salt = sealing::random_bytes::<16>();
     let mut s = Settings { version: 1, kdf: "argon2id".into(), m, t, p: 1, salt: B64.encode(salt), check: String::new() };
     let key = derive(passphrase, &s)?;
     s.check = seal(&key, SETTINGS, CHECK);
@@ -87,26 +89,14 @@ pub fn unlock(passphrase: &str, s: &Settings) -> Result<[u8; 32]> {
 }
 
 pub fn seal(key: &[u8; 32], name: &str, plain: &str) -> String {
-    let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let ct = XChaCha20Poly1305::new(Key::from_slice(key))
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain.as_bytes(), aad: &aad(name) })
-        .expect("encryption doesn't fail");
-    let mut all = nonce.to_vec();
-    all.extend(ct);
-    format!("{MAGIC}{}", B64.encode(all))
+    format!("{MAGIC}{}", B64.encode(sealing::seal(key, &aad(name), plain.as_bytes())))
 }
 
 /// The plaintext, or `None` if it can't be decrypted with `key` (another
 /// key, damaged, or moved from another name).
 pub fn open(key: &[u8; 32], name: &str, text: &str) -> Option<String> {
     let all = B64.decode(text.strip_prefix(MAGIC)?.trim()).ok()?;
-    if all.len() < 24 {
-        return None;
-    }
-    let (nonce, ct) = all.split_at(24);
-    let plain = XChaCha20Poly1305::new(Key::from_slice(key)).decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: &aad(name) }).ok()?;
-    String::from_utf8(plain).ok()
+    String::from_utf8(sealing::open(key, &aad(name), &all)?.to_vec()).ok()
 }
 
 pub fn is_sealed(text: &str) -> bool {
@@ -118,26 +108,15 @@ pub fn is_sealed(text: &str) -> bool {
 pub const MAGIC_BYTES: &[u8] = b"CleanNotes-encrypted-bin-1\n";
 
 pub fn seal_bytes(key: &[u8; 32], name: &str, plain: &[u8]) -> Vec<u8> {
-    let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let ct = XChaCha20Poly1305::new(Key::from_slice(key))
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad: &aad(name) })
-        .expect("encryption doesn't fail");
     let mut out = MAGIC_BYTES.to_vec();
-    out.extend_from_slice(&nonce);
-    out.extend(ct);
+    out.extend(sealing::seal(key, &aad(name), plain));
     out
 }
 
 /// The plaintext of [`seal_bytes`]' output, or `None` if it can't be
 /// decrypted with `key` under `name`.
 pub fn open_bytes(key: &[u8; 32], name: &str, data: &[u8]) -> Option<Vec<u8>> {
-    let all = data.strip_prefix(MAGIC_BYTES)?;
-    if all.len() < 24 {
-        return None;
-    }
-    let (nonce, ct) = all.split_at(24);
-    XChaCha20Poly1305::new(Key::from_slice(key)).decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: &aad(name) }).ok()
+    sealing::open(key, &aad(name), data.strip_prefix(MAGIC_BYTES)?).map(|p| p.to_vec())
 }
 
 /// The name an attachment is stored under in an encrypted folder: keyed,

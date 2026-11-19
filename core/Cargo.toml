@@ -5,6 +5,8 @@ edition = "2021"
 description = "CleanNotes' shared core: notes, folders, accounts, the rich-text document and its Markdown, editing, locked notes, storage and sync. Used by the desktop app and (through cleannotes-ffi) the iPhone app."
 
 [dependencies]
+# What CleanNotes shares with CleanPassword: the S3 client, sealing, keys.
+cleanbucket = { path = "../bucket" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
-use super::sigv4;
+use cleanbucket::s3 as sigv4;
 use crate::sync::test_http::{self, url_decode, Request, Response};
 
 pub const BUCKET: &str = "notes-bucket";

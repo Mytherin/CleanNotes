@@ -140,6 +140,8 @@ impl App {
         let mut app = App::with(lib);
         let ctx = cc.egui_ctx.clone();
         app.pw = passwords::PasswordsUi::new(cleannotes_core::passwords::Passwords::new(move || ctx.request_repaint()));
+        // CleanPassword's items, sealed with its vault key, between unlocks.
+        app.pw.service.set_cache_dir(db::data_dir());
         app.restore_location();
         Ok(app)
     }

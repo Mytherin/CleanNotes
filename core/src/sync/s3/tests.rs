@@ -183,9 +183,9 @@ fn checking_the_bucket() {
 #[test]
 fn amazon_urls() {
     let c = Config { bucket: "my-notes".into(), region: "eu-west-1".into(), prefix: "".into(), endpoint: None, encrypted: false };
-    assert_eq!(c.url_parts("notes/a b.md"), ("https://my-notes.s3.eu-west-1.amazonaws.com".into(), "/notes/a%20b.md".into()));
+    assert_eq!(c.location().url_parts("notes/a b.md"), ("https://my-notes.s3.eu-west-1.amazonaws.com".into(), "/notes/a%20b.md".into()));
     let c = Config { bucket: "my.notes".into(), ..c };
-    assert_eq!(c.url_parts("head"), ("https://s3.eu-west-1.amazonaws.com".into(), "/my.notes/head".into()));
+    assert_eq!(c.location().url_parts("head"), ("https://s3.eu-west-1.amazonaws.com".into(), "/my.notes/head".into()));
     assert_eq!(Config { prefix: " /a/b/ ".into(), ..c.clone() }.root(), "a/b/");
     assert_eq!(c.root(), "");
 }

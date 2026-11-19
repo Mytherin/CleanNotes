@@ -30,20 +30,22 @@
 //! Now, 15 minutes without use, or quitting), and wiped then.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use cleanbucket::block_on;
+use cleanbucket::kdf::{self, Cost};
+use cleanbucket::s3::{Client, Cond, Credentials, Location, Object, Put};
+use cleanbucket::seal as sealing;
+use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::sync::s3::{self, Keys, S3Backend};
+use crate::sync::s3::{self, Blocking, Keys};
 
 pub mod totp;
 #[cfg(test)]
@@ -57,24 +59,29 @@ pub const ITEMS: &str = "items/";
 pub const DEFAULT_FOLDER: &str = "CleanPassword";
 /// The vault locks after this long without use.
 pub const AUTO_LOCK: Duration = Duration::from_secs(15 * 60);
-/// An unlocked vault is read again this often while the app runs.
-pub const REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Rewritten by every device after it changes the vault (CleanPassword's
+/// and CleanNotes'), so one `HEAD` tells whether anything changed.
+pub const HEAD_OBJECT: &str = "vault-head";
+/// An unlocked vault is checked for changes this often while the app runs
+/// (one `HEAD` when nothing changed).
+pub const REFRESH_EVERY: Duration = Duration::from_secs(60);
+/// The folder is listed in full at least this often anyway: a device can
+/// stop between writing an item and [`HEAD_OBJECT`], and older versions of
+/// CleanPassword don't write it.
+pub const FULL_LIST_EVERY: Duration = Duration::from_secs(15 * 60);
 
 const VAULT_FORMAT: &str = "cleanpassword-vault";
 /// Sealed items start with this, then `nonce ‖ ciphertext ‖ tag`.
 const MAGIC: &[u8] = b"CPV1";
-const NONCE_LEN: usize = 24;
-const TAG_LEN: usize = 16;
 /// Downloads running at once.
 const PARALLEL: usize = 16;
-/// Argon2 memory the vault may ask for (KiB): CleanPassword's own limits, so
-/// a damaged or hostile `vault.json` can neither make unlocking cheap to
-/// attack nor make this computer allocate gigabytes.
-const MIN_MEMORY_KIB: u32 = if cfg!(test) { 8 } else { 19 * 1024 };
-const MAX_MEMORY_KIB: u32 = 1024 * 1024;
+/// Argon2 memory the vault may ask for (KiB), as CleanPassword allows, so a
+/// damaged or hostile `vault.json` can neither make unlocking cheap to
+/// attack nor make this computer allocate gigabytes (tests use tiny costs).
+const MIN_MEMORY_KIB: u32 = if cfg!(test) { 8 } else { kdf::MIN_MEMORY_KIB };
 
 /// A 256-bit key, wiped when dropped.
-pub type Key = Zeroizing<[u8; 32]>;
+pub type Key = cleanbucket::seal::Key;
 
 // ---- The format -------------------------------------------------------------
 
@@ -135,37 +142,20 @@ impl VaultHeader {
         if p.alg != "argon2id" {
             bail!("this vault uses {}, which this version of CleanNotes doesn't know", p.alg);
         }
-        if !(MIN_MEMORY_KIB..=MAX_MEMORY_KIB).contains(&p.memory_kib) || !(1..=32).contains(&p.passes) || !(1..=16).contains(&p.lanes) {
-            bail!("the vault's key settings are out of the allowed range");
-        }
+        let cost = Cost { memory_kib: p.memory_kib, passes: p.passes, lanes: p.lanes };
+        cost.check(MIN_MEMORY_KIB).context("the vault's key settings")?;
         let salt = B64.decode(p.salt.trim()).context("the vault's salt is damaged")?;
-        if salt.len() < 16 {
-            bail!("the vault's salt is too short");
-        }
-        let params = Params::new(p.memory_kib, p.passes, p.lanes, Some(32)).map_err(|e| anyhow::anyhow!("argon2: {e}"))?;
-        let mut master: Key = Zeroizing::new([0u8; 32]);
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(password.as_bytes(), &salt, master.as_mut())
-            .map_err(|e| anyhow::anyhow!("argon2: {e}"))?;
+        let master = kdf::derive(password.as_bytes(), &salt, cost).context("the vault's salt")?;
         let wrapped = B64.decode(self.wrapped_key.trim()).context("the vault's key is damaged")?;
         let aad = format!("cleanpassword/vault-key/v1/{}", self.vault_id);
-        let key = open(&master, aad.as_bytes(), &wrapped).ok_or(WrongPassword)?;
+        let key = sealing::open(&master, aad.as_bytes(), &wrapped).ok_or(WrongPassword)?;
         let arr: [u8; 32] = key.as_slice().try_into().map_err(|_| anyhow::anyhow!("the vault's key is damaged"))?;
         Ok(Zeroizing::new(arr))
     }
 }
 
-/// `nonce ‖ ciphertext ‖ tag` opened, or `None` if it wasn't sealed with
-/// this key and `aad`, or was changed.
-fn open(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    if sealed.len() < NONCE_LEN + TAG_LEN {
-        return None;
-    }
-    let (nonce, ct) = sealed.split_at(NONCE_LEN);
-    XChaCha20Poly1305::new(key.into()).decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad }).ok().map(Zeroizing::new)
-}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ItemKind {
     #[default]
@@ -178,14 +168,14 @@ pub enum ItemKind {
     Other,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ItemUri {
     pub uri: String,
 }
 
 /// A custom field.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Field {
     pub name: String,
@@ -195,7 +185,7 @@ pub struct Field {
 }
 
 /// A password the item had before.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HistoryEntry {
     pub password: String,
@@ -205,7 +195,7 @@ pub struct HistoryEntry {
 
 /// A passkey, as far as it's shown: its site and account. (Its private key
 /// isn't even read.)
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Passkey {
     pub rp_id: String,
@@ -216,7 +206,7 @@ pub struct Passkey {
 
 /// A vault item: a login or a secure note. Fields this version doesn't
 /// know are ignored.
-#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Item {
     pub id: String,
@@ -320,7 +310,7 @@ fn item_id(name: &str) -> Option<&str> {
 /// be (another vault's, damaged, or a format this version doesn't know).
 fn open_item(key: &[u8; 32], vault_id: &str, id: &str, data: &[u8]) -> Option<Option<Item>> {
     let aad = format!("cleanpassword/item/v1/{vault_id}/{id}");
-    let plain = open(key, aad.as_bytes(), data.strip_prefix(MAGIC)?)?;
+    let plain = sealing::open(key, aad.as_bytes(), data.strip_prefix(MAGIC)?)?;
     let stored: Stored = serde_json::from_slice(&plain).ok()?;
     // The id inside must be the one in the name (the AAD binds them too).
     match stored {
@@ -354,13 +344,31 @@ impl Found {
     }
 }
 
-/// The access key of a CleanNotes S3 account, for reading the bucket in
-/// the clear (the vault has its own encryption).
-fn plain_backend(config: &s3::Config, secret: &str, folder: &str) -> Result<S3Backend> {
-    let keys: Keys = serde_json::from_str(secret).context("the saved access key is unreadable")?;
-    let keys = Keys { encryption_key: None, ..keys };
-    let config = s3::Config { prefix: folder.to_owned(), encrypted: false, ..config.clone() };
-    S3Backend::open(&config, Some(keys.to_secret()))
+
+/// The vault's folder, read and written in the clear with an S3 account's
+/// access key (the vault has its own encryption), through the client
+/// CleanPassword shares.
+struct Access {
+    location: Location,
+    credentials: Credentials,
+    http: Blocking,
+}
+
+impl Access {
+    fn new(config: &s3::Config, secret: &str, folder: &str) -> Result<Access> {
+        let keys: Keys = serde_json::from_str(secret).context("the saved access key is unreadable")?;
+        let location = Location { bucket: config.bucket.clone(), region: config.region.clone(), prefix: folder.to_owned(), endpoint: config.endpoint.clone() };
+        let credentials = Credentials { access_key_id: keys.access_key_id.clone(), secret_access_key: keys.secret_access_key.clone(), session_token: None };
+        Ok(Access { location, credentials, http: Blocking::new() })
+    }
+
+    fn client(&self) -> Client<'_, Blocking> {
+        Client::new(&self.location, &self.credentials, &self.http)
+    }
+
+    fn get(&self, name: &str) -> Result<Option<Object>> {
+        Ok(block_on(self.client().get(name))?)
+    }
 }
 
 /// Looks for a vault with an S3 account's access key: in the notes'
@@ -375,11 +383,10 @@ pub fn find(account: &str, config: &s3::Config, secret: &str) -> Result<Option<F
     let mut first_error = None;
     let mut looked = false;
     for folder in folders {
-        let attempt = plain_backend(config, secret, &folder).and_then(|b| b.get_bytes(VAULT_OBJECT));
-        match attempt {
-            Ok(Some((data, _))) => {
+        match Access::new(config, secret, &folder).and_then(|a| a.get(VAULT_OBJECT)) {
+            Ok(Some(obj)) => {
                 // Something else's vault.json is no vault: not found here.
-                if let Ok(header) = VaultHeader::parse(&data) {
+                if let Ok(header) = VaultHeader::parse(&obj.data) {
                     let config = s3::Config { prefix: folder, encrypted: false, ..config.clone() };
                     return Ok(Some(Found { account: account.to_owned(), config, header }));
                 }
@@ -397,14 +404,21 @@ pub fn find(account: &str, config: &s3::Config, secret: &str) -> Result<Option<F
     }
 }
 
-/// An unlocked vault's items, and their objects' ETags (so reading it again
-/// downloads only what changed).
-#[derive(Default)]
+/// An unlocked vault's items, their objects' ETags (so reading it again
+/// downloads only what changed), and what [`HEAD_OBJECT`] said then.
+#[derive(Default, Serialize, Deserialize)]
 pub struct Contents {
     /// Item id → (ETag, the item; `None` for a tombstone).
     objects: BTreeMap<String, (String, Option<Item>)>,
     /// Objects that couldn't be opened.
+    #[serde(skip)]
     pub unreadable: usize,
+    /// [`HEAD_OBJECT`]'s ETag when the folder was last listed.
+    #[serde(default)]
+    cursor: Option<String>,
+    /// When the folder was last listed in full.
+    #[serde(default)]
+    listed_at: Option<DateTime<Utc>>,
 }
 
 impl Contents {
@@ -415,6 +429,17 @@ impl Contents {
 
     pub fn get(&self, id: &str) -> Option<&Item> {
         self.objects.get(id).and_then(|(_, i)| i.as_ref())
+    }
+
+    /// A copy to read again from: what's unchanged is kept rather than
+    /// downloaded again.
+    fn copy(&self) -> Contents {
+        Contents { objects: self.objects.clone(), unreadable: 0, cursor: self.cursor.clone(), listed_at: self.listed_at }
+    }
+
+    /// Listed in full long enough ago that it's due again.
+    fn list_due(&self) -> bool {
+        self.listed_at.is_none_or(|t| Utc::now() - t > chrono::Duration::from_std(FULL_LIST_EVERY).expect("in range"))
     }
 }
 
@@ -429,16 +454,24 @@ impl Drop for Contents {
 }
 
 /// Reads the vault's items, downloading only those whose ETag isn't the
-/// one in `old`. Fails if the folder's vault isn't `vault_id` any more.
-pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents) -> Result<Contents> {
-    let b = plain_backend(&found.config, secret, &found.config.prefix)?;
-    let header = b.get_bytes(VAULT_OBJECT)?.context("the vault is no longer in the bucket")?;
-    if VaultHeader::parse(&header.0)?.vault_id != found.header.vault_id {
+/// one in `old`. First, unless `list_anyway`, one `HEAD` of [`HEAD_OBJECT`]:
+/// if it's what it was at the last listing, nothing changed and `None` is
+/// returned. Fails if the folder's vault isn't `vault_id` any more.
+pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents, list_anyway: bool) -> Result<Option<Contents>> {
+    let a = Access::new(&found.config, secret, &found.config.prefix)?;
+    let client = a.client();
+    // Read before listing: a write landing after this is seen next time.
+    let cursor = block_on(client.head(HEAD_OBJECT))?;
+    if !list_anyway && !old.list_due() && cursor.is_some() && cursor == old.cursor {
+        return Ok(None);
+    }
+    let header = a.get(VAULT_OBJECT)?.context("the vault is no longer in the bucket")?;
+    if VaultHeader::parse(&header.data)?.vault_id != found.header.vault_id {
         bail!("the bucket holds another vault now");
     }
     let listed: Vec<(String, String)> =
-        b.list_names(ITEMS)?.into_iter().filter_map(|(name, etag)| Some((item_id(&name)?.to_owned(), etag))).collect();
-    let mut out = Contents::default();
+        block_on(client.list(ITEMS))?.into_iter().filter_map(|l| Some((item_id(&l.name)?.to_owned(), l.etag))).collect();
+    let mut out = Contents { objects: BTreeMap::new(), unreadable: 0, cursor, listed_at: Some(Utc::now()) };
     let mut wanted = Vec::new();
     for (id, etag) in listed {
         match old.objects.get(&id) {
@@ -462,7 +495,7 @@ pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents) -> Res
                     *n - 1
                 };
                 let Some((id, etag)) = wanted.get(i) else { return };
-                let r = b.get_bytes(&format!("{ITEMS}{id}.bin")).map(|o| o.map(|(d, _)| d));
+                let r = a.get(&format!("{ITEMS}{id}.bin")).map(|o| o.map(|o| o.data));
                 results.lock().unwrap().push((id.clone(), etag.clone(), r));
             });
         }
@@ -477,7 +510,39 @@ pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents) -> Res
             None => out.unreadable += 1,
         }
     }
-    Ok(out)
+    Ok(Some(out))
+}
+
+// ---- Kept on this device ----------------------------------------------------
+
+/// Where an unlocked vault's items are kept between unlocks, sealed with
+/// the vault key, so unlocking downloads only what changed. `None` for a
+/// vault id that isn't a plain name.
+fn cache_path(dir: &Path, vault_id: &str) -> Option<PathBuf> {
+    let plain = !vault_id.is_empty() && vault_id.len() <= 64 && vault_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+    plain.then(|| dir.join(format!("cleanpassword-{vault_id}.cache")))
+}
+
+fn cache_aad(vault_id: &str) -> Vec<u8> {
+    format!("cleannotes/vault-cache/v1/{vault_id}").into_bytes()
+}
+
+/// Keeps `contents` on this device, sealed with the vault key.
+fn save_cache(dir: &Path, vault_id: &str, key: &[u8; 32], contents: &Contents) {
+    let Some(path) = cache_path(dir, vault_id) else { return };
+    let plain = Zeroizing::new(serde_json::to_vec(contents).expect("items serialize"));
+    let sealed = sealing::seal(key, &cache_aad(vault_id), &plain);
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, sealed).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// What [`save_cache`] kept, if it opens with this key.
+fn load_cache(dir: &Path, vault_id: &str, key: &[u8; 32]) -> Option<Contents> {
+    let sealed = std::fs::read(cache_path(dir, vault_id)?).ok()?;
+    let plain = sealing::open(key, &cache_aad(vault_id), &sealed)?;
+    serde_json::from_slice(&plain).ok()
 }
 
 // ---- Changing it ------------------------------------------------------------
@@ -501,19 +566,9 @@ pub enum Change {
 /// An item object as CleanPassword seals it: `CPV1 ‖ nonce ‖ ciphertext`,
 /// the JSON padded with spaces.
 fn seal_item(key: &[u8; 32], vault_id: &str, id: &str, json: &[u8]) -> Vec<u8> {
-    use rand::RngCore;
-    let mut plain = Zeroizing::new(json.to_vec());
-    let len = plain.len().div_ceil(PAD).max(1) * PAD;
-    plain.resize(len, b' ');
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let aad = format!("cleanpassword/item/v1/{vault_id}/{id}");
-    let ct = XChaCha20Poly1305::new(key.into())
-        .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plain, aad: aad.as_bytes() })
-        .expect("XChaCha20-Poly1305 encryption can't fail");
+    let plain = Zeroizing::new(sealing::pad(json.to_vec(), PAD));
     let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&nonce);
-    out.extend(ct);
+    out.extend(sealing::seal(key, format!("cleanpassword/item/v1/{vault_id}/{id}").as_bytes(), &plain));
     out
 }
 
@@ -543,13 +598,16 @@ fn changed(json: &[u8], id: &str, change: Change) -> Option<Zeroizing<Vec<u8>>> 
     Some(Zeroizing::new(serde_json::to_vec(&v).expect("JSON serializes")))
 }
 
-/// Applies `change` to the items, as CleanPassword would. Returns how many
+/// Applies `change` to the items, as CleanPassword would, then rewrites
+/// [`HEAD_OBJECT`] so CleanPassword's devices notice. Returns how many
 /// couldn't be changed: gone, unreadable, or (deleting for good) edited
 /// elsewhere meanwhile, as an edit beats a delete.
 pub fn apply(found: &Found, secret: &str, key: &[u8; 32], ids: &[String], change: Change) -> Result<usize> {
-    let b = plain_backend(&found.config, secret, &found.config.prefix)?;
+    let a = Access::new(&found.config, secret, &found.config.prefix)?;
+    let client = a.client();
     let vault_id = &found.header.vault_id;
     let mut skipped = 0;
+    let mut wrote = false;
     for id in ids {
         let name = format!("{ITEMS}{id}.bin");
         if item_id(&name).is_none() {
@@ -558,16 +616,18 @@ pub fn apply(found: &Found, secret: &str, key: &[u8; 32], ids: &[String], change
         }
         let mut done = false;
         for _ in 0..RETRIES {
-            let Some((data, etag)) = b.get_bytes(&name)? else { break };
+            let Some(obj) = a.get(&name)? else { break };
             let aad = format!("cleanpassword/item/v1/{vault_id}/{id}");
-            let Some(plain) = data.strip_prefix(MAGIC).and_then(|d| open(key, aad.as_bytes(), d)) else { break };
+            let Some(plain) = obj.data.strip_prefix(MAGIC).and_then(|d| sealing::open(key, aad.as_bytes(), d)) else { break };
             let Some(json) = changed(&plain, id, change) else {
                 // Already so (deleted elsewhere too, say): done.
                 done = serde_json::from_slice::<serde_json::Value>(&plain).is_ok_and(|v| v.get("item").is_some());
                 break;
             };
-            if b.put_bytes_if(&name, &seal_item(key, vault_id, id, &json), &etag)?.is_some() {
+            let sealed = seal_item(key, vault_id, id, &json);
+            if let Put::Stored { .. } = block_on(client.put(&name, sealed, Cond::Match(&obj.etag)))? {
                 done = true;
+                wrote = true;
                 break;
             }
             if change == Change::DeleteForever {
@@ -577,6 +637,9 @@ pub fn apply(found: &Found, secret: &str, key: &[u8; 32], ids: &[String], change
         if !done {
             skipped += 1;
         }
+    }
+    if wrote {
+        block_on(client.touch(HEAD_OBJECT)).context("marking the vault changed")?;
     }
     Ok(skipped)
 }
@@ -612,6 +675,9 @@ pub struct State {
     secret: Option<String>,
     /// Changes being written.
     saving: usize,
+    /// Where the vault's items are kept between unlocks (sealed), if
+    /// anywhere.
+    cache_dir: Option<PathBuf>,
 }
 
 impl State {
@@ -687,6 +753,25 @@ impl Passwords {
         self.state.lock().unwrap()
     }
 
+    /// Keeps the vault's items in `dir` between unlocks, sealed with the
+    /// vault key, so unlocking downloads only what changed.
+    pub fn set_cache_dir(&self, dir: PathBuf) {
+        self.state().cache_dir = Some(dir);
+    }
+
+    /// Takes a read of the vault (`None`: nothing changed) and keeps it on
+    /// this device.
+    fn take_read(s: &mut State, found: &Found, read: Option<Contents>) {
+        let dir = s.cache_dir.clone();
+        let Some((key, contents)) = s.open.as_mut() else { return };
+        if let Some(c) = read {
+            *contents = c;
+        }
+        if let Some(dir) = dir {
+            save_cache(&dir, &found.header.vault_id, key, contents);
+        }
+    }
+
     /// Looks for a vault with these accounts' access keys, in the
     /// background. A vault no account can see any more is locked and
     /// forgotten; one that can't be looked for (offline) is kept.
@@ -746,7 +831,7 @@ impl Passwords {
     /// [`State::error`]).
     pub fn unlock(&self, password: String) {
         let password = Zeroizing::new(password);
-        let (found, secret, generation) = {
+        let (found, secret, generation, dir) = {
             let mut s = self.state();
             let (Some(f), Some(secret)) = (s.found.clone(), s.secret.clone()) else { return };
             if s.busy.is_some() || s.open.is_some() {
@@ -754,23 +839,40 @@ impl Passwords {
             }
             s.busy = Some(Busy::Unlocking);
             s.error = None;
-            (f, secret, s.generation)
+            (f, secret, s.generation, s.cache_dir.clone())
         };
         let this = self.clone();
         std::thread::spawn(move || {
-            let r = found.header.unwrap_key(&password).and_then(|key| {
-                let c = fetch(&found, &secret, &key, &Contents::default())?;
-                Ok((key, c))
+            let r = found.header.unwrap_key(&password).map(|key| {
+                // What this device kept from last time, then only what
+                // changed since (one HEAD if nothing did). Offline, what
+                // was kept is shown.
+                let kept = dir.as_deref().and_then(|d| load_cache(d, &found.header.vault_id, &key));
+                let read = match &kept {
+                    Some(old) => fetch(&found, &secret, &key, old, false).map_err(|e| (e, true)),
+                    None => fetch(&found, &secret, &key, &Contents::default(), true).map_err(|e| (e, false)),
+                };
+                (key, kept, read)
             });
             let mut s = this.state();
             if s.generation == generation {
                 s.busy = None;
                 match r {
-                    Ok(open) => {
-                        s.open = Some(open);
-                        s.last_refresh = Some(Instant::now());
-                        s.last_use = Some(Instant::now());
-                    }
+                    Ok((key, kept, read)) => match read {
+                        Ok(read) => {
+                            s.open = Some((key, kept.unwrap_or_default()));
+                            Self::take_read(&mut s, &found, read);
+                            s.last_refresh = Some(Instant::now());
+                            s.last_use = Some(Instant::now());
+                        }
+                        Err((e, true)) => {
+                            s.open = Some((key, kept.unwrap_or_default()));
+                            s.error = Some(format!("Couldn't read the vault (showing what this computer kept): {}", message(&e)));
+                            s.last_refresh = Some(Instant::now());
+                            s.last_use = Some(Instant::now());
+                        }
+                        Err((e, false)) => s.error = Some(message(&e)),
+                    },
                     Err(e) => s.error = Some(message(&e)),
                 }
             }
@@ -779,9 +881,10 @@ impl Passwords {
         });
     }
 
-    /// Reads the unlocked vault again (only what changed), in the
-    /// background.
-    pub fn refresh(&self) {
+    /// Reads the unlocked vault again, in the background: one `HEAD` if
+    /// nothing changed, else only what changed. `list` lists the folder
+    /// whatever the change marker says (Refresh).
+    pub fn refresh_with(&self, list: bool) {
         let (found, secret, key, old, generation) = {
             let mut s = self.state();
             let (Some(f), Some(secret)) = (s.found.clone(), s.secret.clone()) else { return };
@@ -790,15 +893,14 @@ impl Passwords {
             }
             let Some((key, contents)) = s.open.as_ref() else { return };
             let key = key.clone();
-            // What's unchanged is kept rather than downloaded again.
-            let old = Contents { objects: contents.objects.clone(), unreadable: 0 };
+            let old = contents.copy();
             s.busy = Some(Busy::Refreshing);
             s.last_refresh = Some(Instant::now());
             (f, secret, key, old, s.generation)
         };
         let this = self.clone();
         std::thread::spawn(move || {
-            let r = fetch(&found, &secret, &key, &old);
+            let r = fetch(&found, &secret, &key, &old, list);
             drop(old);
             let mut s = this.state();
             if s.generation == generation {
@@ -807,10 +909,10 @@ impl Passwords {
                     // A change written meanwhile reads the vault again
                     // itself; this read may be from before it.
                     Ok(_) if s.saving > 0 => {}
-                    Ok(c) => {
+                    Ok(read) => {
                         s.error = None;
-                        if let Some(open) = s.open.as_mut() {
-                            open.1 = c;
+                        if read.is_some() {
+                            Self::take_read(&mut s, &found, read);
                         }
                     }
                     Err(e) => s.error = Some(format!("Couldn't read the vault: {}", message(&e))),
@@ -819,6 +921,11 @@ impl Passwords {
             drop(s);
             (this.wake)();
         });
+    }
+
+    /// Refresh: reads the vault again, listing it in full.
+    pub fn refresh(&self) {
+        self.refresh_with(true);
     }
 
     /// Deletes, recovers or deletes for good the items: shown so at once,
@@ -859,20 +966,14 @@ impl Passwords {
         (self.wake)();
         std::thread::spawn(move || {
             let r = apply(&found, &secret, &key, &ids, change);
-            let old = {
-                let s = this.state();
-                let objects = s.open.as_ref().map(|(_, c)| c.objects.clone()).unwrap_or_default();
-                Contents { objects, unreadable: 0 }
-            };
-            let read = fetch(&found, &secret, &key, &old);
+            let old = this.state().open.as_ref().map(|(_, c)| c.copy()).unwrap_or_default();
+            let read = fetch(&found, &secret, &key, &old, true);
             drop(old);
             let mut s = this.state();
             if s.generation == generation {
                 s.saving -= 1;
-                if let Ok(c) = read {
-                    if let Some(open) = s.open.as_mut() {
-                        open.1 = c;
-                    }
+                if let Ok(read) = read {
+                    Self::take_read(&mut s, &found, read);
                     s.last_refresh = Some(Instant::now());
                 }
                 s.error = match r {
@@ -896,7 +997,7 @@ impl Passwords {
         s.secret = Some(String::new());
         s.open = items.map(|items| {
             let objects = items.into_iter().map(|i| (i.id.clone(), (String::new(), Some(i)))).collect();
-            (Zeroizing::new([0u8; 32]), Contents { objects, unreadable: 0 })
+            (Zeroizing::new([0u8; 32]), Contents { objects, unreadable: 0, cursor: None, listed_at: None })
         });
     }
 
@@ -937,7 +1038,7 @@ impl Passwords {
             return true;
         }
         if stale && !self.state().saving() {
-            self.refresh();
+            self.refresh_with(false);
         }
         false
     }

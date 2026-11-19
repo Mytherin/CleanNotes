@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "core", "ffi"]
+members = [".", "core", "ffi", "bucket"]
 resolver = "2"
 
 # The desktop app (egui). The notes, editing, storage and sync logic it shares
