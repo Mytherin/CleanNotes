@@ -18,7 +18,7 @@ use super::{consume_exact, list_time, note_header_time, App, Pane, TOOLBAR_H};
 use crate::icons::{self, Icon};
 use crate::menu;
 use crate::theme::{self, Palette};
-use cleannotes_core::passwords::{self, totp, Busy, Candidate, Change, Item, ItemKind, Passwords, State};
+use cleannotes_core::passwords::{self, totp, Busy, Candidate, Change, Item, ItemExt, ItemKind, Passwords, State};
 use cleannotes_core::sync::BackendConfig;
 
 /// A copied password is taken off the clipboard after this long, as in
@@ -760,7 +760,7 @@ impl App {
                     ui.vertical(|ui| {
                         ui.add_space(6.0);
                         ui.label(RichText::new(item.title()).font(theme::bold_font(22.0)).color(p.text));
-                        let when = item.modified.map(|m| format!("Last modified {}", note_header_time(m))).unwrap_or_default();
+                        let when = format!("Last modified {}", note_header_time(item.modified));
                         ui.label(RichText::new(when).size(12.5).color(p.secondary));
                     });
                 });
@@ -870,7 +870,7 @@ impl App {
                         if open {
                             for h in item.history.iter().rev() {
                                 divider(ui, p);
-                                let when = h.retired.map(|r| format!("Until {}", list_time(r))).unwrap_or_else(|| "Earlier".into());
+                                let when = format!("Until {}", list_time(h.retired));
                                 if field_row(ui, p, &when, &h.password, true, Some(true)).copy {
                                     copy = Some((h.password.clone(), "the earlier password", true));
                                 }
@@ -1059,9 +1059,9 @@ mod tests {
     fn found() -> passwords::Found {
         let header = passwords::VaultHeader {
             format: "cleanpassword-vault".into(),
-            version: 1,
+            version: 2,
             vault_id: "v1".into(),
-            kdf: passwords::KdfParams { alg: "argon2id".into(), memory_kib: 8, passes: 1, lanes: 1, salt: String::new() },
+            kdf: passwords::KdfParams::with_cost(8, 1),
             wrapped_key: String::new(),
             created: chrono::Utc::now(),
         };
@@ -1072,32 +1072,66 @@ mod tests {
             endpoint: None,
             encrypted: false,
         };
-        passwords::Found { account: "acct".into(), config, header }
+        passwords::Found { account: "acct".into(), config, header, header_etag: String::new() }
     }
 
-    fn items() -> Vec<Item> {
-        use passwords::{Field, HistoryEntry, ItemUri, Passkey};
-        let now = Some(chrono::Utc::now());
-        vec![
-            Item {
-                id: "gh".into(),
-                name: "GitHub".into(),
-                username: "octocat".into(),
-                password: "s3cret-pw".into(),
-                uris: vec![ItemUri { uri: "https://github.com/login".into() }],
-                totp: "JBSWY3DPEHPK3PXP".into(),
-                notes: "Recovery codes in the safe.".into(),
-                folder: "Work".into(),
-                fields: vec![Field { name: "PIN".into(), value: "4321".into(), hidden: true }],
+    /// A vault holding GitHub, Bank, Wi-Fi, Old (in Recently Deleted) and
+    /// `more` logins, made by CleanPassword's core. Its S3 is nowhere (a
+    /// closed port), so its syncs fail at once.
+    fn vault(more: &[&str]) -> passwords::Vault {
+        use passwords::{Field, HistoryEntry, ImportedItem, ItemData, ItemUri, Passkey};
+        let now = chrono::Utc::now();
+        let config = passwords::S3Config { bucket: "b".into(), region: "us-east-1".into(), prefix: "CleanPassword".into(), endpoint: Some("http://127.0.0.1:9".into()) };
+        let creds = passwords::AwsCredentials { access_key_id: "AKIA".into(), secret_access_key: "secret".into(), session_token: None };
+        let mut v = passwords::Vault::create(config, creds, "correct horse battery").unwrap();
+        let login = |name: &str| ItemData { name: name.into(), username: "me".into(), ..Default::default() };
+        let item = |data: ItemData| ImportedItem { data, history: vec![], passkeys: vec![] };
+        let mut items = vec![
+            ImportedItem {
+                data: ItemData {
+                    password: "s3cret-pw".into(),
+                    username: "octocat".into(),
+                    uris: vec![ItemUri::new("https://github.com/login")],
+                    totp: "JBSWY3DPEHPK3PXP".into(),
+                    notes: "Recovery codes in the safe.".into(),
+                    folder: "Work".into(),
+                    fields: vec![Field { name: "PIN".into(), value: "4321".into(), hidden: true }],
+                    ..login("GitHub")
+                },
                 history: vec![HistoryEntry { password: "old-pw".into(), retired: now }],
-                passkeys: vec![Passkey { rp_id: "github.com".into(), user_name: "octocat".into(), ..Default::default() }],
-                modified: now,
-                ..Default::default()
+                passkeys: vec![Passkey {
+                    credential_id: "Y3JlZA".into(),
+                    rp_id: "github.com".into(),
+                    rp_name: String::new(),
+                    user_handle: "dQ".into(),
+                    user_name: "octocat".into(),
+                    user_display_name: String::new(),
+                    key: String::new(),
+                    counter: 0,
+                    created: now,
+                }],
             },
-            Item { id: "bank".into(), name: "Bank".into(), username: "me".into(), password: "x".into(), folder: "Money/Banks".into(), ..Default::default() },
-            Item { id: "wifi".into(), kind: ItemKind::Note, name: "Wi-Fi".into(), notes: "swordfish".into(), ..Default::default() },
-            Item { id: "old".into(), name: "Old".into(), deleted: now, ..Default::default() },
-        ]
+            item(ItemData { password: "x".into(), folder: "Money/Banks".into(), ..login("Bank") }),
+            item(ItemData { kind: ItemKind::Note, name: "Wi-Fi".into(), notes: "swordfish".into(), ..Default::default() }),
+            item(login("Old")),
+        ];
+        items.extend(more.iter().map(|n| item(login(n))));
+        v.import(items);
+        let old = v.items().iter().find(|i| i.name == "Old").unwrap().id.clone();
+        v.delete(&old).unwrap();
+        v
+    }
+
+    /// An item's id by its name.
+    fn id(app: &App, name: &str) -> String {
+        let s = app.pw.service.state();
+        s.items().into_iter().chain(s.deleted()).find(|i| i.name == name).unwrap_or_else(|| panic!("no {name}")).id.clone()
+    }
+
+    /// Items' names, by id.
+    fn names(app: &App, ids: &[String]) -> Vec<String> {
+        let s = app.pw.service.state();
+        ids.iter().map(|i| s.item(i).map(|i| i.name.clone()).unwrap_or_default()).collect()
     }
 
     /// One frame of the window, as [`App::frame`] lays it out.
@@ -1139,34 +1173,34 @@ mod tests {
         assert!(app.pw.shown.is_empty());
 
         // Unlocked: the items by name, Recently Deleted apart.
-        app.pw.service.set_for_test(found(), Some(items()));
+        app.pw.service.set_for_test(found(), Some(vault(&[])));
         app.open_passwords(View::Codes);
         app.open_passwords(View::All);
         app.focus = Pane::List;
         ctx.memory_mut(|m| m.stop_text_input());
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["bank", "gh", "wifi"]);
-        assert_eq!(app.pw.selected.as_deref(), Some("bank"));
+        assert_eq!(names(&app, &app.pw.shown), ["Bank", "GitHub", "Wi-Fi"]);
+        assert_eq!(app.pw.selected, Some(id(&app, "Bank")));
         frame(&mut app, &ctx, vec![key(Key::ArrowDown, Modifiers::NONE)]);
-        assert_eq!(app.pw.selected.as_deref(), Some("gh"));
+        assert_eq!(app.pw.selected, Some(id(&app, "GitHub")));
         // Its details, with the secrets shown too.
         app.pw.revealed.extend(["password".to_owned(), "field 0".to_owned(), "history".to_owned()]);
         frame(&mut app, &ctx, vec![]);
         app.pw.search = "git".into();
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["gh"]);
+        assert_eq!(names(&app, &app.pw.shown), ["GitHub"]);
 
         for (view, shown) in [
-            (View::Codes, vec!["gh"]),
-            (View::Folder("Money".into()), vec!["bank"]),
-            (View::Folder("Money/Banks".into()), vec!["bank"]),
-            (View::Deleted, vec!["old"]),
+            (View::Codes, vec!["GitHub"]),
+            (View::Folder("Money".into()), vec!["Bank"]),
+            (View::Folder("Money/Banks".into()), vec!["Bank"]),
+            (View::Deleted, vec!["Old"]),
         ] {
             app.open_passwords(view.clone());
             frame(&mut app, &ctx, vec![]);
             frame(&mut app, &ctx, vec![]);
-            assert_eq!(app.pw.shown, shown, "{view:?}");
-            assert_eq!(app.pw.selected.as_deref(), Some(shown[0]));
+            assert_eq!(names(&app, &app.pw.shown), shown, "{view:?}");
+            assert_eq!(app.pw.selected, Some(id(&app, shown[0])));
         }
 
         // Copying a password remembers it, to clear the clipboard later.
@@ -1192,41 +1226,38 @@ mod tests {
         let mut app = App::for_test(dir.path());
         let ctx = egui::Context::default();
         theme::install_fonts(&ctx);
-        let mut many = items();
-        for n in ["Amazon", "Dropbox", "Zoom"] {
-            many.push(Item { id: n.to_lowercase(), name: n.into(), username: "me".into(), ..Default::default() });
-        }
-        app.pw.service.set_for_test(found(), Some(many));
+        app.pw.service.set_for_test(found(), Some(vault(&["Amazon", "Dropbox", "Zoom"])));
         app.open_passwords(View::All);
         app.focus = Pane::List;
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "gh", "wifi", "zoom"]);
+        assert_eq!(names(&app, &app.pw.shown), ["Amazon", "Bank", "Dropbox", "GitHub", "Wi-Fi", "Zoom"]);
+        let selected = |app: &App| names(app, &app.selected_passwords());
 
         // Ctrl+Click adds and removes; Shift+Click selects a range from the
         // last item clicked.
-        app.click_password("bank", Modifiers::NONE);
-        app.click_password("gh", Modifiers::COMMAND);
-        assert_eq!(app.selected_passwords(), ["bank", "gh"]);
-        app.click_password("zoom", Modifiers::SHIFT);
-        assert_eq!(app.selected_passwords(), ["gh", "wifi", "zoom"]);
-        app.click_password("wifi", Modifiers::COMMAND);
-        assert_eq!(app.selected_passwords(), ["gh", "zoom"]);
+        app.click_password(&id(&app, "Bank"), Modifiers::NONE);
+        app.click_password(&id(&app, "GitHub"), Modifiers::COMMAND);
+        assert_eq!(selected(&app), ["Bank", "GitHub"]);
+        app.click_password(&id(&app, "Zoom"), Modifiers::SHIFT);
+        assert_eq!(selected(&app), ["GitHub", "Wi-Fi", "Zoom"]);
+        app.click_password(&id(&app, "Wi-Fi"), Modifiers::COMMAND);
+        assert_eq!(selected(&app), ["GitHub", "Zoom"]);
         frame(&mut app, &ctx, vec![]);
 
         // Delete: both go to Recently Deleted at once; the next one is
         // selected.
         frame(&mut app, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "wifi"]);
-        assert_eq!(app.selected_passwords(), ["wifi"]);
-        let deleted: Vec<String> = app.pw.service.state().deleted().iter().map(|i| i.id.clone()).collect();
-        assert!(deleted.contains(&"gh".to_owned()) && deleted.contains(&"zoom".to_owned()));
+        assert_eq!(names(&app, &app.pw.shown), ["Amazon", "Bank", "Dropbox", "Wi-Fi"]);
+        assert_eq!(selected(&app), ["Wi-Fi"]);
+        let deleted: Vec<String> = app.pw.service.state().deleted().iter().map(|i| i.name.clone()).collect();
+        assert!(deleted.contains(&"GitHub".to_owned()) && deleted.contains(&"Zoom".to_owned()));
 
         // ⌘Z brings them back, selected.
         frame(&mut app, &ctx, vec![key(Key::Z, Modifiers::COMMAND)]);
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "gh", "wifi", "zoom"]);
-        assert_eq!(app.selected_passwords(), ["gh", "zoom"]);
+        assert_eq!(names(&app, &app.pw.shown), ["Amazon", "Bank", "Dropbox", "GitHub", "Wi-Fi", "Zoom"]);
+        assert_eq!(selected(&app), ["GitHub", "Zoom"]);
 
         // ⌘A, then the pane offers to delete them all.
         frame(&mut app, &ctx, vec![key(Key::A, Modifiers::COMMAND)]);
@@ -1237,14 +1268,15 @@ mod tests {
         app.open_passwords(View::Deleted);
         app.focus = Pane::List;
         frame(&mut app, &ctx, vec![]);
-        assert_eq!(app.pw.shown, ["old"]);
+        let old = id(&app, "Old");
+        assert_eq!(app.pw.shown, [old.as_str()]);
         frame(&mut app, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
         let Some(crate::app::Confirm::DeletePasswordsForever(ids)) = app.confirm.take() else { panic!("asks first") };
-        assert_eq!(ids, ["old"]);
+        assert_eq!(ids, [old.as_str()]);
         app.delete_passwords_forever(ids);
         frame(&mut app, &ctx, vec![]);
         assert!(app.pw.shown.is_empty());
-        assert!(app.pw.service.state().item("old").is_none());
+        assert!(app.pw.service.state().item(&old).is_none());
     }
 
     #[test]
