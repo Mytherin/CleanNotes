@@ -135,10 +135,16 @@ impl App {
             ui.allocate_exact_size(next.size(), Sense::hover());
             return;
         }
-        let title = n.title();
-        let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let locked = crate::lock::is_locked(&n.body);
-        let snippet = if locked { "Locked".to_owned() } else { markdown::snippet_of(&n.body, 120) };
+        // A tab note: the page's title, and its site instead of the text.
+        let tab = n.tab();
+        let title = tab.as_ref().map_or_else(|| n.title(), |t| t.title.clone());
+        let title = if title.is_empty() { "New Note".to_owned() } else { title };
+        let snippet = match &tab {
+            _ if locked => "Locked".to_owned(),
+            Some(t) => super::tabs::site(t),
+            None => markdown::snippet_of(&n.body, 120),
+        };
         let snippet = if snippet.is_empty() { "No additional text".to_owned() } else { snippet };
         let when = if n.deleted.is_some() && matches!(self.location, Location::Deleted(_)) { n.deleted.unwrap() } else if self.lib.settings.sort_by == crate::settings::SortBy::Created { n.created } else { n.modified };
         let time = list_time(when);
@@ -163,7 +169,15 @@ impl App {
         let text = p.on_selection(active);
         let sub = if active { theme::blend(p.selection, p.selection_text, 0.6) } else { p.secondary };
         let x = inner.left() + 16.0;
-        let w = inner.width() - 32.0;
+        let mut w = inner.width() - 32.0;
+        // Its page's picture, on the right.
+        if let Some(t) = tab.as_ref().filter(|t| t.thumbnail.is_some()) {
+            let side = ROW_H - 18.0;
+            let thumb = Rect::from_min_size(Pos2::new(inner.right() - 10.0 - side, rect.top() + 9.0), Vec2::splat(side));
+            super::tabs::paint_picture(ui, p, t, thumb, 6.0, &self.images, 9.0);
+            w -= side + 8.0;
+        }
+        let painter = ui.painter();
         let title_line = truncate(&title, w, ui);
         painter.text(Pos2::new(x, rect.top() + 18.0), Align2::LEFT_CENTER, title_line, theme::bold_font(13.5), text);
         let tg = painter.layout_no_wrap(time.clone(), theme::bold_font(12.5), text);
@@ -339,11 +353,19 @@ impl App {
         if crate::lock::is_locked(&n.body) {
             crate::icons::paint(painter, Icon::Lock, Rect::from_center_size(r.center(), Vec2::splat(30.0)), p.secondary);
         }
+        let tab = n.tab();
+        if let Some(t) = &tab {
+            // A tab note: its page's picture (or site) is the card.
+            super::tabs::paint_picture(ui, p, t, r, 10.0, &self.images, 13.0);
+            let stroke = egui::Stroke::new(if selected { 3.0_f32 } else { 1.0 }, if selected { p.accent } else { p.separator });
+            ui.painter().rect_stroke(r, 10.0, stroke);
+        }
         // A miniature of the note.
         let clip = painter.with_clip_rect(r.shrink(8.0));
         let body = if crate::lock::is_locked(&n.body) { n.title() } else { n.body.clone() };
         let mut y = r.top() + 10.0;
-        for (i, line) in body.lines().filter(|l| !l.trim().is_empty()).take(9).enumerate() {
+        let lines = if tab.is_some() { 0 } else { 9 };
+        for (i, line) in body.lines().filter(|l| !l.trim().is_empty()).take(lines).enumerate() {
             let b = markdown::from_markdown(line);
             let text = b.blocks.first().map(|b| b.text.clone()).unwrap_or_default();
             let (font, color) = if i == 0 { (theme::bold_font(10.5), p.text) } else { (theme::font(9.0), p.secondary) };
@@ -355,7 +377,7 @@ impl App {
                 break;
             }
         }
-        let title = n.title();
+        let title = tab.map_or_else(|| n.title(), |t| t.title);
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let t = truncate(&title, r.width(), ui);
         painter.text(Pos2::new(r.center().x, r.bottom() + 14.0), Align2::CENTER_CENTER, t, theme::bold_font(12.5), p.text);

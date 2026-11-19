@@ -10,6 +10,8 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::sync::{BackendConfig, NoteData};
+/// Tab notes: browser tabs CleanTabs saved as notes (see [`Note::tab`]).
+pub use cleanbucket::notes::tabs;
 
 /// The id of the account that's only on this computer.
 pub const LOCAL: &str = "local";
@@ -17,6 +19,14 @@ pub const LOCAL: &str = "local";
 pub const DEFAULT_FOLDER: &str = cleanbucket::notes::DEFAULT_FOLDER;
 /// How long deleted notes stay in Recently Deleted.
 pub const KEEP_DELETED_DAYS: i64 = 30;
+
+/// The web page a note with this id and Markdown is, if it's a tab note.
+pub fn tab_of(id: &str, body: &str) -> Option<tabs::TabNote> {
+    if !id.starts_with(tabs::ID_PREFIX) {
+        return None;
+    }
+    tabs::TabNote::parse(body)
+}
 
 pub fn local_account_name() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -174,6 +184,12 @@ impl Note {
 
     pub fn title(&self) -> String {
         crate::markdown::title_of(&self.body)
+    }
+
+    /// The web page, if this is a tab note (a browser tab CleanTabs saved;
+    /// see [`tabs`]). A locked one isn't, until opened.
+    pub fn tab(&self) -> Option<tabs::TabNote> {
+        tab_of(&self.id, &self.body)
     }
 
     /// Records a local change.

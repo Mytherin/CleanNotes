@@ -30,6 +30,7 @@ mod note_pane;
 pub mod passwords;
 pub mod settings_window;
 mod sidebar;
+mod tabs;
 
 /// Height of the toolbar row along the top of every pane.
 pub const TOOLBAR_H: f32 = 52.0;

@@ -18,6 +18,7 @@ use crate::icons::Icon;
 use crate::menu;
 use crate::theme::{self, Palette};
 pub use cleannotes_core::editing::{Command, Editing};
+use crate::model::tabs::TabNote;
 
 pub mod images;
 pub mod layout;
@@ -140,6 +141,18 @@ pub struct Editor {
     drag_unit: Option<(Pos, Pos, u32)>,
     /// Typing hides the pointer until the mouse moves, as on macOS.
     pointer_hidden: bool,
+    /// A tab note's web page (title, address, picture), shown as a card
+    /// above the text: the editor holds only what's written about it (so
+    /// `text` is kept empty here), and puts the two back together.
+    pub tab: Option<TabNote>,
+}
+
+/// A tab note: its page (with no text) and the Markdown of its text.
+fn split_tab(note_id: &str, md: &str) -> Option<(TabNote, String)> {
+    let mut tab = crate::model::tab_of(note_id, md)?;
+    let text = std::mem::take(&mut tab.text);
+    let text = if text.is_empty() { text } else { text + "\n" };
+    Some((tab, text))
 }
 
 /// Clicks closer together than this make a double- or triple-click (macOS's
@@ -167,8 +180,69 @@ impl DerefMut for Editor {
 }
 
 impl Editor {
+    /// The editor for a note. A tab note's page goes to [`Editor::tab`] and
+    /// only the text below it is edited.
     pub fn new(note_id: &str, md: &str) -> Editor {
-        Editor::wrap(Editing::new(note_id, md))
+        match split_tab(note_id, md) {
+            Some((tab, text)) => {
+                let mut e = Editor::wrap(Editing::new(note_id, &text));
+                e.tab = Some(tab);
+                e
+            }
+            None => Editor::wrap(Editing::new(note_id, md)),
+        }
+    }
+
+    /// The note's Markdown, if changed since last asked (see
+    /// [`Editing::take_markdown`]): a tab note's whole, page and text.
+    pub fn take_markdown(&mut self) -> Option<String> {
+        let md = self.ed.take_markdown()?;
+        Some(self.with_tab(md))
+    }
+
+    /// The note's Markdown as last stored or loaded (for "Edit as
+    /// Markdown"): a tab note's whole.
+    pub fn markdown(&self) -> String {
+        self.with_tab(self.ed.markdown_seen.clone())
+    }
+
+    /// The note changed elsewhere (see [`Editing::reload`]). Whether
+    /// anything shown changed.
+    pub fn reload(&mut self, md: &str) -> bool {
+        match split_tab(&self.ed.note_id, md) {
+            Some((tab, text)) => {
+                let card = self.tab.as_ref() != Some(&tab);
+                self.tab = Some(tab);
+                self.ed.reload(&text) | card
+            }
+            None => {
+                let was_tab = self.tab.take().is_some();
+                self.ed.reload(md) | was_tab
+            }
+        }
+    }
+
+    /// The note's Markdown was edited by hand (see
+    /// [`Editing::set_markdown`]).
+    pub fn set_markdown(&mut self, md: &str) {
+        match split_tab(&self.ed.note_id, md) {
+            Some((tab, text)) => {
+                self.tab = Some(tab);
+                self.ed.set_markdown(&text);
+            }
+            None => {
+                self.tab = None;
+                self.ed.set_markdown(md);
+            }
+        }
+    }
+
+    /// The text's Markdown with a tab note's page above it.
+    fn with_tab(&self, text: String) -> String {
+        match &self.tab {
+            Some(t) => TabNote { text, ..t.clone() }.to_markdown(),
+            None => text,
+        }
     }
 
     /// A new note: its Markdown from the library (empty, or a tag), the
@@ -178,7 +252,7 @@ impl Editor {
     }
 
     fn wrap(ed: Editing) -> Editor {
-        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None, kill: String::new(), kill_at: None, scroll_request: None, last_press: None, drag_unit: None, pointer_hidden: false }
+        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None, kill: String::new(), kill_at: None, scroll_request: None, last_press: None, drag_unit: None, pointer_hidden: false, tab: None }
     }
 
     pub fn id(&self) -> egui::Id {

@@ -118,12 +118,26 @@ impl App {
         };
         let Some(editor) = &mut self.editor else { return };
         let mut out = None;
+        let mut open_tab = None;
         egui::ScrollArea::vertical()
             .id_salt(("note", &id))
             .auto_shrink([false, false])
             .show(&mut child, |ui| {
-                out = Some(editor.show(ui, p, &opts, &header));
+                // A tab note: its web page as a card, above what's written
+                // about it (which the editor has).
+                match editor.tab.clone() {
+                    Some(tab) => {
+                        if super::tabs::card(ui, p, &id, &tab, &header, &self.images) {
+                            open_tab = Some(tab.url);
+                        }
+                        out = Some(editor.show(ui, p, &opts, ""));
+                    }
+                    None => out = Some(editor.show(ui, p, &opts, &header)),
+                }
             });
+        if let Some(url) = open_tab {
+            let _ = open::that(url);
+        }
         let editor_focused = child.memory(|m| m.has_focus(editor.id()));
         if editor_focused {
             self.focus = Pane::Note;
@@ -174,7 +188,7 @@ impl App {
             // Start from the note as it's stored now.
             self.flush_editor();
             let Some(e) = &self.editor else { return };
-            self.markdown_source = Some((id.to_owned(), e.markdown_seen.clone()));
+            self.markdown_source = Some((id.to_owned(), e.markdown()));
         }
         let Some(e) = &mut self.editor else { return };
         let Some((_, text)) = &mut self.markdown_source else { return };
