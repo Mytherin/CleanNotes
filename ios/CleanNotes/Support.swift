@@ -7,6 +7,7 @@ extension NoteItem: Identifiable {}
 extension FolderItem: Identifiable {}
 extension AccountItem: Identifiable {}
 extension SmartFolderItem: Identifiable {}
+extension VaultRow: Identifiable {}
 
 /// Where the navigation stack can go.
 enum Route: Hashable {
@@ -14,6 +15,11 @@ enum Route: Hashable {
     case list(Place)
     /// A note; `isNew` opens it with the keyboard up.
     case note(id: String, isNew: Bool)
+    /// A CleanPassword list (All Passwords, Codes, a folder, Recently
+    /// Deleted).
+    case passwords(VaultPlace)
+    /// A CleanPassword item.
+    case password(id: String)
 }
 
 /// The message of an error from the core.

@@ -24,3 +24,5 @@ uniffi = "0.29"
 
 [dev-dependencies]
 tempfile = "3"
+# The CleanPassword tests make a vault header.
+chrono = "0.4"
