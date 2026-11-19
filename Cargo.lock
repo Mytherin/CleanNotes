@@ -978,11 +978,14 @@ name = "cleanbucket"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
  "getrandom 0.2.17",
  "hmac",
  "rand 0.8.8",
+ "serde",
+ "serde_json",
  "sha2",
  "url",
  "zeroize",

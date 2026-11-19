@@ -1124,28 +1124,8 @@ impl Doc {
 
 /// Hashtags in a line of text: `#` at the start of a word, followed by
 /// letters, digits, `-`, `_` or `/`, at least one of them a non-digit.
-pub fn tags_in(text: &str) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '#' && (i == 0 || chars[i - 1].is_whitespace() || chars[i - 1] == '(') {
-            let mut j = i + 1;
-            while j < chars.len() && (chars[j].is_alphanumeric() || matches!(chars[j], '-' | '_' | '/')) {
-                j += 1;
-            }
-            let tag: String = chars[i + 1..j].iter().collect();
-            let tag = tag.trim_end_matches(['-', '/']).to_lowercase();
-            if !tag.is_empty() && tag.chars().any(|c| !c.is_ascii_digit()) {
-                out.push(tag);
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    out
-}
+/// (Shared with CleanTabs, which writes notes' front matter too.)
+pub use cleanbucket::notes::tags_in;
 
 /// The char offset of the next (`dir > 0`) or previous grapheme boundary
 /// from `offset` (a char offset) in `text`.

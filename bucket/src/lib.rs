@@ -8,6 +8,9 @@
 //!   (a native HTTP client, driven with [`block_on`]).
 //! - [`seal`]: XChaCha20-Poly1305 with a random nonce, bound to associated
 //!   data naming what's sealed; keys wiped when dropped.
+//! - [`notes`]: a CleanNotes account's folder (note format, encryption,
+//!   and an async client), for CleanNotes' sync and for CleanTabs, which
+//!   saves browser tabs as notes there.
 //! - [`kdf`]: Argon2id keys from passwords, with the costs both apps use
 //!   and the range a stored setting may ask for.
 //! - [`s3::Client::touch`] / [`s3::Client::head`]: a small object rewritten
@@ -18,6 +21,7 @@
 //! git dependency pinned to a revision.
 
 pub mod kdf;
+pub mod notes;
 pub mod s3;
 pub mod seal;
 

@@ -11,7 +11,6 @@
 //! To add a backend: implement [`Backend`], add a [`BackendConfig`] variant,
 //! and open it in [`open`].
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod engine;
@@ -44,23 +43,9 @@ impl BackendConfig {
     }
 }
 
-/// A note as a backend stores it. Folder are given by path from the top of
-/// the account; the default folder is `["Notes"]`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NoteData {
-    /// The note's id in the app (a UUID). A note a backend didn't get from
-    /// the app (say, a Markdown file put into the S3 folder by hand) gets one made up
-    /// from its remote id.
-    pub id: String,
-    pub folder: Vec<String>,
-    /// Markdown.
-    pub body: String,
-    pub created: DateTime<Utc>,
-    pub modified: DateTime<Utc>,
-    pub pinned: bool,
-    /// In Recently Deleted since then.
-    pub deleted: Option<DateTime<Utc>>,
-}
+/// A note as a backend stores it (shared with CleanTabs, which writes
+/// notes into S3 folders too).
+pub use cleanbucket::notes::NoteData;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteNote {

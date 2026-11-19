@@ -14,7 +14,7 @@ use crate::sync::{BackendConfig, NoteData};
 /// The id of the account that's only on this computer.
 pub const LOCAL: &str = "local";
 /// The name of every account's default folder.
-pub const DEFAULT_FOLDER: &str = "Notes";
+pub const DEFAULT_FOLDER: &str = cleanbucket::notes::DEFAULT_FOLDER;
 /// How long deleted notes stay in Recently Deleted.
 pub const KEEP_DELETED_DAYS: i64 = 30;
 
