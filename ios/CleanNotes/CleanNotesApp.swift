@@ -24,8 +24,11 @@ struct CleanNotesApp: App {
             switch phase {
             case .active:
                 store.becameActive()
+                PasswordsStore.shared.becameActive()
                 UIApplication.shared.shortcutItems = store.startupError == nil ? QuickAction.items : []
-            case .background, .inactive: store.resignedActive()
+            case .background, .inactive:
+                store.resignedActive()
+                PasswordsStore.shared.resignedActive()
             @unknown default: break
             }
         }
@@ -49,6 +52,10 @@ struct RootView: View {
                         NotesListView(place: place, path: $path)
                     case let .note(id, isNew):
                         NoteView(noteId: id, startEditing: isNew, path: $path)
+                    case let .passwords(place):
+                        PasswordListView(place: place)
+                    case let .password(id):
+                        PasswordDetailView(id: id)
                     }
                 }
         }

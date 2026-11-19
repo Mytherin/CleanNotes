@@ -5,6 +5,7 @@ import SwiftUI
 /// folder and new note in the bottom toolbar.
 struct FoldersView: View {
     @EnvironmentObject private var store: NotesStore
+    @ObservedObject private var passwords = PasswordsStore.shared
     @Binding var path: [Route]
 
     @State private var search = ""
@@ -36,11 +37,13 @@ struct FoldersView: View {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu {
                     Button { showSettings = true } label: { Label("Settings", systemImage: "gear") }
-                    if store.core.hasUnlocked() {
+                    // Lock Now locks CleanPassword's vault too, as on the desktop.
+                    if store.core.hasUnlocked() || passwords.core.status().unlocked {
                         Button {
                             store.saveEditor()
                             store.perform { $0.lockNow() }
                             NoteImages.shared.forgetAll()
+                            passwords.lock()
                         } label: { Label("Lock Now", systemImage: "lock") }
                     }
                 } label: {
@@ -167,6 +170,8 @@ struct FoldersView: View {
                         }
                 }
             }
+            // CleanPassword's vault, when an S3 account's bucket holds one.
+            PasswordsSection(collapsed: $collapsed)
             if !overview.smartFolders.isEmpty {
                 Section("Smart Folders") {
                     ForEach(overview.smartFolders) { s in

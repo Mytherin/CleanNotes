@@ -1597,6 +1597,686 @@ fn splice_utf16(s: &str, start: usize, end: usize, text: &str) -> String {
     String::from_utf16_lossy(&out)
 }
 
+// ==== CleanPassword's vault =====================================================
+//
+// The iPhone app's CleanPassword section, as the desktop app's
+// (`src/app/passwords.rs`): CleanPassword's vault, when an S3 account's
+// bucket holds one, found with the accounts' access keys, unlocked with the
+// master password, its items read, and deleted, recovered and deleted
+// permanently. Editing items is CleanPassword's. Everything is
+// [`cleannotes_core::passwords`]; this is what the screens see of it.
+
+use cleannotes_core::passwords::{self as vault, ItemExt};
+
+/// The vault is looked for again this often (a vault made since, or one
+/// that was unreachable), as in the desktop app.
+const VAULT_SEARCH_EVERY: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The app, told when something about the vault changed in the background
+/// (found or gone, unlocked, synced, a change saved). Called on a background
+/// thread: the app should then read [`PasswordsCore::status`] again on the
+/// main thread.
+#[uniffi::export(with_foreign)]
+pub trait PasswordsListener: Send + Sync {
+    fn vault_changed(&self);
+}
+
+/// What's going on in the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum VaultBusy {
+    Unlocking,
+    Refreshing,
+}
+
+/// What a CleanPassword list shows.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum VaultPlace {
+    /// All Passwords (not those in Recently Deleted).
+    All,
+    /// Items with a verification code.
+    Codes,
+    /// A folder (`Work`, or `Work/Email` inside it), with the folders
+    /// inside it.
+    Folder { path: String },
+    /// CleanPassword's Recently Deleted.
+    Deleted,
+}
+
+/// One of the vault's folders, for the sidebar.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultFolder {
+    /// `Money/Banks`, for [`VaultPlace::Folder`].
+    pub path: String,
+    /// `Banks`.
+    pub name: String,
+    /// How deep inside other folders it is (0 at the top).
+    pub depth: u32,
+    /// Its items, with those of the folders inside it.
+    pub count: u32,
+}
+
+/// The vault, as the folders screen shows it.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultStatus {
+    /// An S3 account's bucket holds a vault: the CleanPassword section is
+    /// shown.
+    pub found: bool,
+    /// Where: "bucket/folder".
+    pub place: String,
+    /// The account whose access key reads it.
+    pub account: String,
+    /// Looking for a vault.
+    pub searching: bool,
+    pub unlocked: bool,
+    pub busy: Option<VaultBusy>,
+    /// Changes are being saved.
+    pub saving: bool,
+    /// Why unlocking or syncing last failed (shown under the master
+    /// password field, or on top of the item).
+    pub error: Option<String>,
+    /// Counts, while unlocked (0 while locked).
+    pub all_count: u32,
+    pub codes_count: u32,
+    pub deleted_count: u32,
+    /// The items' folders and those around them, sorted, while unlocked.
+    pub folders: Vec<VaultFolder>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum VaultItemKind {
+    Login,
+    /// A secure note.
+    Note,
+}
+
+/// A verification code as it is now.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultCode {
+    /// "287082", to copy.
+    pub code: String,
+    /// "287 082", to show.
+    pub spaced: String,
+    /// Seconds until the next code.
+    pub remaining: u32,
+    /// Seconds each code lasts.
+    pub period: u32,
+}
+
+/// An item in a CleanPassword list.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultRow {
+    pub id: String,
+    /// Its name, or its first website's host, or its user name.
+    pub title: String,
+    /// The user name, "Secure Note", or (in Recently Deleted) when it was
+    /// deleted.
+    pub subtitle: String,
+    pub kind: VaultItemKind,
+    pub username: String,
+    /// It has a password (to copy: [`PasswordsCore::item`]).
+    pub has_password: bool,
+    /// Its verification code now, if it has one.
+    pub code: Option<VaultCode>,
+    /// Its first website, to open (`https://…`).
+    pub website: Option<String>,
+    /// In Recently Deleted.
+    pub deleted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultWebsite {
+    /// As saved.
+    pub uri: String,
+    /// Its host ("github.com"), or as saved.
+    pub label: String,
+    /// To open: `https://` added to a bare host.
+    pub url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultPasskey {
+    /// The site it signs in to ("github.com").
+    pub site: String,
+    /// The account's name on the site, if known.
+    pub user: String,
+}
+
+/// A custom field.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultField {
+    pub name: String,
+    pub value: String,
+    /// Shown as dots until revealed (a PIN, a security answer).
+    pub hidden: bool,
+}
+
+/// A password the item had before.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultHistoryEntry {
+    pub password: String,
+    /// When it stopped being the password ("Yesterday", "3 Mar 2026").
+    pub retired: String,
+}
+
+/// An item's details, as Apple's Passwords app shows them.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct VaultItem {
+    pub id: String,
+    pub title: String,
+    pub kind: VaultItemKind,
+    pub username: String,
+    pub password: String,
+    /// Its verification code now, if it has one.
+    pub code: Option<VaultCode>,
+    pub websites: Vec<VaultWebsite>,
+    pub passkeys: Vec<VaultPasskey>,
+    pub fields: Vec<VaultField>,
+    pub notes: String,
+    /// Earlier passwords, most recent first.
+    pub history: Vec<VaultHistoryEntry>,
+    pub folder: String,
+    pub favorite: bool,
+    /// "15 November 2026 at 11:32".
+    pub modified: String,
+    /// In Recently Deleted.
+    pub deleted: bool,
+}
+
+/// CleanPassword's vault for the iPhone app ([`vault::Passwords`]): found,
+/// unlocked and synced on background threads, which tell the app through
+/// [`PasswordsListener`]; the screens read it while they draw.
+#[derive(uniffi::Object)]
+pub struct PasswordsCore {
+    service: vault::Passwords,
+    /// The S3 accounts last looked with.
+    searched_with: Mutex<Option<String>>,
+}
+
+#[uniffi::export]
+impl PasswordsCore {
+    /// The vault is kept in `dir` (the app's Application Support folder)
+    /// between unlocks, sealed with the vault key, as CleanPassword's
+    /// devices keep it.
+    #[uniffi::constructor]
+    pub fn new(dir: String, listener: Arc<dyn PasswordsListener>) -> Arc<PasswordsCore> {
+        let service = vault::Passwords::new(move || listener.vault_changed());
+        service.set_cache_dir(std::path::PathBuf::from(dir));
+        Arc::new(PasswordsCore { service, searched_with: Mutex::new(None) })
+    }
+
+    /// Looks for a vault with `notes`' S3 accounts' access keys, in the
+    /// background, when the accounts changed and every 10 minutes (else does
+    /// nothing): call it on the app's timer. A vault no account can see any
+    /// more is locked and forgotten.
+    pub fn look_for_vault(&self, notes: Arc<NotesCore>) {
+        let lib = notes.lib();
+        let accounts: Vec<(String, s3::Config)> = lib
+            .store
+            .accounts
+            .iter()
+            .filter(|a| a.enabled)
+            .filter_map(|a| match &a.backend {
+                BackendConfig::S3(c) => Some((a.id.clone(), c.clone())),
+                _ => None,
+            })
+            .collect();
+        let fingerprint = format!("{accounts:?}");
+        let stale = self.service.last_search().is_none_or(|t| t.elapsed() > VAULT_SEARCH_EVERY);
+        let mut searched = self.searched_with.lock().unwrap_or_else(|e| e.into_inner());
+        if searched.as_deref() == Some(fingerprint.as_str()) && !stale {
+            return;
+        }
+        // The access keys come from the keychain: only now.
+        let candidates: Vec<vault::Candidate> = accounts.into_iter().filter_map(|(id, c)| Some((id.clone(), c, lib.db.secret(&id)?))).collect();
+        drop(lib);
+        *searched = Some(fingerprint);
+        if !candidates.is_empty() {
+            self.service.search(candidates);
+        } else if self.service.state().found.is_some() {
+            // The account was removed: so is its vault.
+            self.service.search(Vec::new());
+        }
+    }
+
+    /// Call now and then (the app's timer): locks the vault after 15
+    /// minutes without use (returns true then), and syncs it every minute.
+    pub fn tick(&self) -> bool {
+        self.service.tick()
+    }
+
+    pub fn status(&self) -> VaultStatus {
+        let s = self.service.state();
+        let found = s.found.as_ref();
+        let folders = s
+            .folders()
+            .into_iter()
+            .map(|path| VaultFolder {
+                name: path.rsplit('/').next().unwrap_or(&path).to_owned(),
+                depth: path.matches('/').count() as u32,
+                count: vault_items(&s, &VaultPlace::Folder { path: path.clone() }, "").len() as u32,
+                path,
+            })
+            .collect();
+        VaultStatus {
+            found: found.is_some(),
+            place: found.map(|f| f.place()).unwrap_or_default(),
+            account: found.map(|f| f.account.clone()).unwrap_or_default(),
+            searching: s.searching,
+            unlocked: s.unlocked(),
+            busy: s.busy.map(|b| match b {
+                vault::Busy::Unlocking => VaultBusy::Unlocking,
+                vault::Busy::Refreshing => VaultBusy::Refreshing,
+            }),
+            saving: s.saving(),
+            error: s.error.clone(),
+            all_count: s.items().len() as u32,
+            codes_count: vault_items(&s, &VaultPlace::Codes, "").len() as u32,
+            deleted_count: s.deleted().len() as u32,
+            folders,
+        }
+    }
+
+    /// Unlocks the vault with the master password and syncs it, in the
+    /// background: [`VaultStatus::busy`] until it's unlocked, or
+    /// [`VaultStatus::error`] says why not.
+    pub fn unlock(&self, password: String) {
+        self.service.unlock(password);
+    }
+
+    /// Lock Now: the vault and its keys are dropped (the keys wiped).
+    pub fn lock(&self) {
+        self.service.lock();
+    }
+
+    /// Syncs the unlocked vault now, in the background (pull to refresh).
+    pub fn refresh(&self) {
+        self.service.refresh();
+    }
+
+    /// The vault was used: it stays unlocked another 15 minutes.
+    pub fn touch(&self) {
+        self.service.touch();
+    }
+
+    /// The items `place` shows that have every word of `search` (all, when
+    /// it's empty), by name; Recently Deleted's most recent first.
+    pub fn items(&self, place: VaultPlace, search: String) -> Vec<VaultRow> {
+        let s = self.service.state();
+        vault_items(&s, &place, &search).into_iter().map(|i| vault_row(i, &place)).collect()
+    }
+
+    /// An item's details, while unlocked.
+    pub fn item(&self, id: String) -> Option<VaultItem> {
+        self.service.state().item(&id).map(vault_item)
+    }
+
+    /// An item's verification code now (for its countdown).
+    pub fn code(&self, id: String) -> Option<VaultCode> {
+        self.service.state().item(&id).and_then(|i| vault_code(&i.totp))
+    }
+
+    /// To CleanPassword's Recently Deleted: shown at once, saved to the
+    /// vault in the background (a change that can't be saved now is kept
+    /// and tried again, and [`VaultStatus::error`] says so).
+    pub fn delete(&self, ids: Vec<String>) {
+        self.service.change(ids, vault::Change::Delete);
+    }
+
+    /// Back from Recently Deleted.
+    pub fn recover(&self, ids: Vec<String>) {
+        self.service.change(ids, vault::Change::Recover);
+    }
+
+    /// For good, from every device (unless another device edits it first).
+    pub fn delete_permanently(&self, ids: Vec<String>) {
+        self.service.change(ids, vault::Change::DeleteForever);
+    }
+}
+
+/// The items `place` shows, matching `search`.
+fn vault_items<'a>(s: &'a vault::State, place: &VaultPlace, search: &str) -> Vec<&'a vault::Item> {
+    let items = if *place == VaultPlace::Deleted { s.deleted() } else { s.items() };
+    items
+        .into_iter()
+        .filter(|i| match place {
+            VaultPlace::All | VaultPlace::Deleted => true,
+            VaultPlace::Codes => vault::totp::code_now(&i.totp).is_some(),
+            VaultPlace::Folder { path } => i.in_folder(path),
+        })
+        .filter(|i| search.trim().is_empty() || i.matches(search))
+        .collect()
+}
+
+fn vault_kind(i: &vault::Item) -> VaultItemKind {
+    if i.kind == vault::ItemKind::Note {
+        VaultItemKind::Note
+    } else {
+        VaultItemKind::Login
+    }
+}
+
+fn vault_code(totp: &str) -> Option<VaultCode> {
+    vault::totp::code_now(totp).map(|c| VaultCode {
+        spaced: vault::totp::spaced(&c.code),
+        code: c.code,
+        remaining: c.remaining as u32,
+        period: c.period as u32,
+    })
+}
+
+/// A saved website as a URL to open (`github.com` → `https://github.com`).
+fn website_url(uri: &str) -> String {
+    let u = uri.trim();
+    if u.contains("://") {
+        u.to_owned()
+    } else {
+        format!("https://{u}")
+    }
+}
+
+fn vault_row(i: &vault::Item, place: &VaultPlace) -> VaultRow {
+    let subtitle = match place {
+        VaultPlace::Deleted => i.deleted.map(dates::list_time).unwrap_or_default(),
+        _ if i.kind == vault::ItemKind::Note => "Secure Note".into(),
+        _ => i.username.clone(),
+    };
+    VaultRow {
+        id: i.id.clone(),
+        title: i.title(),
+        subtitle,
+        kind: vault_kind(i),
+        username: i.username.clone(),
+        has_password: !i.password.is_empty(),
+        code: vault_code(&i.totp),
+        website: i.uris.first().map(|u| website_url(&u.uri)),
+        deleted: i.deleted.is_some(),
+    }
+}
+
+fn vault_item(i: &vault::Item) -> VaultItem {
+    VaultItem {
+        id: i.id.clone(),
+        title: i.title(),
+        kind: vault_kind(i),
+        username: i.username.clone(),
+        password: i.password.clone(),
+        code: vault_code(&i.totp),
+        websites: i
+            .uris
+            .iter()
+            .map(|u| VaultWebsite { uri: u.uri.clone(), label: vault::host(&u.uri).unwrap_or_else(|| u.uri.clone()), url: website_url(&u.uri) })
+            .collect(),
+        passkeys: i
+            .passkeys
+            .iter()
+            .map(|k| VaultPasskey {
+                site: k.rp_id.clone(),
+                user: if k.user_name.is_empty() { k.user_display_name.clone() } else { k.user_name.clone() },
+            })
+            .collect(),
+        fields: i.fields.iter().map(|f| VaultField { name: f.name.clone(), value: f.value.clone(), hidden: f.hidden }).collect(),
+        notes: i.notes.trim_end().to_owned(),
+        history: i.history.iter().rev().map(|h| VaultHistoryEntry { password: h.password.clone(), retired: dates::list_time(h.retired) }).collect(),
+        folder: i.folder.clone(),
+        favorite: i.favorite,
+        modified: dates::note_header_time(i.modified),
+        deleted: i.deleted.is_some(),
+    }
+}
+
+#[cfg(test)]
+mod passwords_tests {
+    use super::*;
+
+    struct Quiet;
+    impl PasswordsListener for Quiet {
+        fn vault_changed(&self) {}
+    }
+
+    fn passwords() -> (Arc<PasswordsCore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (PasswordsCore::new(dir.path().to_string_lossy().into_owned(), Arc::new(Quiet)), dir)
+    }
+
+    /// Where the vault was found (the desktop app's tests' vault).
+    fn found() -> vault::Found {
+        let header = vault::VaultHeader {
+            format: "cleanpassword-vault".into(),
+            version: 2,
+            vault_id: "v1".into(),
+            kdf: vault::KdfParams::with_cost(8, 1),
+            wrapped_key: String::new(),
+            created: chrono::Utc::now(),
+        };
+        let config = s3::Config { bucket: "b".into(), region: "us-east-1".into(), prefix: "CleanPassword".into(), endpoint: None, encrypted: false };
+        vault::Found { account: "acct".into(), config, header, header_etag: String::new() }
+    }
+
+    /// A vault made by CleanPassword's core, holding GitHub, Bank, Wi-Fi and
+    /// Old (in Recently Deleted). Its S3 is nowhere (a closed port), so its
+    /// syncs fail at once.
+    fn made_vault() -> vault::Vault {
+        use vault::{Field, HistoryEntry, ImportedItem, ItemData, ItemUri, Passkey};
+        let now = chrono::Utc::now();
+        let config = vault::S3Config { bucket: "b".into(), region: "us-east-1".into(), prefix: "CleanPassword".into(), endpoint: Some("http://127.0.0.1:9".into()) };
+        let creds = vault::AwsCredentials { access_key_id: "AKIA".into(), secret_access_key: "secret".into(), session_token: None };
+        let mut v = vault::Vault::create(config, creds, "correct horse battery").unwrap();
+        let login = |name: &str| ItemData { name: name.into(), username: "me".into(), ..Default::default() };
+        let item = |data: ItemData| ImportedItem { data, history: vec![], passkeys: vec![] };
+        v.import(vec![
+            ImportedItem {
+                data: ItemData {
+                    password: "s3cret-pw".into(),
+                    username: "octocat".into(),
+                    uris: vec![ItemUri::new("https://github.com/login"), ItemUri::new("gist.github.com")],
+                    totp: "JBSWY3DPEHPK3PXP".into(),
+                    notes: "Recovery codes in the safe.\n".into(),
+                    folder: "Work".into(),
+                    fields: vec![Field { name: "PIN".into(), value: "4321".into(), hidden: true }],
+                    ..login("GitHub")
+                },
+                history: vec![HistoryEntry { password: "old-pw".into(), retired: now }],
+                passkeys: vec![Passkey {
+                    credential_id: "Y3JlZA".into(),
+                    rp_id: "github.com".into(),
+                    rp_name: String::new(),
+                    user_handle: "dQ".into(),
+                    user_name: "octocat".into(),
+                    user_display_name: String::new(),
+                    key: String::new(),
+                    counter: 0,
+                    created: now,
+                }],
+            },
+            item(ItemData { password: "x".into(), folder: "Money/Banks".into(), ..login("Bank") }),
+            item(ItemData { kind: vault::ItemKind::Note, name: "Wi-Fi".into(), notes: "swordfish".into(), ..Default::default() }),
+            item(login("Old")),
+        ]);
+        let old = v.items().iter().find(|i| i.name == "Old").unwrap().id.clone();
+        v.delete(&old).unwrap();
+        v
+    }
+
+    fn titles(rows: &[VaultRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.title.as_str()).collect()
+    }
+
+    fn id_of(p: &PasswordsCore, title: &str) -> String {
+        let all = p.items(VaultPlace::All, String::new()).into_iter().chain(p.items(VaultPlace::Deleted, String::new()));
+        all.into_iter().find(|r| r.title == title).unwrap_or_else(|| panic!("no {title}")).id
+    }
+
+    fn wait(what: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !what() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_vault_is_shown_locked_then_unlocked() {
+        let (p, _dir) = passwords();
+        assert!(!p.status().found, "no vault yet: no section");
+
+        // Found, locked: the section, nothing in it.
+        p.service.set_for_test(found(), None);
+        let s = p.status();
+        assert!(s.found && !s.unlocked && !s.searching);
+        assert_eq!((s.place.as_str(), s.account.as_str()), ("b/CleanPassword", "acct"));
+        assert_eq!((s.all_count, s.codes_count, s.deleted_count), (0, 0, 0));
+        assert!(s.folders.is_empty() && s.busy.is_none() && s.error.is_none());
+        assert!(p.items(VaultPlace::All, String::new()).is_empty());
+
+        // Unlocked: counts, folders (with those around them), and the items
+        // in each list.
+        p.service.set_for_test(found(), Some(made_vault()));
+        let s = p.status();
+        assert!(s.unlocked);
+        assert_eq!((s.all_count, s.codes_count, s.deleted_count), (3, 1, 1));
+        let folder = |path: &str, name: &str, depth: u32, count: u32| VaultFolder { path: path.into(), name: name.into(), depth, count };
+        assert_eq!(s.folders, [folder("Money", "Money", 0, 1), folder("Money/Banks", "Banks", 1, 1), folder("Work", "Work", 0, 1)]);
+
+        let all = p.items(VaultPlace::All, String::new());
+        assert_eq!(titles(&all), ["Bank", "GitHub", "Wi-Fi"]);
+        assert_eq!(all.iter().map(|r| r.subtitle.as_str()).collect::<Vec<_>>(), ["me", "octocat", "Secure Note"]);
+        assert_eq!(all.iter().map(|r| r.kind).collect::<Vec<_>>(), [VaultItemKind::Login, VaultItemKind::Login, VaultItemKind::Note]);
+        let gh = &all[1];
+        assert!(gh.has_password && !gh.deleted && gh.code.is_some());
+        assert_eq!(gh.website.as_deref(), Some("https://github.com/login"));
+        assert!(all[2].website.is_none() && all[2].code.is_none() && !all[2].has_password);
+
+        assert_eq!(titles(&p.items(VaultPlace::Codes, String::new())), ["GitHub"]);
+        assert_eq!(titles(&p.items(VaultPlace::Folder { path: "Money".into() }, String::new())), ["Bank"]);
+        assert_eq!(titles(&p.items(VaultPlace::Folder { path: "Money/Banks".into() }, String::new())), ["Bank"]);
+        assert_eq!(titles(&p.items(VaultPlace::All, "  GIT ".into())), ["GitHub"]);
+        assert!(p.items(VaultPlace::All, "git money".into()).is_empty());
+        let deleted = p.items(VaultPlace::Deleted, String::new());
+        assert_eq!(titles(&deleted), ["Old"]);
+        assert!(deleted[0].deleted);
+        assert!(!deleted[0].subtitle.is_empty(), "when it was deleted");
+
+        // An item's details.
+        let item = p.item(gh.id.clone()).unwrap();
+        assert_eq!((item.title.as_str(), item.kind, item.username.as_str(), item.password.as_str()), ("GitHub", VaultItemKind::Login, "octocat", "s3cret-pw"));
+        let code = item.code.unwrap();
+        assert_eq!(code.code.len(), 6);
+        assert_eq!(code.spaced, format!("{} {}", &code.code[..3], &code.code[3..]));
+        assert_eq!(code.period, 30);
+        assert!((1..=30).contains(&code.remaining));
+        assert_eq!(
+            item.websites,
+            [
+                VaultWebsite { uri: "https://github.com/login".into(), label: "github.com".into(), url: "https://github.com/login".into() },
+                VaultWebsite { uri: "gist.github.com".into(), label: "gist.github.com".into(), url: "https://gist.github.com".into() },
+            ]
+        );
+        assert_eq!(item.passkeys, [VaultPasskey { site: "github.com".into(), user: "octocat".into() }]);
+        assert_eq!(item.fields, [VaultField { name: "PIN".into(), value: "4321".into(), hidden: true }]);
+        assert_eq!(item.notes, "Recovery codes in the safe.");
+        assert_eq!(item.history.iter().map(|h| h.password.as_str()).collect::<Vec<_>>(), ["old-pw"]);
+        assert!(!item.history[0].retired.is_empty() && !item.modified.is_empty());
+        assert_eq!((item.folder.as_str(), item.deleted), ("Work", false));
+        assert!(p.code(gh.id.clone()).is_some());
+        assert!(p.code(all[0].id.clone()).is_none());
+        assert_eq!(p.item(all[2].id.clone()).unwrap().kind, VaultItemKind::Note);
+        assert!(p.item(deleted[0].id.clone()).unwrap().deleted);
+        assert!(p.item("nope".into()).is_none());
+
+        // Lock Now: nothing is shown any more.
+        p.touch();
+        p.lock();
+        let s = p.status();
+        assert!(s.found && !s.unlocked);
+        assert_eq!((s.all_count, s.deleted_count), (0, 0));
+        assert!(p.items(VaultPlace::All, String::new()).is_empty());
+        assert!(p.item(gh.id.clone()).is_none() && p.code(gh.id.clone()).is_none());
+        assert!(!p.tick(), "nothing to lock");
+    }
+
+    #[test]
+    fn deleting_recovering_and_deleting_permanently() {
+        let (p, _dir) = passwords();
+        p.service.set_for_test(found(), Some(made_vault()));
+        let (gh, wifi, old) = (id_of(&p, "GitHub"), id_of(&p, "Wi-Fi"), id_of(&p, "Old"));
+
+        // Shown at once.
+        p.delete(vec![gh.clone(), wifi.clone()]);
+        assert_eq!(titles(&p.items(VaultPlace::All, String::new())), ["Bank"]);
+        assert_eq!(p.status().deleted_count, 3);
+        assert!(p.item(gh.clone()).unwrap().deleted);
+        p.recover(vec![gh.clone()]);
+        assert_eq!(titles(&p.items(VaultPlace::All, String::new())), ["Bank", "GitHub"]);
+        p.delete_permanently(vec![old.clone()]);
+        assert!(p.item(old.clone()).is_none());
+        assert_eq!(titles(&p.items(VaultPlace::Deleted, String::new())), ["Wi-Fi"]);
+
+        // The vault's S3 can't be reached: the changes stay, and that's said.
+        wait(|| !p.status().saving);
+        let s = p.status();
+        assert!(s.error.as_deref().unwrap_or_default().starts_with("Couldn't save the change"), "{:?}", s.error);
+        assert_eq!((s.all_count, s.deleted_count), (2, 1));
+        assert!(p.item(old).is_none());
+    }
+
+    #[test]
+    fn unlocking_says_why_it_failed() {
+        let (p, _dir) = passwords();
+        // Not found: nothing happens.
+        p.unlock("correct horse battery".into());
+        assert!(p.status().busy.is_none());
+
+        // Found, but its access key can't be read.
+        p.service.set_for_test(found(), None);
+        p.unlock("correct horse battery".into());
+        wait(|| p.status().busy.is_none());
+        let s = p.status();
+        assert!(!s.unlocked);
+        assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn the_vault_is_looked_for_when_the_s3_accounts_change() {
+        let (notes, _notes_dir) = tests_core();
+        let (p, _dir) = passwords();
+
+        // Only "On My iPhone": nothing to look with.
+        p.look_for_vault(notes.clone());
+        assert!(p.service.last_search().is_none());
+
+        // An S3 account (nowhere: a closed port) is looked in once, and not
+        // again until the accounts change (or 10 minutes pass).
+        let settings = S3Settings { bucket: "notes".into(), region: "".into(), folder: "".into(), endpoint: Some("http://127.0.0.1:9/".into()), encrypted: false };
+        notes.add_s3_account(None, "Work".into(), S3Checked { settings: settings.clone(), secret: "k".into() });
+        p.look_for_vault(notes.clone());
+        let first = p.service.last_search();
+        assert!(first.is_some());
+        wait(|| !p.status().searching);
+        assert!(!p.status().found);
+        p.look_for_vault(notes.clone());
+        assert_eq!(p.service.last_search(), first);
+        notes.add_s3_account(None, "Home".into(), S3Checked { settings, secret: "k".into() });
+        p.look_for_vault(notes.clone());
+        assert_ne!(p.service.last_search(), first);
+        wait(|| !p.status().searching);
+
+        // A vault found with an account since removed is forgotten.
+        let (alone, _alone_dir) = tests_core();
+        let (q, _qdir) = passwords();
+        q.service.set_for_test(found(), None);
+        q.look_for_vault(alone);
+        wait(|| !q.status().searching);
+        assert!(!q.status().found);
+    }
+
+    /// A notes library with only "On My iPhone" (as `tests::core`).
+    fn tests_core() -> (Arc<NotesCore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path(), Secrets::Memory, || {}).unwrap();
+        (Arc::new(NotesCore { lib: Mutex::new(lib) }), dir)
+    }
+}
+
 // ---- Tab notes (browser tabs CleanTabs saved) ----------------------------------
 //
 // A tab note (id `tab-…`, kept under `Tabs/`; see
