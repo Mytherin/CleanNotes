@@ -43,3 +43,9 @@ png = "0.17"
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# CleanPassword's core (the vault view) depends on cleanbucket in this
+# repository at a pinned revision; build it with the local bucket/ instead,
+# so there's one cleanbucket (and one S3 Transport) in the build.
+[patch."https://github.com/Mytherin/CleanNotes"]
+cleanbucket = { path = "bucket" }
