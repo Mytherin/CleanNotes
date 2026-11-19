@@ -2,11 +2,20 @@
 //! notes, which CleanNotes shows on their own, as previews of their web
 //! pages, apart from the account's notes.
 //!
-//! A tab note's id starts with [`ID_PREFIX`] (so its object is
-//! `notes/tab-….md`, and CleanTabs lists just those), and it lives under
-//! the [`FOLDER`] folder: `CleanTabs/<collection>`, and a tab group saved
-//! with its window in `CleanTabs/<collection>/<group>`. (The first version
-//! used `Tabs`, [`LEGACY_FOLDER`]; CleanTabs moves those.) Its Markdown is:
+//! They're kept in a sub-folder of the S3 account's folder, [`DIR`]
+//! (`<bucket>/CleanNotes/tabs/`), laid out exactly as a CleanNotes folder
+//! is (see [`super`]: `tabs/head`, `tabs/notes/…`, `tabs/folders/…`,
+//! `tabs/attachments/…`). CleanNotes reads and syncs it as a second, linked
+//! source of the account, so tabs never mix with the notes, and its notes
+//! sync (which reads only `notes/` and `folders/`) never sees them. It's
+//! encrypted when the account's folder is, with the same key; it has no
+//! `encryption.json` of its own.
+//!
+//! A tab note's id starts with [`ID_PREFIX`], and its folder is the
+//! collection it was saved to: `[Research]`, and a tab group saved with its
+//! window `[Research, Docs]`. (The first versions kept tab notes among the
+//! account's notes, under `Tabs` or `CleanTabs`; CleanTabs moves those, see
+//! [`legacy_folder`].) Its Markdown is:
 //!
 //! ```text
 //! # <the page's title>
@@ -25,24 +34,38 @@ use super::NoteData;
 
 /// What a tab note's id starts with.
 pub const ID_PREFIX: &str = "tab-";
-/// The folder tab notes are kept under.
-pub const FOLDER: &str = "CleanTabs";
-/// Where the first version of CleanTabs kept them.
-pub const LEGACY_FOLDER: &str = "Tabs";
+/// The sub-folder of an account's folder that tabs are kept in.
+pub const DIR: &str = "tabs";
+/// Where tabs saved without a collection go.
+pub const DEFAULT_COLLECTION: &str = "Saved";
 
-/// A tab note's folder below [`FOLDER`] (or [`LEGACY_FOLDER`]): `[]` for
-/// the top. A tab note elsewhere (moved by hand) is at the top too.
-pub fn relative_folder(folder: &[String]) -> &[String] {
-    match folder.first().map(String::as_str) {
-        Some(FOLDER) | Some(LEGACY_FOLDER) => &folder[1..],
-        _ => &[],
+/// The S3 prefix of the tabs of an account whose folder is
+/// `account_prefix` (`CleanNotes` → `CleanNotes/tabs`).
+pub fn dir_prefix(account_prefix: &str) -> String {
+    let p = account_prefix.trim().trim_matches('/');
+    if p.is_empty() {
+        DIR.to_owned()
+    } else {
+        format!("{p}/{DIR}")
     }
 }
 
-/// Whether a folder (by path from the top of an account) is CleanTabs'
-/// own: [`FOLDER`] and everything in it.
-pub fn is_tabs_folder(path: &[String]) -> bool {
-    path.first().map(String::as_str) == Some(FOLDER)
+/// Folders the first versions kept tab notes in, among the account's notes.
+const LEGACY_ROOTS: [&str; 2] = ["Tabs", "CleanTabs"];
+
+/// For a tab note the first versions saved among the account's notes: its
+/// collection in [`DIR`] (its folder below `Tabs` or `CleanTabs`, else
+/// [`DEFAULT_COLLECTION`]).
+pub fn legacy_folder(folder: &[String]) -> Vec<String> {
+    let rel = match folder.first() {
+        Some(r) if LEGACY_ROOTS.contains(&r.as_str()) => &folder[1..],
+        _ => &[][..],
+    };
+    if rel.is_empty() {
+        vec![DEFAULT_COLLECTION.to_owned()]
+    } else {
+        rel.to_vec()
+    }
 }
 
 /// A tab note's contents.
@@ -222,7 +245,7 @@ mod tests {
         assert_eq!(TabNote::parse("Just text"), None);
         assert_eq!(TabNote::parse("# T\n\n[a](https://a.b) and more\n"), None);
         let t = chrono::Utc::now();
-        let n = |id: &str| NoteData { id: id.into(), folder: vec![FOLDER.into()], body: "# A\n\n[a.b](https://a.b)\n".into(), created: t, modified: t, pinned: false, deleted: None };
+        let n = |id: &str| NoteData { id: id.into(), folder: vec![DEFAULT_COLLECTION.into()], body: "# A\n\n[a.b](https://a.b)\n".into(), created: t, modified: t, pinned: false, deleted: None };
         assert!(is_tab(&n("tab-1")));
         assert!(!is_tab(&n("6f1c0d3e")));
     }
@@ -230,11 +253,13 @@ mod tests {
     #[test]
     fn folders() {
         let p = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert_eq!(relative_folder(&p(&["CleanTabs", "Research", "Docs"])), p(&["Research", "Docs"]));
-        assert_eq!(relative_folder(&p(&["Tabs", "Research"])), p(&["Research"]), "the first version's");
-        assert_eq!(relative_folder(&p(&["Notes"])), p(&[]));
-        assert!(is_tabs_folder(&p(&["CleanTabs"])) && is_tabs_folder(&p(&["CleanTabs", "A"])));
-        assert!(!is_tabs_folder(&p(&["Tabs"])) && !is_tabs_folder(&p(&[])));
+        assert_eq!(dir_prefix("CleanNotes"), "CleanNotes/tabs");
+        assert_eq!(dir_prefix("/notes/work/"), "notes/work/tabs");
+        assert_eq!(dir_prefix(""), "tabs");
+        assert_eq!(legacy_folder(&p(&["CleanTabs", "Research", "Docs"])), p(&["Research", "Docs"]));
+        assert_eq!(legacy_folder(&p(&["Tabs", "Research"])), p(&["Research"]));
+        assert_eq!(legacy_folder(&p(&["Tabs"])), p(&["Saved"]));
+        assert_eq!(legacy_folder(&p(&["Notes"])), p(&["Saved"]));
     }
 
     #[test]

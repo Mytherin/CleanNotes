@@ -215,6 +215,13 @@ impl<'a, T: Transport> Folder<'a, T> {
         Ok(etag.map(|etag| StoredNote { stem: stem.to_owned(), etag, data: n.clone() }))
     }
 
+    /// Deletes a note for good, as CleanNotes does: a tombstone, if it's
+    /// still at `etag` (`Ok(false)` if it changed).
+    pub async fn delete_note(&self, stem: &str, etag: &str, now: DateTime<Utc>) -> Result<bool> {
+        let r = self.write(&format!("{NOTES}{stem}.md"), &format::tombstone(stem, now), MARKDOWN, Cond::Match(etag)).await?;
+        Ok(r.is_some())
+    }
+
     /// Stores a picture under `name` (from [`attachment_name`]): what a
     /// note refers to as `attachments/<name>`. One already there is the
     /// same picture.
@@ -305,8 +312,14 @@ mod tests {
                 let mut moved = n.clone();
                 moved.folder = vec!["Tabs".into()];
                 assert!(f.update_note(&stored.stem, "\"stale\"", &moved).await.unwrap().is_none());
-                assert!(f.update_note(&stored.stem, &stored.etag, &moved).await.unwrap().is_some());
+                let updated = f.update_note(&stored.stem, &stored.etag, &moved).await.unwrap().unwrap();
                 assert_eq!(f.notes("").await.unwrap().len(), 2);
+                let other = f.notes("other").await.unwrap().remove(0);
+                assert!(!f.delete_note(&other.stem, "\"stale\"", Utc::now()).await.unwrap(), "changed since");
+                assert!(f.delete_note(&other.stem, &other.etag, Utc::now()).await.unwrap());
+                assert_eq!(f.notes("").await.unwrap(), vec![updated], "tombstones aren't notes");
+                let Some((Some(t), _)) = f.read("notes/other.md").await.unwrap() else { panic!() };
+                assert_eq!(format::read(&t, "other", Utc::now()), format::Object::Gone);
 
                 let mut known = f.folders().await.unwrap();
                 assert!(f.ensure_folder(&["Tabs".into(), "Reading".into()], &mut known).await.unwrap());
