@@ -461,7 +461,9 @@ pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents, list_a
     let a = Access::new(&found.config, secret, &found.config.prefix)?;
     let client = a.client();
     // Read before listing: a write landing after this is seen next time.
-    let cursor = block_on(client.head(HEAD_OBJECT))?;
+    // A HEAD that fails (a service without it, say) means listing, as
+    // CleanPassword does; the listing reports a real error.
+    let cursor = block_on(client.head(HEAD_OBJECT)).ok().flatten();
     if !list_anyway && !old.list_due() && cursor.is_some() && cursor == old.cursor {
         return Ok(None);
     }
