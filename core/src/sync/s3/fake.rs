@@ -61,9 +61,14 @@ impl FakeS3 {
 
     /// Puts an object directly, as if written by another program.
     pub fn put(&self, key: &str, body: &str) {
+        self.put_bytes(key, body.as_bytes());
+    }
+
+    /// [`FakeS3::put`] with bytes.
+    pub fn put_bytes(&self, key: &str, body: &[u8]) {
         let mut s = self.state();
         let etag = s.next_etag();
-        s.objects.insert(key.to_owned(), Obj { body: body.as_bytes().to_vec(), etag, modified: Utc::now() });
+        s.objects.insert(key.to_owned(), Obj { body: body.to_vec(), etag, modified: Utc::now() });
     }
 }
 

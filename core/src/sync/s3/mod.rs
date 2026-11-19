@@ -45,7 +45,7 @@ pub mod crypto;
 pub mod format;
 pub mod sigv4;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
@@ -488,6 +488,28 @@ impl S3Backend {
             }
         }
         bail!("the S3 folder has too many objects to list")
+    }
+
+    /// An object's bytes and ETag (`rel` is inside the folder), as stored:
+    /// for reading what other apps keep in the bucket (CleanPassword's
+    /// vault, see [`crate::passwords`]). `None` if there's none.
+    pub(crate) fn get_bytes(&self, rel: &str) -> Result<Option<(Vec<u8>, String)>> {
+        let r = self.request("GET", &format!("{}{rel}", self.config.root()), &[], None, &[])?;
+        if r.status == 404 {
+            return Ok(None);
+        }
+        if !r.ok() {
+            return Err(r.error());
+        }
+        let etag = r.etag.clone().context("S3 sent no ETag")?;
+        Ok(Some((r.data, etag)))
+    }
+
+    /// Every object under `sub` in the folder: its name inside the folder
+    /// and its ETag.
+    pub(crate) fn list_names(&self, sub: &str) -> Result<Vec<(String, String)>> {
+        let root = self.config.root();
+        Ok(self.list(sub)?.into_iter().filter_map(|l| Some((l.key.strip_prefix(&root)?.to_owned(), l.etag))).collect())
     }
 
     /// Lists `sub`, downloads what changed since last time (several at

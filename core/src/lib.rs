@@ -23,5 +23,6 @@ pub mod library;
 pub mod lock;
 pub mod markdown;
 pub mod model;
+pub mod passwords;
 pub mod settings;
 pub mod sync;

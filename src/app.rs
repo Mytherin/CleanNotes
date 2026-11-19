@@ -27,6 +27,7 @@ mod import;
 mod list;
 pub mod locked;
 mod note_pane;
+pub mod passwords;
 pub mod settings_window;
 mod sidebar;
 
@@ -103,6 +104,8 @@ pub struct App {
     pub pdfs: PdfCache,
     /// Quick Look: an attached PDF (its reference and name) shown whole.
     pub quick_look: Option<(String, String)>,
+    /// CleanPassword's vault, when it's in an S3 account's bucket.
+    pub pw: passwords::PasswordsUi,
 }
 
 impl App {
@@ -133,6 +136,8 @@ impl App {
             lib.seed();
         }
         let mut app = App::with(lib);
+        let ctx = cc.egui_ctx.clone();
+        app.pw = passwords::PasswordsUi::new(cleannotes_core::passwords::Passwords::new(move || ctx.request_repaint()));
         app.restore_location();
         Ok(app)
     }
@@ -142,6 +147,7 @@ impl App {
             images: ImageCache::new(lib.attachments_dir()),
             pdfs: PdfCache::new(lib.attachments_dir()),
             quick_look: None,
+            pw: passwords::PasswordsUi::new(cleannotes_core::passwords::Passwords::new(|| {})),
             lib,
             location: Location::Folder(String::new()),
             selected: None,
@@ -287,6 +293,8 @@ impl App {
     }
 
     pub fn go_to(&mut self, loc: Location) {
+        // Notes take the panes back from CleanPassword.
+        self.pw.view = None;
         self.lib.remember_location(&loc);
         self.location = loc;
         self.search.clear();
@@ -681,6 +689,7 @@ impl App {
         if ctx.input(|i| !i.events.is_empty() || i.pointer.is_moving()) {
             self.lib.touch_lock();
         }
+        self.passwords_background(ctx);
     }
 
     /// Drops notes that no longer exist (purged, deleted by a sync) from
@@ -713,6 +722,11 @@ impl App {
         let alt_cmd = Modifiers::COMMAND | Modifiers::ALT;
         // A modal question takes the keyboard (Enter, Esc) for itself.
         if self.confirm.is_some() {
+            return;
+        }
+        // CleanPassword, when shown, has keys of its own (none that change
+        // the notes hidden behind it).
+        if self.passwords_shortcuts(ctx) {
             return;
         }
         // Modifiers must match exactly: egui's own matching ignores extra
@@ -1064,18 +1078,22 @@ impl App {
                 .frame(egui::Frame::none().fill(p.list_bg))
                 .show(ctx, |ui| self.sidebar(ui, &p));
         }
-        let list_w = if self.lib.settings.view == ListView::Gallery { 0.0 } else { 300.0 };
-        if self.lib.settings.view == ListView::List {
+        // CleanPassword's items are always a list (there are no thumbnails).
+        let vault = self.pw.view.is_some();
+        let list_w = if self.lib.settings.view == ListView::Gallery && !vault { 0.0 } else { 300.0 };
+        if self.lib.settings.view == ListView::List || vault {
             egui::SidePanel::left("notes-list")
                 .resizable(true)
                 .default_width(list_w)
                 .width_range(220.0..=480.0)
                 .show_separator_line(false)
                 .frame(egui::Frame::none().fill(p.list_bg))
-                .show(ctx, |ui| self.notes_list(ui, &p));
+                .show(ctx, |ui| if vault { self.passwords_list(ui, &p) } else { self.notes_list(ui, &p) });
         }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(p.bg)).show(ctx, |ui| {
-            if self.lib.settings.view == ListView::Gallery {
+            if vault {
+                self.password_pane(ui, &p);
+            } else if self.lib.settings.view == ListView::Gallery {
                 self.gallery(ui, &p);
             } else {
                 self.note_pane(ui, &p);

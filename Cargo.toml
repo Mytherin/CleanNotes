@@ -34,6 +34,8 @@ rfd = "0.15"
 # Pasting a picture (egui's clipboard only carries text).
 arboard = { version = "3", features = ["image-data"] }
 hayro = "0.9"
+# CleanPassword's vault: a typed or copied password wiped from memory.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

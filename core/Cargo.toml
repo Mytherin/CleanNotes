@@ -26,8 +26,12 @@ hkdf = "0.12"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
-# An encrypted S3 folder's notes.
+# An encrypted S3 folder's notes, and CleanPassword's vault.
 chacha20poly1305 = "0.10"
+# CleanPassword's vault: keys and passwords wiped from memory, and its
+# items' verification codes (TOTP, usually with SHA-1).
+zeroize = "1"
+sha1 = "0.10"
 
 # Desktop only: the default data folder. (On iOS the app passes its own
 # folder in.)
