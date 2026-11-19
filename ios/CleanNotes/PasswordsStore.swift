@@ -76,9 +76,48 @@ final class PasswordsStore: ObservableObject {
     /// Something changed: screens redraw.
     func changed() {
         revision &+= 1
+        // A typed master password unlocked the vault (or didn't): Face ID
+        // keeps it, or offers to.
+        if let typed = typedPassword {
+            let s = core.status()
+            if s.busy == nil {
+                typedPassword = nil
+                if s.unlocked && VaultFaceID.unlocked(with: typed) {
+                    offerFaceID = typed
+                }
+            }
+        }
     }
 
+    /// The master password just typed, until the vault says whether it
+    /// unlocks it.
+    private var typedPassword: String?
+    /// A master password that just unlocked the vault, while asking whether
+    /// Face ID should keep it.
+    @Published var offerFaceID: String?
+
     // ---- What the screens do ----
+
+    /// Unlocks the vault with its master password, typed or kept for Face
+    /// ID (in the background: `status().busy` until it's done).
+    func unlock(password: String, typed: Bool) {
+        core.unlock(password: password)
+        typedPassword = typed ? password : nil
+        changed()
+    }
+
+    /// Face ID unlocks the vault, when it's on: asks for it and unlocks with
+    /// the kept master password. Returns false (and does nothing) when it's
+    /// off.
+    @discardableResult
+    func unlockWithFaceID() -> Bool {
+        guard VaultFaceID.kept.ready, core.status().busy == nil else { return false }
+        VaultFaceID.kept.password(reason: "Unlock CleanPassword.") { [weak self] kept in
+            guard let self, let kept, !self.core.status().unlocked else { return }
+            self.unlock(password: kept, typed: false)
+        }
+        return true
+    }
 
     /// The vault was used: it stays unlocked another 15 minutes.
     func touch() {

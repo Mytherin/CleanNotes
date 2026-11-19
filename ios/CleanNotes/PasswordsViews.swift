@@ -89,6 +89,8 @@ struct VaultUnlockView: View {
     @ObservedObject private var passwords = PasswordsStore.shared
     @State private var password = ""
     @FocusState private var focused: Bool
+    /// Face ID was asked for once since this screen showed.
+    @State private var triedFaceID = false
 
     var body: some View {
         let _ = passwords.revision
@@ -104,7 +106,7 @@ struct VaultUnlockView: View {
                     .foregroundStyle(.secondary)
                 Text("CleanPassword is locked.")
                     .font(.title3.bold())
-                Text("Enter the master password to view your passwords.")
+                Text(VaultFaceID.kept.ready ? "Use \(Biometrics.name) or enter the master password to view your passwords." : "Enter the master password to view your passwords.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -133,6 +135,15 @@ struct VaultUnlockView: View {
                         .tint(Color.notesAccent)
                         .disabled(password.isEmpty)
                         .padding(.top, 6)
+                    if VaultFaceID.kept.ready {
+                        Button {
+                            faceID()
+                        } label: {
+                            Label("Use \(Biometrics.name)", systemImage: Biometrics.name == "Touch ID" ? "touchid" : "faceid")
+                        }
+                        .buttonStyle(.borderless)
+                        .tint(Color.notesAccent)
+                    }
                 }
                 Spacer()
                 Text("Your CleanPassword vault, in \(status.place).")
@@ -141,15 +152,30 @@ struct VaultUnlockView: View {
                     .multilineTextAlignment(.center)
             }
             .padding(32)
-            .onAppear { focused = true }
+            .onAppear {
+                // Face ID first, when it's on (as for locked notes); else
+                // the keyboard for the master password.
+                if !triedFaceID && VaultFaceID.kept.ready && !unlocking {
+                    triedFaceID = true
+                    faceID()
+                } else {
+                    focused = true
+                }
+            }
         }
     }
 
     private func unlock() {
         guard !password.isEmpty else { return }
-        passwords.core.unlock(password: password)
+        passwords.unlock(password: password, typed: true)
         password = ""
-        passwords.changed()
+    }
+
+    private func faceID() {
+        focused = false
+        if !passwords.unlockWithFaceID() {
+            focused = true
+        }
     }
 }
 
@@ -482,9 +508,26 @@ extension View {
 
 private struct VaultCover: ViewModifier {
     @Environment(\.scenePhase) private var phase
+    @ObservedObject private var passwords = PasswordsStore.shared
 
     func body(content: Content) -> some View {
-        content.overlay {
+        content
+        // After the first unlock with the master password: keep it for Face ID?
+        .alert("Use \(Biometrics.name) for CleanPassword?", isPresented: Binding(
+            get: { passwords.offerFaceID != nil },
+            set: { if !$0 { passwords.offerFaceID = nil } }
+        )) {
+            Button("Not Now", role: .cancel) { passwords.offerFaceID = nil }
+            Button("Use \(Biometrics.name)") {
+                if let p = passwords.offerFaceID {
+                    VaultFaceID.kept.turnOn(password: p)
+                }
+                passwords.offerFaceID = nil
+            }
+        } message: {
+            Text("Unlock CleanPassword with \(Biometrics.name) instead of typing the master password. It's kept in this iPhone's keychain, readable only after \(Biometrics.name). You can change this in Settings.")
+        }
+        .overlay {
             if phase != .active {
                 ZStack {
                     Rectangle().fill(.regularMaterial)

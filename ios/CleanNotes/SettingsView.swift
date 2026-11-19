@@ -8,6 +8,8 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var setPassword = false
     @State private var useBiometrics = Biometrics.enabled
+    @State private var vaultFaceID = VaultFaceID.on
+    @ObservedObject private var passwords = PasswordsStore.shared
     @State private var askBiometricsPassword = false
     @State private var biometricsPassword = ""
     @State private var biometricsError: String?
@@ -114,6 +116,32 @@ struct SettingsView: View {
                         Text("Locked notes are encrypted with this password, here and wherever they sync to.")
                     }
                 }
+                // CleanPassword's vault, when an S3 account's bucket holds one.
+                if passwords.core.status().found && Biometrics.available {
+                    Section {
+                        Toggle("Use \(Biometrics.name)", isOn: Binding(
+                            get: { vaultFaceID },
+                            set: { on in
+                                if on {
+                                    VaultFaceID.wanted = true
+                                } else {
+                                    VaultFaceID.turnOff()
+                                }
+                                vaultFaceID = VaultFaceID.on
+                            }
+                        ))
+                    } header: {
+                        Text("CleanPassword")
+                    } footer: {
+                        if VaultFaceID.kept.enabled {
+                            Text("\(Biometrics.name) unlocks CleanPassword on this iPhone: the master password is kept in its keychain, readable only after \(Biometrics.name).")
+                        } else if vaultFaceID {
+                            Text("\(Biometrics.name) starts working the next time you unlock CleanPassword with its master password.")
+                        } else {
+                            Text("Unlock CleanPassword with \(Biometrics.name) instead of typing the master password.")
+                        }
+                    }
+                }
             }
             .alert("Use \(Biometrics.name)", isPresented: $askBiometricsPassword) {
                 SecureField("Password", text: $biometricsPassword)
@@ -127,7 +155,10 @@ struct SettingsView: View {
             } message: {
                 Text(biometricsError ?? "")
             }
-            .onAppear { useBiometrics = Biometrics.enabled }
+            .onAppear {
+                useBiometrics = Biometrics.enabled
+                vaultFaceID = VaultFaceID.on
+            }
             .navigationTitle("Notes")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
