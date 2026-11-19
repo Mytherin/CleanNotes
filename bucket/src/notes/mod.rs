@@ -234,6 +234,27 @@ impl<'a, T: Transport> Folder<'a, T> {
         Ok(())
     }
 
+    /// A picture stored with [`Folder::put_attachment`], decrypted;
+    /// `None` if it isn't there, or can't be decrypted or doesn't match its
+    /// name.
+    pub async fn get_attachment(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let key = match &self.key {
+            Some(k) => format!("{ATTACHMENTS}{}", crypto::attachment_object(k, name)),
+            None => format!("{ATTACHMENTS}{name}"),
+        };
+        let Some(o) = self.client.get(&key).await? else { return Ok(None) };
+        let data = if o.data.starts_with(crypto::MAGIC_BYTES) {
+            match &self.key {
+                Some(k) => crypto::open_bytes(k, &key, &o.data),
+                None => None,
+            }
+        } else {
+            Some(o.data)
+        };
+        let ext = name.split_once('.').map_or("", |(_, e)| e);
+        Ok(data.filter(|d| attachment_name(d, ext) == name))
+    }
+
     /// Tells other devices something changed. Call once after writes.
     pub async fn touch(&self) -> Result<String> {
         self.client.touch(HEAD).await
@@ -298,6 +319,8 @@ mod tests {
                 let name = attachment_name(pic, "jpg");
                 f.put_attachment(&name, pic).await.unwrap();
                 f.put_attachment(&name, pic).await.unwrap();
+                assert_eq!(f.get_attachment(&name).await.unwrap().as_deref(), Some(&pic[..]));
+                assert_eq!(f.get_attachment(&attachment_name(b"other", "jpg")).await.unwrap(), None);
                 f.touch().await.unwrap();
             });
             let objects = s3.objects.borrow();
