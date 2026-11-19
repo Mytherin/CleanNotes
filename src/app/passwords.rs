@@ -18,7 +18,7 @@ use super::{consume_exact, list_time, note_header_time, App, Pane, TOOLBAR_H};
 use crate::icons::{self, Icon};
 use crate::menu;
 use crate::theme::{self, Palette};
-use cleannotes_core::passwords::{self, totp, Busy, Candidate, Item, ItemKind, Passwords, State};
+use cleannotes_core::passwords::{self, totp, Busy, Candidate, Change, Item, ItemKind, Passwords, State};
 use cleannotes_core::sync::BackendConfig;
 
 /// A copied password is taken off the clipboard after this long, as in
@@ -62,6 +62,13 @@ pub struct PasswordsUi {
     searched_with: Option<String>,
     /// The list as shown last frame (for ↑/↓).
     shown: Vec<String>,
+    /// Items selected together with Ctrl+Click or Shift+Click (including
+    /// `selected`); empty when just one is.
+    multi: Vec<String>,
+    /// Where a Shift+Click range starts.
+    anchor: Option<String>,
+    /// The items last moved to Recently Deleted, for ⌘Z.
+    undo: Vec<String>,
 }
 
 impl PasswordsUi {
@@ -78,6 +85,9 @@ impl PasswordsUi {
             copied: None,
             searched_with: None,
             shown: Vec::new(),
+            multi: Vec::new(),
+            anchor: None,
+            undo: Vec::new(),
         }
     }
 
@@ -210,7 +220,115 @@ impl App {
         if self.pw.selected != id {
             self.pw.revealed.clear();
         }
+        self.pw.anchor = id.clone();
+        self.pw.multi.clear();
         self.pw.selected = id;
+    }
+
+    /// The selected items, in list order.
+    pub fn selected_passwords(&self) -> Vec<String> {
+        if self.pw.multi.is_empty() {
+            self.pw.selected.iter().cloned().collect()
+        } else {
+            self.pw.multi.clone()
+        }
+    }
+
+    fn is_password_selected(&self, id: &str) -> bool {
+        if self.pw.multi.is_empty() {
+            self.pw.selected.as_deref() == Some(id)
+        } else {
+            self.pw.multi.iter().any(|m| m == id)
+        }
+    }
+
+    /// A click on an item in the list: Shift+Click selects a range,
+    /// Ctrl+Click (⌘ on a Mac) adds or removes one, as in the notes list.
+    fn click_password(&mut self, id: &str, m: Modifiers) {
+        let pos = |list: &[String], x: &str| list.iter().position(|s| s == x);
+        let mut set = if m.shift {
+            let anchor = self.pw.anchor.clone().or_else(|| self.pw.selected.clone()).unwrap_or_else(|| id.to_owned());
+            match (pos(&self.pw.shown, &anchor), pos(&self.pw.shown, id)) {
+                (Some(a), Some(b)) => self.pw.shown[a.min(b)..=a.max(b)].to_vec(),
+                _ => vec![id.to_owned()],
+            }
+        } else if m.command {
+            let mut set = self.selected_passwords();
+            match pos(&set, id) {
+                Some(i) if set.len() > 1 => {
+                    set.remove(i);
+                }
+                Some(_) => {}
+                None => set.push(id.to_owned()),
+            }
+            set
+        } else {
+            return self.select_password(Some(id.to_owned()));
+        };
+        set.sort_by_key(|s| pos(&self.pw.shown, s).unwrap_or(usize::MAX));
+        set.dedup();
+        let primary = if set.iter().any(|s| s == id) { id.to_owned() } else { set.last().cloned().unwrap_or_default() };
+        if !m.shift {
+            self.pw.anchor = Some(id.to_owned());
+        }
+        if self.pw.selected.as_deref() != Some(primary.as_str()) {
+            self.pw.revealed.clear();
+        }
+        self.pw.selected = Some(primary);
+        self.pw.multi = if set.len() > 1 { set } else { Vec::new() };
+    }
+
+    /// The item to show once `ids` leave the list: the next one after
+    /// them, or else the one before.
+    fn password_neighbour(&self, ids: &[String]) -> Option<String> {
+        let last = ids.iter().filter_map(|i| self.pw.shown.iter().position(|s| s == i)).max()?;
+        let keep = |s: &&String| !ids.contains(s);
+        self.pw.shown[last + 1..].iter().find(keep).or_else(|| self.pw.shown[..last].iter().rev().find(keep)).cloned()
+    }
+
+    /// Delete: to CleanPassword's Recently Deleted (from there, for good,
+    /// after asking).
+    pub fn delete_passwords(&mut self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        if self.pw.view == Some(View::Deleted) {
+            self.confirm = Some(super::Confirm::DeletePasswordsForever(ids));
+            return;
+        }
+        let next = self.password_neighbour(&ids);
+        self.pw.service.change(ids.clone(), Change::Delete);
+        self.pw.undo = ids;
+        self.select_password(next);
+    }
+
+    /// Recover, in Recently Deleted.
+    pub fn recover_passwords(&mut self, ids: Vec<String>) {
+        let next = self.password_neighbour(&ids);
+        self.pw.service.change(ids, Change::Recover);
+        self.select_password(next);
+    }
+
+    /// Delete Permanently, once confirmed.
+    pub fn delete_passwords_forever(&mut self, ids: Vec<String>) {
+        let next = self.password_neighbour(&ids);
+        self.pw.service.change(ids, Change::DeleteForever);
+        self.select_password(next);
+    }
+
+    /// ⌘Z: the items last deleted come back, selected.
+    fn undo_delete_passwords(&mut self) {
+        let ids = std::mem::take(&mut self.pw.undo);
+        if ids.is_empty() {
+            return;
+        }
+        self.pw.service.change(ids.clone(), Change::Recover);
+        if self.pw.view == Some(View::Deleted) {
+            self.pw.view = Some(View::All);
+        }
+        self.pw.selected = ids.first().cloned();
+        self.pw.multi = if ids.len() > 1 { ids } else { Vec::new() };
+        self.scroll_list = true;
     }
 
     /// Copies `text`; a secret is taken off the clipboard again later.
@@ -237,7 +355,7 @@ impl App {
         let s = svc.state();
         let Some(found) = s.found.clone() else { return };
         let unlocked = s.unlocked();
-        let busy = s.busy;
+        let busy = s.busy.or(s.saving().then_some(Busy::Refreshing));
         let error = s.error.clone();
         let all = s.items().len();
         let codes = items_in(&s, &View::Codes, "").len();
@@ -264,8 +382,8 @@ impl App {
             icons::paint(painter, Icon::Lock, right, p.tertiary);
         }
         let tip = match (&error, unlocked) {
-            (Some(e), true) => format!("Couldn't read the vault: {e}"),
-            _ => format!("Your CleanPassword vault, in {}. Read-only here: edit passwords in CleanPassword.", found.place()),
+            (Some(e), true) => e.clone(),
+            _ => format!("Your CleanPassword vault, in {}. Edit passwords in CleanPassword.", found.place()),
         };
         let resp = resp.on_hover_text(tip);
         if resp.clicked() {
@@ -348,8 +466,15 @@ impl App {
             .collect();
         drop(s);
         self.pw.shown = rows.iter().map(|r| r.0.clone()).collect();
-        if unlocked && self.pw.selected.as_ref().is_none_or(|s| !self.pw.shown.contains(s)) {
-            self.pw.selected = self.pw.shown.first().cloned();
+        // Items gone from the list (deleted, searched away) leave the
+        // selection.
+        let shown = self.pw.shown.clone();
+        self.pw.multi.retain(|m| shown.contains(m));
+        if self.pw.multi.len() == 1 {
+            self.pw.multi.clear();
+        }
+        if unlocked && self.pw.selected.as_ref().is_none_or(|s| !shown.contains(s)) {
+            self.pw.selected = self.pw.multi.first().cloned().or_else(|| shown.first().cloned());
         }
 
         // The header: the view's name and count, as the notes list's.
@@ -399,8 +524,8 @@ impl App {
         egui::ScrollArea::vertical().id_salt("passwords-list").auto_shrink([false, false]).show(&mut child, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             for (i, (id, title, sub, uri)) in rows.iter().enumerate() {
-                let selected = self.pw.selected.as_deref() == Some(id);
-                let next_selected = rows.get(i + 1).is_some_and(|r| self.pw.selected.as_deref() == Some(&r.0));
+                let selected = self.is_password_selected(id);
+                let next_selected = rows.get(i + 1).is_some_and(|r| self.is_password_selected(&r.0));
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click());
                 let inner = rect.shrink2(Vec2::new(10.0, 0.0));
                 let active = selected && self.focus == Pane::List;
@@ -422,10 +547,13 @@ impl App {
                 let w = inner.right() - x - 10.0;
                 painter.text(Pos2::new(x, rect.center().y - 9.0), Align2::LEFT_CENTER, truncate(title, w, ui), theme::bold_font(13.5), text);
                 painter.text(Pos2::new(x, rect.center().y + 10.0), Align2::LEFT_CENTER, truncate(sub, w, ui), theme::font(12.5), subc);
-                if selected && self.scroll_list {
+                if self.pw.selected.as_deref() == Some(id) && self.scroll_list {
                     ui.scroll_to_rect(rect, None);
                 }
-                if resp.clicked() || resp.secondary_clicked() {
+                if resp.clicked() {
+                    self.click_password(id, ui.input(|i| i.modifiers));
+                    self.focus = Pane::List;
+                } else if resp.secondary_clicked() && !self.is_password_selected(id) {
                     self.select_password(Some(id.clone()));
                     self.focus = Pane::List;
                 }
@@ -435,13 +563,36 @@ impl App {
         self.scroll_list = false;
     }
 
-    /// An item's right-click menu.
+    /// An item's right-click menu; with several items selected, it acts on
+    /// all of them.
     fn password_menu(&mut self, resp: &egui::Response, id: &str, uri: Option<&str>) {
         let Some(item) = self.pw.service.state().item(id).cloned() else { return };
         let code = totp::code_now(&item.totp);
+        let ids = if self.is_password_selected(id) { self.selected_passwords() } else { vec![id.to_owned()] };
+        let n = ids.len();
         resp.context_menu(|ui| {
             menu::begin(ui, 210.0);
             let ctx = ui.ctx().clone();
+            if item.deleted.is_some() {
+                let label = if n > 1 { format!("Recover {n} Items") } else { "Recover".to_owned() };
+                if menu::item(&label).show(ui).clicked() {
+                    self.recover_passwords(ids.clone());
+                    ui.close_menu();
+                }
+                let label = if n > 1 { format!("Delete {n} Items Permanently…") } else { "Delete Permanently…".to_owned() };
+                if menu::item(&label).icon(Icon::Trash).show(ui).clicked() {
+                    self.confirm = Some(super::Confirm::DeletePasswordsForever(ids.clone()));
+                    ui.close_menu();
+                }
+                return;
+            }
+            if n > 1 {
+                if menu::item(&format!("Delete {n} Items")).icon(Icon::Trash).shortcut(cmd_key!("Backspace")).show(ui).clicked() {
+                    self.delete_passwords(ids.clone());
+                    ui.close_menu();
+                }
+                return;
+            }
             if !item.username.is_empty() && menu::item("Copy User Name").icon(Icon::Copy).show(ui).clicked() {
                 self.copy_from_vault(&ctx, item.username.clone(), "the user name", false);
                 ui.close_menu();
@@ -462,6 +613,11 @@ impl App {
                     let _ = open::that(website_url(u));
                     ui.close_menu();
                 }
+            }
+            menu::separator(ui);
+            if menu::item("Delete").icon(Icon::Trash).shortcut(cmd_key!("Backspace")).show(ui).clicked() {
+                self.delete_passwords(ids.clone());
+                ui.close_menu();
             }
         });
     }
@@ -487,11 +643,20 @@ impl App {
             if glass_button(ui, p, Pos2::new(bar.right() - 76.0, y), Icon::Sync, "Refresh", !refreshing).clicked() {
                 svc.refresh();
             }
+            let ids = self.selected_passwords();
+            let tip = if self.pw.view == Some(View::Deleted) { "Delete Permanently" } else { "Delete" };
+            if glass_button(ui, p, Pos2::new(bar.right() - 120.0, y), Icon::Trash, tip, !ids.is_empty()).clicked() {
+                self.delete_passwords(ids);
+            }
         }
         let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom()), full.max);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::LEFT)));
         if !unlocked {
             self.vault_lock_screen(&mut child, p, area, busy, error);
+            return;
+        }
+        if self.pw.multi.len() > 1 {
+            self.several_passwords(&mut child, p, area);
             return;
         }
         let Some(mut item) = self.pw.selected.as_ref().and_then(|id| svc.state().item(id).cloned()) else {
@@ -504,6 +669,33 @@ impl App {
         });
         item.history.iter_mut().for_each(|h| zeroize::Zeroize::zeroize(&mut h.password));
         zeroize::Zeroize::zeroize(&mut item.password);
+    }
+
+    /// Several items selected: their badges, stacked, and how many.
+    fn several_passwords(&mut self, ui: &mut Ui, p: &Palette, area: Rect) {
+        let c = area.center() - Vec2::new(0.0, 40.0);
+        let n = self.pw.multi.len();
+        let svc = self.pw.service.clone();
+        let s = svc.state();
+        for (k, id) in self.pw.multi.iter().take(3).enumerate().collect::<Vec<_>>().into_iter().rev() {
+            if let Some(item) = s.item(id) {
+                let off = k as f32 * 22.0 - 22.0;
+                item_badge(ui.painter(), c + Vec2::new(off, 0.0), 28.0, item);
+            }
+        }
+        drop(s);
+        ui.painter().text(c + Vec2::new(0.0, 56.0), Align2::CENTER_CENTER, format!("{n} Items Selected"), theme::font(15.0), p.secondary);
+        let deleted = self.pw.view == Some(View::Deleted);
+        let label = if deleted { format!("Recover {n} Items") } else { format!("Delete {n} Items") };
+        let btn = Rect::from_center_size(c + Vec2::new(0.0, 96.0), Vec2::new(150.0, 28.0));
+        if ui.put(btn, egui::Button::new(label).rounding(8.0)).clicked() {
+            let ids = self.selected_passwords();
+            if deleted {
+                self.recover_passwords(ids);
+            } else {
+                self.delete_passwords(ids);
+            }
+        }
     }
 
     /// "CleanPassword is locked": the master password field.
@@ -555,7 +747,7 @@ impl App {
                 ui.spacing_mut().item_spacing.y = 6.0;
                 ui.add_space(18.0);
                 if let Some(e) = error {
-                    ui.colored_label(theme::RED, format!("Couldn't read the vault again: {e}"));
+                    ui.colored_label(theme::RED, e);
                 }
                 if item.deleted.is_some() {
                     ui.label(RichText::new("This item is in CleanPassword's Recently Deleted.").color(p.secondary).size(12.5));
@@ -689,7 +881,7 @@ impl App {
                 }
 
                 ui.add_space(6.0);
-                ui.label(RichText::new("Shown read-only from your CleanPassword vault. Edit items in CleanPassword.").size(12.0).color(p.tertiary));
+                ui.label(RichText::new("From your CleanPassword vault. Edit items in CleanPassword; delete them here or there.").size(12.0).color(p.tertiary));
                 ui.add_space(24.0);
 
                 if let Some((text, what, secret)) = copy {
@@ -730,7 +922,25 @@ impl App {
         if pressed(cmd | Modifiers::ALT, Key::S) {
             self.lib.settings.sidebar_visible = !self.lib.settings.sidebar_visible;
         }
+        // Not while typing: there they edit the text.
+        if !ctx.wants_keyboard_input() {
+            if pressed(cmd, Key::Backspace) || pressed(cmd, Key::Delete) {
+                self.delete_passwords(self.selected_passwords());
+            }
+            if pressed(cmd, Key::Z) {
+                self.undo_delete_passwords();
+            }
+        }
         if self.focus == Pane::List && !ctx.wants_keyboard_input() {
+            if pressed(Modifiers::NONE, Key::Delete) || pressed(Modifiers::NONE, Key::Backspace) {
+                self.delete_passwords(self.selected_passwords());
+            }
+            if pressed(cmd, Key::A) && self.pw.shown.len() > 1 {
+                self.pw.multi = self.pw.shown.clone();
+                if self.pw.selected.is_none() {
+                    self.pw.selected = self.pw.shown.first().cloned();
+                }
+            }
             let step = if pressed(Modifiers::NONE, Key::ArrowDown) {
                 1
             } else if pressed(Modifiers::NONE, Key::ArrowUp) {
@@ -974,6 +1184,67 @@ mod tests {
         assert_eq!(app.pw.view, None);
         assert!(app.selected.is_some());
         frame(&mut app, &ctx, vec![]);
+    }
+
+    #[test]
+    fn selecting_several_and_deleting_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::for_test(dir.path());
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx);
+        let mut many = items();
+        for n in ["Amazon", "Dropbox", "Zoom"] {
+            many.push(Item { id: n.to_lowercase(), name: n.into(), username: "me".into(), ..Default::default() });
+        }
+        app.pw.service.set_for_test(found(), Some(many));
+        app.open_passwords(View::All);
+        app.focus = Pane::List;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "gh", "wifi", "zoom"]);
+
+        // Ctrl+Click adds and removes; Shift+Click selects a range from the
+        // last item clicked.
+        app.click_password("bank", Modifiers::NONE);
+        app.click_password("gh", Modifiers::COMMAND);
+        assert_eq!(app.selected_passwords(), ["bank", "gh"]);
+        app.click_password("zoom", Modifiers::SHIFT);
+        assert_eq!(app.selected_passwords(), ["gh", "wifi", "zoom"]);
+        app.click_password("wifi", Modifiers::COMMAND);
+        assert_eq!(app.selected_passwords(), ["gh", "zoom"]);
+        frame(&mut app, &ctx, vec![]);
+
+        // Delete: both go to Recently Deleted at once; the next one is
+        // selected.
+        frame(&mut app, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "wifi"]);
+        assert_eq!(app.selected_passwords(), ["wifi"]);
+        let deleted: Vec<String> = app.pw.service.state().deleted().iter().map(|i| i.id.clone()).collect();
+        assert!(deleted.contains(&"gh".to_owned()) && deleted.contains(&"zoom".to_owned()));
+
+        // ⌘Z brings them back, selected.
+        frame(&mut app, &ctx, vec![key(Key::Z, Modifiers::COMMAND)]);
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.pw.shown, ["amazon", "bank", "dropbox", "gh", "wifi", "zoom"]);
+        assert_eq!(app.selected_passwords(), ["gh", "zoom"]);
+
+        // ⌘A, then the pane offers to delete them all.
+        frame(&mut app, &ctx, vec![key(Key::A, Modifiers::COMMAND)]);
+        assert_eq!(app.selected_passwords().len(), 6);
+        frame(&mut app, &ctx, vec![]);
+
+        // In Recently Deleted, Delete asks first, then deletes for good.
+        app.open_passwords(View::Deleted);
+        app.focus = Pane::List;
+        frame(&mut app, &ctx, vec![]);
+        assert_eq!(app.pw.shown, ["old"]);
+        frame(&mut app, &ctx, vec![key(Key::Delete, Modifiers::NONE)]);
+        let Some(crate::app::Confirm::DeletePasswordsForever(ids)) = app.confirm.take() else { panic!("asks first") };
+        assert_eq!(ids, ["old"]);
+        app.delete_passwords_forever(ids);
+        frame(&mut app, &ctx, vec![]);
+        assert!(app.pw.shown.is_empty());
+        assert!(app.pw.service.state().item("old").is_none());
     }
 
     #[test]

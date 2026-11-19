@@ -505,6 +505,21 @@ impl S3Backend {
         Ok(Some((r.data, etag)))
     }
 
+    /// Replaces an object (`rel` is inside the folder) with `data`, as
+    /// stored, only if its ETag is still `if_match`. Returns the new ETag,
+    /// or `None` if it changed (or went) meanwhile.
+    pub(crate) fn put_bytes_if(&self, rel: &str, data: &[u8], if_match: &str) -> Result<Option<String>> {
+        let extra = [("content-type", "application/octet-stream".to_owned()), ("if-match", if_match.to_owned())];
+        let r = self.request("PUT", &format!("{}{rel}", self.config.root()), &[], Some(data), &extra)?;
+        if r.conflict() {
+            return Ok(None);
+        }
+        if !r.ok() {
+            return Err(r.error());
+        }
+        Ok(Some(r.etag.clone().context("S3 sent no ETag")?))
+    }
+
     /// Every object under `sub` in the folder: its name inside the folder
     /// and its ETag.
     pub(crate) fn list_names(&self, sub: &str) -> Result<Vec<(String, String)>> {

@@ -48,6 +48,8 @@ pub enum Confirm {
     DeleteFolder(String),
     EmptyDeleted(String),
     RemoveAccount(String),
+    /// CleanPassword items, from its Recently Deleted.
+    DeletePasswordsForever(Vec<String>),
 }
 
 /// A folder being named in the sidebar.
@@ -927,6 +929,11 @@ impl App {
                 },
                 "Remove",
             ),
+            Confirm::DeletePasswordsForever(ids) => (
+                if ids.len() == 1 { "Delete this item permanently?".to_owned() } else { format!("Delete {} items permanently?", ids.len()) },
+                "It's deleted from CleanPassword on every device. This action can't be undone.".to_owned(),
+                "Delete",
+            ),
         };
         let mut answer = None;
         modal(ctx, "confirm", p, |ui| {
@@ -955,6 +962,7 @@ impl App {
                 Confirm::DeleteFolder(id) => self.delete_folder(&id),
                 Confirm::EmptyDeleted(a) => self.empty_deleted(&a),
                 Confirm::RemoveAccount(a) => self.remove_account(&a),
+                Confirm::DeletePasswordsForever(ids) => self.delete_passwords_forever(ids),
             },
             Some(false) => self.confirm = None,
             None => {}

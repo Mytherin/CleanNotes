@@ -247,3 +247,149 @@ fn a_lock_during_unlocking_wins() {
     std::thread::sleep(Duration::from_secs(3));
     assert!(!pw.state().unlocked());
 }
+
+/// An item object's JSON as stored (for checking what was written).
+fn stored_json(server: &FakeS3, found: &Found, key: &[u8; 32], id: &str) -> serde_json::Value {
+    let name = format!("{}/{ITEMS}{id}.bin", found.config.prefix);
+    let data = server.state().objects[&name].body.clone();
+    let aad = format!("cleanpassword/item/v1/{}/{id}", found.header.vault_id);
+    let plain = open(key, aad.as_bytes(), data.strip_prefix(MAGIC).unwrap()).unwrap();
+    serde_json::from_slice(&plain).unwrap()
+}
+
+#[test]
+fn deleting_recovering_and_deleting_for_good_write_what_cleanpassword_writes() {
+    let server = server_with_vault("CleanPassword");
+    let (found, key, c) = unlocked(&server);
+    let gh = by_name(&c, "GitHub").id.clone();
+    let old = by_name(&c, "Old Forum").id.clone();
+    let bank = by_name(&c, "bank.example").id.clone();
+    let before = stored_json(&server, &found, &key, &gh);
+
+    assert_eq!(apply(&found, &secret(), &key, &[gh.clone()], Change::Delete).unwrap(), 0);
+    let after = stored_json(&server, &found, &key, &gh);
+    let item = after["item"].as_object().unwrap();
+    assert!(item["deleted"].is_string());
+    assert_ne!(item["modified"], before["item"]["modified"]);
+    // Everything else as it was.
+    for (k, v) in before["item"].as_object().unwrap() {
+        if k != "modified" {
+            assert_eq!(&item[k], v, "{k}");
+        }
+    }
+    // Padded as CleanPassword pads.
+    let len = server.state().objects[&format!("CleanPassword/{ITEMS}{gh}.bin")].body.len();
+    assert_eq!((len - MAGIC.len() - NONCE_LEN - TAG_LEN) % PAD, 0);
+    // Deleting again changes nothing.
+    let etag = server.state().objects[&format!("CleanPassword/{ITEMS}{gh}.bin")].etag.clone();
+    assert_eq!(apply(&found, &secret(), &key, &[gh.clone()], Change::Delete).unwrap(), 0);
+    assert_eq!(server.state().objects[&format!("CleanPassword/{ITEMS}{gh}.bin")].etag, etag);
+
+    assert_eq!(apply(&found, &secret(), &key, &[old.clone()], Change::Recover).unwrap(), 0);
+    assert!(stored_json(&server, &found, &key, &old)["item"].get("deleted").is_none());
+
+    assert_eq!(apply(&found, &secret(), &key, &[bank.clone()], Change::DeleteForever).unwrap(), 0);
+    let t = stored_json(&server, &found, &key, &bank);
+    assert_eq!(t["tombstone"]["id"], bank.as_str());
+
+    let c = fetch(&found, &secret(), &key, &Contents::default()).unwrap();
+    assert!(c.get(&gh).unwrap().deleted.is_some());
+    assert!(c.get(&old).unwrap().deleted.is_none());
+    assert!(c.get(&bank).is_none());
+    assert_eq!(c.unreadable, 0);
+}
+
+#[test]
+fn fields_this_version_doesnt_read_are_kept() {
+    let server = server_with_vault("CleanPassword");
+    let (found, key, c) = unlocked(&server);
+    let gh = by_name(&c, "GitHub").id.clone();
+    // A passkey with its private key, and a field from a newer version.
+    let mut v = stored_json(&server, &found, &key, &gh);
+    v["item"]["passkeys"] = serde_json::json!([{ "credential_id": "Y3JlZA", "rp_id": "github.com", "user_handle": "dQ", "key": "PRIVATE", "created": "2026-01-01T00:00:00Z" }]);
+    v["item"]["future_field"] = serde_json::json!({ "x": 1 });
+    let name = format!("CleanPassword/{ITEMS}{gh}.bin");
+    server.put_bytes(&name, &seal_item(&key, &found.header.vault_id, &gh, &serde_json::to_vec(&v).unwrap()));
+
+    apply(&found, &secret(), &key, &[gh.clone()], Change::Delete).unwrap();
+    let after = stored_json(&server, &found, &key, &gh);
+    assert_eq!(after["item"]["passkeys"][0]["key"], "PRIVATE");
+    assert_eq!(after["item"]["future_field"]["x"], 1);
+    assert!(after["item"]["deleted"].is_string());
+}
+
+#[test]
+fn an_edit_elsewhere_beats_deleting_for_good_but_not_deleting() {
+    let server = server_with_vault("CleanPassword");
+    let (found, key, c) = unlocked(&server);
+    let gh = by_name(&c, "GitHub").id.clone();
+    // A purge refused by If-Match (the item changed after we read it) is
+    // not retried: the edit wins.
+    server.state().reject_if_match_once = true;
+    assert_eq!(apply(&found, &secret(), &key, &[gh.clone()], Change::DeleteForever).unwrap(), 1);
+    assert!(stored_json(&server, &found, &key, &gh).get("item").is_some());
+    // A delete refused once is tried again on the new version.
+    let wifi = by_name(&c, "Wi-Fi").id.clone();
+    server.state().reject_if_match_once = true;
+    assert_eq!(apply(&found, &secret(), &key, &[wifi.clone()], Change::Delete).unwrap(), 0);
+    assert!(stored_json(&server, &found, &key, &wifi)["item"]["deleted"].is_string());
+}
+
+#[test]
+fn the_service_shows_changes_at_once_and_reads_back_after() {
+    let server = server_with_vault("CleanPassword");
+    let pw = Passwords::new(|| {});
+    pw.search(vec![("acct".into(), notes_config(&server), secret())]);
+    wait(&pw, |s| !s.searching);
+    pw.unlock(PASSWORD.into());
+    wait(&pw, |s| s.busy.is_none());
+    let ids: Vec<String> = pw.state().items().iter().map(|i| i.id.clone()).collect();
+    assert_eq!(ids.len(), 3);
+
+    pw.change(ids[..2].to_vec(), Change::Delete);
+    assert_eq!(pw.state().items().len(), 1, "shown at once");
+    assert!(pw.state().saving());
+    wait(&pw, |s| !s.saving());
+    assert_eq!(pw.state().items().len(), 1);
+    assert_eq!(pw.state().deleted().len(), 3);
+    assert!(pw.state().error.is_none());
+
+    pw.change(vec![ids[0].clone()], Change::Recover);
+    wait(&pw, |s| !s.saving());
+    assert_eq!(pw.state().items().len(), 2);
+
+    let trash: Vec<String> = pw.state().deleted().iter().map(|i| i.id.clone()).collect();
+    pw.change(trash, Change::DeleteForever);
+    wait(&pw, |s| !s.saving());
+    assert!(pw.state().deleted().is_empty());
+    assert_eq!(pw.state().items().len(), 2);
+
+    // A key that may only read: said so, and the vault shows as it is.
+    server.state().refuse_puts = true;
+    let id = pw.state().items()[0].id.clone();
+    pw.change(vec![id], Change::Delete);
+    wait(&pw, |s| !s.saving());
+    assert!(pw.state().error.as_deref().unwrap().starts_with("Couldn't change the vault"));
+    assert_eq!(pw.state().items().len(), 2);
+}
+
+/// With CleanPassword's own core: `CLEANNOTES_CP_DIR` holds a vault's
+/// objects (`objects.json`, made by CleanPassword); this deletes GitHub,
+/// recovers Old Forum and deletes bank.example for good, and writes the
+/// objects after (`after.json`) for CleanPassword to sync with.
+#[test]
+#[ignore]
+fn changes_for_cleanpassword_to_read() {
+    let dir = std::env::var("CLEANNOTES_CP_DIR").expect("CLEANNOTES_CP_DIR");
+    let m: BTreeMap<String, String> = serde_json::from_str(&std::fs::read_to_string(format!("{dir}/objects.json")).unwrap()).unwrap();
+    let server = FakeS3::start();
+    for (k, v) in m {
+        server.put_bytes(&k, &B64.decode(v).unwrap());
+    }
+    let (found, key, c) = unlocked(&server);
+    for (name, change) in [("GitHub", Change::Delete), ("Old Forum", Change::Recover), ("bank.example", Change::DeleteForever)] {
+        assert_eq!(apply(&found, &secret(), &key, &[by_name(&c, name).id.clone()], change).unwrap(), 0);
+    }
+    let out: BTreeMap<String, String> = server.state().objects.iter().map(|(k, o)| (k.clone(), B64.encode(&o.body))).collect();
+    std::fs::write(format!("{dir}/after.json"), serde_json::to_string(&out).unwrap()).unwrap();
+}

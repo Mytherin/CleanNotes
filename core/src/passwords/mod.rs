@@ -14,8 +14,15 @@
 //! It may share the notes' folder (CleanPassword's README suggests it; the
 //! two apps' objects don't overlap) or be in its own folder of the bucket,
 //! `CleanPassword` by default. [`find`] looks in both with the account's
-//! access key. Nothing is written: CleanNotes only reads the vault, so
-//! CleanPassword's sync and merging stay CleanPassword's alone.
+//! access key.
+//!
+//! CleanNotes shows the items, and deletes, recovers and deletes for good
+//! ([`apply`]), writing what CleanPassword itself writes, so its devices
+//! merge it like their own: `deleted` and `modified` set on the item, or a
+//! tombstone. Each change starts from the object as it is in S3 now and
+//! touches only those fields of its JSON (fields this version doesn't know,
+//! passkeys' keys, stay as they are), and is written with `If-Match`, so
+//! an edit made meanwhile is never overwritten.
 //!
 //! The master password unlocks the vault key (Argon2id, then
 //! XChaCha20-Poly1305), and that opens the items. Neither the password nor
@@ -473,6 +480,107 @@ pub fn fetch(found: &Found, secret: &str, key: &[u8; 32], old: &Contents) -> Res
     Ok(out)
 }
 
+// ---- Changing it ------------------------------------------------------------
+
+/// Item plaintexts are padded to a multiple of this many bytes.
+const PAD: usize = 512;
+/// Tries per item when it changes in S3 between reading and writing it.
+const RETRIES: usize = 3;
+
+/// What's done to items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// To CleanPassword's Recently Deleted.
+    Delete,
+    /// Back from Recently Deleted.
+    Recover,
+    /// For good: a tombstone, so every device deletes it.
+    DeleteForever,
+}
+
+/// An item object as CleanPassword seals it: `CPV1 ‖ nonce ‖ ciphertext`,
+/// the JSON padded with spaces.
+fn seal_item(key: &[u8; 32], vault_id: &str, id: &str, json: &[u8]) -> Vec<u8> {
+    use rand::RngCore;
+    let mut plain = Zeroizing::new(json.to_vec());
+    let len = plain.len().div_ceil(PAD).max(1) * PAD;
+    plain.resize(len, b' ');
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let aad = format!("cleanpassword/item/v1/{vault_id}/{id}");
+    let ct = XChaCha20Poly1305::new(key.into())
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: &plain, aad: aad.as_bytes() })
+        .expect("XChaCha20-Poly1305 encryption can't fail");
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&nonce);
+    out.extend(ct);
+    out
+}
+
+/// The JSON of an item object after `change`, from its JSON now; `None`
+/// if there's nothing to do (already so, or a tombstone).
+fn changed(json: &[u8], id: &str, change: Change) -> Option<Zeroizing<Vec<u8>>> {
+    let mut v: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let item = v.get_mut("item")?.as_object_mut()?;
+    if item.get("id").and_then(|i| i.as_str()) != Some(id) {
+        return None;
+    }
+    let now = serde_json::to_value(Utc::now()).expect("dates serialize");
+    let in_trash = item.get("deleted").is_some_and(|d| !d.is_null());
+    match change {
+        Change::Delete if in_trash => return None,
+        Change::Delete => {
+            item.insert("deleted".into(), now.clone());
+            item.insert("modified".into(), now);
+        }
+        Change::Recover if !in_trash => return None,
+        Change::Recover => {
+            item.remove("deleted");
+            item.insert("modified".into(), now);
+        }
+        Change::DeleteForever => v = serde_json::json!({ "tombstone": { "id": id, "at": now } }),
+    }
+    Some(Zeroizing::new(serde_json::to_vec(&v).expect("JSON serializes")))
+}
+
+/// Applies `change` to the items, as CleanPassword would. Returns how many
+/// couldn't be changed: gone, unreadable, or (deleting for good) edited
+/// elsewhere meanwhile, as an edit beats a delete.
+pub fn apply(found: &Found, secret: &str, key: &[u8; 32], ids: &[String], change: Change) -> Result<usize> {
+    let b = plain_backend(&found.config, secret, &found.config.prefix)?;
+    let vault_id = &found.header.vault_id;
+    let mut skipped = 0;
+    for id in ids {
+        let name = format!("{ITEMS}{id}.bin");
+        if item_id(&name).is_none() {
+            skipped += 1;
+            continue;
+        }
+        let mut done = false;
+        for _ in 0..RETRIES {
+            let Some((data, etag)) = b.get_bytes(&name)? else { break };
+            let aad = format!("cleanpassword/item/v1/{vault_id}/{id}");
+            let Some(plain) = data.strip_prefix(MAGIC).and_then(|d| open(key, aad.as_bytes(), d)) else { break };
+            let Some(json) = changed(&plain, id, change) else {
+                // Already so (deleted elsewhere too, say): done.
+                done = serde_json::from_slice::<serde_json::Value>(&plain).is_ok_and(|v| v.get("item").is_some());
+                break;
+            };
+            if b.put_bytes_if(&name, &seal_item(key, vault_id, id, &json), &etag)?.is_some() {
+                done = true;
+                break;
+            }
+            if change == Change::DeleteForever {
+                break;
+            }
+        }
+        if !done {
+            skipped += 1;
+        }
+    }
+    Ok(skipped)
+}
+
 // ---- The service the apps use -------------------------------------------------
 
 /// What's going on in the background.
@@ -502,11 +610,18 @@ pub struct State {
     generation: u64,
     /// The access key it was found with (the account's).
     secret: Option<String>,
+    /// Changes being written.
+    saving: usize,
 }
 
 impl State {
     pub fn unlocked(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// Changes are being written.
+    pub fn saving(&self) -> bool {
+        self.saving > 0
     }
 
     pub fn contents(&self) -> Option<&Contents> {
@@ -689,14 +804,83 @@ impl Passwords {
             if s.generation == generation {
                 s.busy = None;
                 match r {
+                    // A change written meanwhile reads the vault again
+                    // itself; this read may be from before it.
+                    Ok(_) if s.saving > 0 => {}
                     Ok(c) => {
                         s.error = None;
                         if let Some(open) = s.open.as_mut() {
                             open.1 = c;
                         }
                     }
-                    Err(e) => s.error = Some(message(&e)),
+                    Err(e) => s.error = Some(format!("Couldn't read the vault: {}", message(&e))),
                 }
+            }
+            drop(s);
+            (this.wake)();
+        });
+    }
+
+    /// Deletes, recovers or deletes for good the items: shown so at once,
+    /// written in the background, then the vault is read again (so what
+    /// couldn't be changed shows as it is, with [`State::error`] saying so).
+    pub fn change(&self, ids: Vec<String>, change: Change) {
+        let (found, secret, key, generation) = {
+            let mut s = self.state();
+            let (Some(f), Some(secret)) = (s.found.clone(), s.secret.clone()) else { return };
+            let Some((key, contents)) = s.open.as_mut() else { return };
+            let key = key.clone();
+            let now = Utc::now();
+            for id in &ids {
+                if let Some((etag, item)) = contents.objects.get_mut(id) {
+                    // Downloaded again by the read that follows.
+                    etag.clear();
+                    match change {
+                        Change::Delete => {
+                            if let Some(i) = item.as_mut().filter(|i| i.deleted.is_none()) {
+                                i.deleted = Some(now);
+                            }
+                        }
+                        Change::Recover => {
+                            if let Some(i) = item.as_mut() {
+                                i.deleted = None;
+                            }
+                        }
+                        Change::DeleteForever => *item = None,
+                    }
+                }
+            }
+            s.saving += 1;
+            s.error = None;
+            s.last_use = Some(Instant::now());
+            (f, secret, key, s.generation)
+        };
+        let this = self.clone();
+        (self.wake)();
+        std::thread::spawn(move || {
+            let r = apply(&found, &secret, &key, &ids, change);
+            let old = {
+                let s = this.state();
+                let objects = s.open.as_ref().map(|(_, c)| c.objects.clone()).unwrap_or_default();
+                Contents { objects, unreadable: 0 }
+            };
+            let read = fetch(&found, &secret, &key, &old);
+            drop(old);
+            let mut s = this.state();
+            if s.generation == generation {
+                s.saving -= 1;
+                if let Ok(c) = read {
+                    if let Some(open) = s.open.as_mut() {
+                        open.1 = c;
+                    }
+                    s.last_refresh = Some(Instant::now());
+                }
+                s.error = match r {
+                    Err(e) => Some(format!("Couldn't change the vault: {}", message(&e))),
+                    Ok(0) => None,
+                    Ok(1) => Some("1 item was changed elsewhere meanwhile and was left as it is.".into()),
+                    Ok(n) => Some(format!("{n} items were changed elsewhere meanwhile and were left as they are.")),
+                };
             }
             drop(s);
             (this.wake)();
@@ -725,6 +909,7 @@ impl Passwords {
         s.open = None;
         s.busy = None;
         s.error = None;
+        s.saving = 0;
         s.generation += 1;
     }
 
@@ -751,7 +936,7 @@ impl Passwords {
             self.lock();
             return true;
         }
-        if stale {
+        if stale && !self.state().saving() {
             self.refresh();
         }
         false
