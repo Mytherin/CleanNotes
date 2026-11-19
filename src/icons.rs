@@ -51,6 +51,10 @@ pub enum Icon {
     Check,
     Photo,
     Paperclip,
+    /// A key: CleanPassword's passwords.
+    Key,
+    /// A stopwatch: verification codes.
+    Timer,
 }
 
 fn line(p: &Painter, pts: &[Pos2], s: Stroke) {
@@ -307,6 +311,21 @@ pub fn paint(p: &Painter, icon: Icon, r: Rect, color: Color32) {
             for x in [-5.0, 0.0, 5.0] {
                 p.circle_filled(at(x, 0.0), 1.3 * u, color);
             }
+        }
+        Icon::Key => {
+            // The bow (a ring) on the upper left, the blade to the lower
+            // right with two teeth, as SF Symbols' key, tilted.
+            p.circle_stroke(at(-3.6, -3.6), 3.4 * u, s);
+            p.circle_filled(at(-4.4, -4.4), 0.9 * u, color);
+            line(p, &[at(-1.2, -1.2), at(6.5, 6.5)], s);
+            line(p, &[at(3.2, 3.2), at(1.6, 4.8)], s);
+            line(p, &[at(5.2, 5.2), at(3.6, 6.8)], s);
+        }
+        Icon::Timer => {
+            p.circle_stroke(at(0.0, 1.0), 6.0 * u, s);
+            line(p, &[at(-1.8, -6.8), at(1.8, -6.8)], s);
+            line(p, &[at(0.0, -6.8), at(0.0, -5.0)], s);
+            line(p, &[at(0.0, 1.0), at(2.8, -1.8)], s);
         }
     }
 }

@@ -38,10 +38,12 @@ use sha2::Sha256;
 const FENCE: &str = "```cleannotes-locked";
 /// What the HMAC covers besides the ciphertext, so nothing can be swapped.
 const CONTEXT: &[u8] = b"cleannotes-locked-v1";
-/// Argon2id's cost: 64 MiB, 3 passes (Bitwarden's defaults, one lane).
-const M_COST: u32 = 64 * 1024;
-const T_COST: u32 = 3;
-const P_COST: u32 = 1;
+/// Argon2id's cost for new passwords: CleanPassword's (46 MiB, 3 passes,
+/// one lane; see [`cleanbucket::kdf`]). Notes locked before with 64 MiB keep
+/// it: the costs are written into every locked note.
+const M_COST: u32 = cleanbucket::kdf::Cost::DEFAULT.memory_kib;
+const T_COST: u32 = cleanbucket::kdf::Cost::DEFAULT.passes;
+const P_COST: u32 = cleanbucket::kdf::Cost::DEFAULT.lanes;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -93,11 +95,8 @@ pub fn derive(password: &str, salt: &[u8]) -> Result<Keys> {
 }
 
 fn derive_with(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Keys> {
-    let params = argon2::Params::new(m, t, p, Some(32)).map_err(|e| anyhow!("argon2: {e}"))?;
-    let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    let mut master = [0u8; 32];
-    argon.hash_password_into(password.as_bytes(), salt, &mut master).map_err(|e| anyhow!("argon2: {e}"))?;
-    let hk = hkdf::Hkdf::<Sha256>::new(None, &master);
+    let master = cleanbucket::kdf::derive(password.as_bytes(), salt, cleanbucket::kdf::Cost { memory_kib: m, passes: t, lanes: p })?;
+    let hk = hkdf::Hkdf::<Sha256>::new(None, master.as_ref());
     let mut keys = Keys { enc: [0; 32], mac: [0; 32], cost: (m, t, p) };
     hk.expand(b"cleannotes-lock enc", &mut keys.enc).map_err(|_| anyhow!("hkdf"))?;
     hk.expand(b"cleannotes-lock mac", &mut keys.mac).map_err(|_| anyhow!("hkdf"))?;

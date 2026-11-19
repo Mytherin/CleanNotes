@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 
-use super::sigv4;
+use cleanbucket::s3 as sigv4;
 use crate::sync::test_http::{self, url_decode, Request, Response};
 
 pub const BUCKET: &str = "notes-bucket";
@@ -31,6 +31,11 @@ pub struct State {
     pub reject_conditions: bool,
     /// Every DELETE fails (503).
     pub refuse_deletes: bool,
+    /// Every PUT is refused (403), as for a key that may only read.
+    pub refuse_puts: bool,
+    /// The next PUT with If-Match finds the object rewritten just before
+    /// (another device's write): its ETag changes and the PUT gets 412.
+    pub reject_if_match_once: bool,
     /// Keys whose objects can't be read (403), e.g. encrypted with a key
     /// the user may not use.
     pub forbidden: std::collections::HashSet<String>,
@@ -49,7 +54,7 @@ pub struct FakeS3 {
 
 impl FakeS3 {
     pub fn start() -> FakeS3 {
-        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, reject_conditions: false, refuse_deletes: false, forbidden: Default::default(), log: vec![], after_list: None, counter: 0 }));
+        let state = Arc::new(Mutex::new(State { objects: BTreeMap::new(), page_size: 1000, ignore_conditions: false, reject_conditions: false, refuse_deletes: false, refuse_puts: false, reject_if_match_once: false, forbidden: Default::default(), log: vec![], after_list: None, counter: 0 }));
         let s = state.clone();
         let url = test_http::spawn(move |req| route(&mut s.lock().unwrap(), req));
         FakeS3 { url, state }
@@ -61,9 +66,14 @@ impl FakeS3 {
 
     /// Puts an object directly, as if written by another program.
     pub fn put(&self, key: &str, body: &str) {
+        self.put_bytes(key, body.as_bytes());
+    }
+
+    /// [`FakeS3::put`] with bytes.
+    pub fn put_bytes(&self, key: &str, body: &[u8]) {
         let mut s = self.state();
         let etag = s.next_etag();
-        s.objects.insert(key.to_owned(), Obj { body: body.as_bytes().to_vec(), etag, modified: Utc::now() });
+        s.objects.insert(key.to_owned(), Obj { body: body.to_vec(), etag, modified: Utc::now() });
     }
 }
 
@@ -169,6 +179,15 @@ fn route(s: &mut State, req: &Request) -> Response {
             None => Response { status: 404, body: Vec::new(), content_type: "text/plain", headers: vec![] },
         },
         "PUT" => {
+            if s.refuse_puts {
+                return error(403, "AccessDenied");
+            }
+            if s.reject_if_match_once && req.headers.contains_key("if-match") && s.objects.contains_key(&key) {
+                s.reject_if_match_once = false;
+                let etag = s.next_etag();
+                s.objects.get_mut(&key).unwrap().etag = etag;
+                return error(412, "PreconditionFailed");
+            }
             let existing = s.objects.get(&key);
             if s.reject_conditions && (req.headers.contains_key("if-match") || req.headers.contains_key("if-none-match")) {
                 return error(501, "NotImplemented");

@@ -39,13 +39,17 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use cleanbucket::s3::{decode, xml_tag, xml_tags, Client, Credentials, HttpRequest, HttpResponse, Location, Transport};
+
 use super::{Backend, Conflict, NeedsSignIn, NoteData, RemoteFolder, RemoteNote, Snapshot};
+
+/// S3's errors, as the shared client reads them.
+pub use cleanbucket::s3::S3Error;
 
 pub mod crypto;
 pub mod format;
-pub mod sigv4;
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
@@ -85,17 +89,9 @@ impl Config {
         }
     }
 
-    /// Base URL and path for a key (`""` for the bucket itself).
-    fn url_parts(&self, key: &str) -> (String, String) {
-        let key = sigv4::uri_encode(key, true);
-        let bucket = sigv4::uri_encode(&self.bucket, false);
-        match &self.endpoint {
-            Some(e) => (e.trim().trim_end_matches('/').to_owned(), format!("/{bucket}/{key}")),
-            // A bucket name with dots doesn't match the wildcard certificate
-            // as a host name.
-            None if self.bucket.contains('.') => (format!("https://s3.{}.amazonaws.com", self.region), format!("/{bucket}/{key}")),
-            None => (format!("https://{}.s3.{}.amazonaws.com", self.bucket, self.region), format!("/{key}")),
-        }
+    /// The bucket and folder, for the shared S3 client.
+    fn location(&self) -> Location {
+        Location { bucket: self.bucket.clone(), region: self.region.clone(), prefix: self.prefix.clone(), endpoint: self.endpoint.clone() }
     }
 }
 
@@ -114,34 +110,6 @@ impl Keys {
         serde_json::to_string(self).expect("keys serialize")
     }
 }
-
-/// An error S3 answered with.
-#[derive(Debug)]
-pub struct S3Error {
-    pub status: u16,
-    pub code: String,
-    pub message: String,
-    /// The bucket's region, when S3 named it.
-    pub region: Option<String>,
-}
-
-impl std::fmt::Display for S3Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.status, self.code.as_str()) {
-            (301 | 307, _) | (_, "PermanentRedirect" | "TemporaryRedirect" | "AuthorizationHeaderMalformed") => match &self.region {
-                Some(r) => write!(f, "the bucket is in region {r}; enter that as its region"),
-                None => write!(f, "the bucket is in another region than the one entered ({} {})", self.status, self.code),
-            },
-            (_, "NoSuchBucket") => f.write_str("there's no bucket with that name"),
-            (_, "AccessDenied") => write!(f, "S3 denied access; check the IAM policy allows this bucket and folder ({})", self.message),
-            (_, "RequestTimeTooSkewed") => f.write_str("this computer's clock is off; S3 refuses the request"),
-            (s, "") => write!(f, "S3 answered {s}"),
-            (s, c) => write!(f, "S3 answered {s} {c}: {}", self.message),
-        }
-    }
-}
-
-impl std::error::Error for S3Error {}
 
 struct Resp {
     status: u16,
@@ -176,69 +144,48 @@ impl Resp {
     }
 }
 
-fn http() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
-        // A redirect (wrong region) is reported, not followed: the request
-        // is signed for its host, and the signature is dropped on the way.
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("HTTP client")
-}
+/// The shared S3 client's transport here: a blocking HTTP client (calls run
+/// on the sync thread), driven with [`cleanbucket::block_on`].
+pub(crate) struct Blocking(reqwest::blocking::Client);
 
-/// The text inside the first `<tag>…</tag>`.
-fn xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&format!("</{tag}>"))? + start;
-    Some(&xml[start..end])
-}
-
-/// Every `<tag>…</tag>`'s text.
-fn xml_tags<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(i) = rest.find(&open) {
-        let after = &rest[i + open.len()..];
-        let Some(j) = after.find(&close) else { break };
-        out.push(&after[..j]);
-        rest = &after[j + close.len()..];
+impl Blocking {
+    pub(crate) fn new() -> Blocking {
+        Blocking(
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(60))
+                // A redirect (wrong region) is reported, not followed: the
+                // request is signed for its host, and the signature is
+                // dropped on the way.
+                .redirect(reqwest::redirect::Policy::none())
+                .user_agent(format!("CleanNotes/{}", env!("CARGO_PKG_VERSION")))
+                .build()
+                .expect("HTTP client"),
+        )
     }
-    out
 }
 
-/// XML character references and the five predefined entities.
-fn decode(s: &str) -> String {
-    let mut out = String::new();
-    let mut rest = s;
-    while let Some(i) = rest.find('&') {
-        out.push_str(&rest[..i]);
-        let after = &rest[i..];
-        let Some(end) = after.find(';') else {
-            out.push_str(after);
-            return out;
-        };
-        let ent = &after[1..end];
-        let c = match ent {
-            "quot" => Some('"'),
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "apos" => Some('\''),
-            _ if ent.starts_with("#x") => u32::from_str_radix(&ent[2..], 16).ok().and_then(char::from_u32),
-            _ if ent.starts_with('#') => ent[1..].parse().ok().and_then(char::from_u32),
-            _ => None,
-        };
-        match c {
-            Some(c) => out.push(c),
-            None => out.push_str(&after[..=end]),
+impl Transport for Blocking {
+    async fn send(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
+        let method = reqwest::Method::from_bytes(req.method.as_bytes()).map_err(|e| e.to_string())?;
+        let put = method == reqwest::Method::PUT;
+        let mut r = self.0.request(method, &req.url);
+        for (k, v) in &req.headers {
+            r = r.header(k.as_str(), v.as_str());
         }
-        rest = &after[end + 1..];
+        if put || !req.body.is_empty() {
+            r = r.body(req.body);
+        }
+        let resp = r.send().map_err(|e| format!("{:#}", anyhow::Error::new(e)))?;
+        let status = resp.status().as_u16();
+        let headers: Vec<(String, String)> =
+            resp.headers().iter().filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned()))).collect();
+        let body = match resp.bytes() {
+            Ok(b) => b.to_vec(),
+            Err(e) if (200..300).contains(&status) => return Err(format!("reading S3's reply: {e}")),
+            Err(_) => Vec::new(),
+        };
+        Ok(HttpResponse { status, headers, body })
     }
-    out.push_str(rest);
-    out
 }
 
 fn http_date(s: &str) -> Option<DateTime<Utc>> {
@@ -277,9 +224,11 @@ enum Cond<'a> {
 }
 
 pub struct S3Backend {
-    http: reqwest::blocking::Client,
+    http: Blocking,
     config: Config,
-    keys: Keys,
+    /// The bucket and folder, and the access key, for the shared client.
+    location: Location,
+    credentials: Credentials,
     /// The encryption key, if the folder is encrypted.
     key: Option<[u8; 32]>,
     /// Objects as last downloaded: key → (ETag, contents).
@@ -307,7 +256,17 @@ impl S3Backend {
             None if config.encrypted => return Err(NeedsSignIn("the encryption key is missing".into()).into()),
             None => None,
         };
-        Ok(S3Backend { http: http(), config: config.clone(), keys, key, cache: HashMap::new(), pending_touch: false, attachments: Default::default() })
+        let credentials = Credentials { access_key_id: keys.access_key_id.clone(), secret_access_key: keys.secret_access_key.clone(), session_token: None };
+        Ok(S3Backend {
+            http: Blocking::new(),
+            config: config.clone(),
+            location: config.location(),
+            credentials,
+            key,
+            cache: HashMap::new(),
+            pending_touch: false,
+            attachments: Default::default(),
+        })
     }
 
     /// The key an attachment is kept under.
@@ -340,51 +299,14 @@ impl S3Backend {
     }
 
     fn request(&self, method: &str, key: &str, query: &[(String, String)], body: Option<&[u8]>, extra: &[(&str, String)]) -> Result<Resp> {
-        let (base, path) = self.config.url_parts(key);
-        let q = sigv4::canonical_query(query);
-        let full = if q.is_empty() { format!("{base}{path}") } else { format!("{base}{path}?{q}") };
-        let url = reqwest::Url::parse(&full).with_context(|| format!("the S3 address {full} isn't valid"))?;
-        let host = match url.port() {
-            Some(p) => format!("{}:{p}", url.host_str().unwrap_or_default()),
-            None => url.host_str().unwrap_or_default().to_owned(),
-        };
-        let payload = sigv4::sha256_hex(body.unwrap_or_default());
-        let signed = sigv4::sign(
-            method,
-            &path,
-            &q,
-            &[("host", host), ("x-amz-content-sha256", payload.clone())],
-            &payload,
-            &self.keys.access_key_id,
-            &self.keys.secret_access_key,
-            &self.config.region,
-            Utc::now(),
-        );
-        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("HTTP method");
-        let mut req = self
-            .http
-            .request(method, url)
-            .header("x-amz-date", signed.amz_date)
-            .header("x-amz-content-sha256", payload)
-            .header("authorization", signed.authorization);
-        for (k, v) in extra {
-            req = req.header(*k, v);
-        }
-        if let Some(b) = body {
-            req = req.body(b.to_vec());
-        }
-        let resp = req.send().context("contacting S3")?;
-        let status = resp.status().as_u16();
-        let header = |n: &str| resp.headers().get(n).and_then(|h| h.to_str().ok()).map(str::to_owned);
+        // Signed and sent by the client CleanPassword shares.
+        let client = Client::new(&self.location, &self.credentials, &self.http);
+        let body = body.map(<[u8]>::to_vec).unwrap_or_default();
+        let r = cleanbucket::block_on(client.send(method, key, query, body, extra)).map_err(anyhow::Error::new)?;
+        let header = |n: &str| r.header(n).map(str::to_owned);
         let (etag, last_modified, region) = (header("etag"), header("last-modified"), header("x-amz-bucket-region"));
-        let ok = (200..300).contains(&status);
-        let data = match resp.bytes() {
-            Ok(b) => b.to_vec(),
-            Err(e) if ok => return Err(anyhow::Error::new(e).context("reading S3's reply")),
-            Err(_) => Vec::new(),
-        };
-        let body = String::from_utf8_lossy(&data).into_owned();
-        Ok(Resp { status, etag, last_modified, region, body, data })
+        let body = String::from_utf8_lossy(&r.body).into_owned();
+        Ok(Resp { status: r.status, etag, last_modified, region, body, data: r.body })
     }
 
     fn put(&self, key: &str, body: &str, content_type: &str, cond: Cond) -> Result<Resp> {

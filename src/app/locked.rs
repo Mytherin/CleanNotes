@@ -105,6 +105,8 @@ impl App {
         self.flush_editor();
         self.lib.lock_now();
         self.after_lock_now();
+        // Lock Now locks CleanPassword's vault too.
+        self.lock_passwords();
     }
 
     /// After locked notes closed (Lock Now, or a while without use).

@@ -1,0 +1,25 @@
+[package]
+name = "cleanbucket"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "What CleanNotes and CleanPassword share for keeping things in an S3 bucket: a signed S3 client over a transport the app supplies (so it runs on WebAssembly too), sealing with XChaCha20-Poly1305, Argon2id keys, and a cheap change marker."
+
+[features]
+# An in-memory S3 for tests (CleanPassword's sync tests use it too).
+fake = []
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+hmac = "0.12"
+sha2 = "0.10"
+url = "2"
+# Sealing and keys.
+chacha20poly1305 = "0.10"
+argon2 = { version = "0.5", features = ["zeroize"] }
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+
+# In a browser, random bytes come from crypto.getRandomValues.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

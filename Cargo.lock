@@ -239,6 +239,7 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -969,6 +970,22 @@ dependencies = [
  "serde_json",
  "tempfile",
  "ttf-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "cleanbucket"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "chrono",
+ "getrandom 0.2.17",
+ "hmac",
+ "rand 0.8.8",
+ "sha2",
+ "url",
+ "zeroize",
 ]
 
 [[package]]
@@ -982,6 +999,7 @@ dependencies = [
  "cbc",
  "chacha20poly1305",
  "chrono",
+ "cleanbucket",
  "diffy",
  "directories",
  "hkdf",
@@ -992,10 +1010,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
  "tempfile",
  "unicode-segmentation",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1810,8 +1830,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]

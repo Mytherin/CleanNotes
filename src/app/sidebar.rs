@@ -89,6 +89,11 @@ impl App {
                 self.account_section(ui, p, &id, &name);
                 ui.add_space(10.0);
             }
+            // CleanPassword's vault, when an account's bucket holds one.
+            if self.pw.service.state().found.is_some() {
+                self.passwords_section(ui, p);
+                ui.add_space(10.0);
+            }
             self.tags_section(ui, p);
         });
         self.folder_drag_preview(ui, p);
@@ -392,6 +397,15 @@ impl App {
     /// A sidebar row: icon, name, count, selection highlight.
     #[allow(clippy::too_many_arguments)]
     fn row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
+        // While CleanPassword is shown, no notes folder is the selected one.
+        let selected = selected && self.pw.view.is_none();
+        self.paint_row(ui, p, depth, icon, label, count, selected, folded)
+    }
+
+    /// A row of the sidebar: icon, name and count; `selected` is the
+    /// yellow pill.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn paint_row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
         // Draggable too: folder rows can be dragged into other folders.
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_H), Sense::click_and_drag());
         let inner = rect.shrink2(Vec2::new(6.0, 1.0));

@@ -5,6 +5,8 @@ edition = "2021"
 description = "CleanNotes' shared core: notes, folders, accounts, the rich-text document and its Markdown, editing, locked notes, storage and sync. Used by the desktop app and (through cleannotes-ffi) the iPhone app."
 
 [dependencies]
+# What CleanNotes shares with CleanPassword: the S3 client, sealing, keys.
+cleanbucket = { path = "../bucket" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -26,8 +28,12 @@ hkdf = "0.12"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
-# An encrypted S3 folder's notes.
+# An encrypted S3 folder's notes, and CleanPassword's vault.
 chacha20poly1305 = "0.10"
+# CleanPassword's vault: keys and passwords wiped from memory, and its
+# items' verification codes (TOTP, usually with SHA-1).
+zeroize = "1"
+sha1 = "0.10"
 
 # Desktop only: the default data folder. (On iOS the app passes its own
 # folder in.)

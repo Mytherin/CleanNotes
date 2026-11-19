@@ -22,6 +22,7 @@ The desktop app is built on [egui/eframe](https://github.com/emilk/egui), like i
 - **Edit as Markdown** (Ctrl+Shift+E, or the note's "…" menu): notes show as the Markdown they're stored as, in a plain text field, and what you type there is saved as written. It stays on for every note until turned off.
 - **Settings** (⚙ or Ctrl+,), laid out like Apple Notes': default account, sort notes by (date edited, date created, title), new notes start with (Title, Heading, Subheading, Body), sort checked items (manually or automatically), default text size, group notes by date, show note count, and how often synced accounts check for changes. **Accounts** adds (+) and removes (−) sync accounts.
 - **Import from Evernote:** Settings → Import → "Import from Evernote…" (or drop `.enex` files on the window) adds the notes of Evernote export files, also those made from Apple Notes, to an account of your choice, keeping their dates and formatting (headings, lists, checklists, monospaced text, tables, links). Each notebook (the file's name) becomes a folder, and its tags become #tags; in exports where every note has exactly one tag, as in those made from Apple Notes, that tag is the note's folder. Pictures become the note's own images, where they were; other attachments (PDFs, audio, …) become the note's own files, linked by their names, and sync with it (notes imported by earlier versions, which linked to such files in the data folder, are changed to match on the next start). Importing a file again skips the notes already imported.
+- **CleanPassword's passwords:** if an S3 account's bucket also holds a [CleanPassword](../CleanPassword) vault (in the notes' folder, or in `CleanPassword/`), the sidebar gets a **CleanPassword** section: All Passwords, Codes, the vault's folders and its Recently Deleted. Unlock it with the master password and its logins and secure notes show as in Apple's Passwords app (user name, password, verification code with its countdown, websites, passkeys, fields, notes and earlier passwords), with copy buttons; a copied password leaves the clipboard after 90 seconds. Items can be selected together (Ctrl+Click, Shift+Click, Ctrl+A) and deleted (Delete, Ctrl+Backspace, the toolbar's trash or the right-click menu) to CleanPassword's Recently Deleted, then recovered (or Ctrl+Z) or deleted permanently; editing them is CleanPassword's. It locks after 15 minutes without use, on Lock Now, and on quitting. See [CleanPassword](#cleanpassword).
 - Empty new notes are thrown away when you leave them, as in Apple Notes.
 - Follows the system's light and dark mode and uses the platform's fonts (Segoe UI and Consolas on Windows, San Francisco and Menlo on macOS, DejaVu on Linux).
 
@@ -159,9 +160,26 @@ An object's ETag is its revision: updates are written with `If-Match` and new no
 
 **Pictures** are uploaded (with `If-None-Match: *`: one already there is the same picture) just before the note that shows them, so another device never gets a note without its pictures. They're downloaded after the notes, only those this device doesn't have, and kept only if their content matches their name. A note whose pictures haven't arrived shows a box in their place, and syncs keep fetching them, even when nothing else changed.
 
-**Encryption (optional):** enter an **encryption key** (a passphrase) when adding the account, and notes and folders are encrypted on your computer before upload, so S3 and anyone with access to the bucket see only ciphertext. The key is made from the passphrase with Argon2id (64 MiB, 3 passes); its random salt and a check value are in `<folder>/encryption.json`, so every device with the same passphrase gets the same key, and a wrong one is refused. Each file is XChaCha20-Poly1305 with a random nonce, bound to its file name. Pictures are encrypted the same way (as bytes), under names that are an HMAC of their content hash, so the bucket's listing doesn't reveal which (known) pictures are there. Only the key is saved, in the credential store, never the passphrase. Other devices must enter the same key; one without it sees the notes as unreadable and leaves them alone. If the passphrase is lost, the notes can't be recovered. Notes already in a folder before encryption is turned on stay readable and are encrypted the next time they're saved. Without an encryption key, notes are stored as plain Markdown (locked notes stay encrypted either way).
+**Encryption (optional):** enter an **encryption key** (a passphrase) when adding the account, and notes and folders are encrypted on your computer before upload, so S3 and anyone with access to the bucket see only ciphertext. The key is made from the passphrase with Argon2id (46 MiB, 3 passes, as CleanPassword's master key; folders set up by earlier versions keep their 64 MiB, since the costs are stored with them); its random salt and a check value are in `<folder>/encryption.json`, so every device with the same passphrase gets the same key, and a wrong one is refused. Each file is XChaCha20-Poly1305 with a random nonce, bound to its file name. Pictures are encrypted the same way (as bytes), under names that are an HMAC of their content hash, so the bucket's listing doesn't reveal which (known) pictures are there. Only the key is saved, in the credential store, never the passphrase. Other devices must enter the same key; one without it sees the notes as unreadable and leaves them alone. If the passphrase is lost, the notes can't be recovered. Notes already in a folder before encryption is turned on stay readable and are encrypted the next time they're saved. Without an encryption key, notes are stored as plain Markdown (locked notes stay encrypted either way).
 
-Requests are signed with AWS Signature V4 by the app itself (`core/src/sync/s3/`), on the same blocking HTTP client as the other backends.
+Requests are signed with AWS Signature V4 by the app itself, with the S3 client CleanNotes shares with CleanPassword (`bucket/`, see [Code layout](#code-layout)), sent on the same blocking HTTP client as the other backends.
+
+### CleanPassword
+
+[CleanPassword](../CleanPassword), the password manager whose vault lives in your own S3 bucket, can share a bucket (and even a folder) with CleanNotes. Whenever the S3 accounts change, and every 10 minutes, CleanNotes looks for `vault.json` with each S3 account's access key: in the account's notes folder first, then in `CleanPassword/` at the top of the bucket. When it finds one, the **CleanPassword** section appears in the sidebar; when the vault is gone, so is the section.
+
+```text
+<folder>/vault.json         the vault's id, Argon2id settings and salt, and its key sealed with the master key
+<folder>/items/<id>.bin     one item, XChaCha20-Poly1305 sealed and bound to the vault and its id
+<folder>/vault-head         rewritten after every change to the vault, so one HEAD tells whether anything changed
+```
+
+- **Deleting writes what CleanPassword writes**, so its devices take it as their own change (merging it with an edit of theirs not synced yet): Delete sets the item's `deleted` and `modified`, Recover removes `deleted`, and Delete Permanently replaces the item with a tombstone. Each change downloads the item as it is in S3 now, changes only those fields of its JSON (fields CleanNotes doesn't read, such as passkeys' keys, stay as they are), seals it again, and writes it with `If-Match`: if another device wrote it meanwhile, a delete or recover is made again on the new version, and a permanent delete is given up (an edit beats a delete). The list shows the change at once, and the vault is read again after. The access key needs `s3:PutObject` on the vault's folder for this. Nothing else of the vault is ever written, and the notes' sync ignores its objects (as CleanPassword ignores the notes').
+- **Unlocking** uses CleanPassword's own encryption (`core/src/passwords/`): Argon2id with the vault's settings (refused when out of CleanPassword's allowed range) unwraps the vault key, which opens each item. Both happen on a background thread. The master password and vault key are never saved; they're kept in memory until the vault locks (after 15 minutes without use, Lock Now, or quitting), and wiped then with the items.
+- **Reading** starts with one `HEAD` of `vault-head`: if it's what it was when the folder was last listed, nothing changed and that's all. Otherwise `items/` is listed and only items whose ETag changed are downloaded, several at once. It's checked every minute while unlocked; Refresh, a missing `vault-head` (versions of CleanPassword before it) and 15 minutes since the last full listing list the folder anyway. Every change CleanNotes writes rewrites `vault-head`. Objects that can't be opened (another vault's, damaged) are skipped.
+- **Kept on this computer between unlocks:** the items and their ETags, sealed with the vault key (`cleanpassword-<vault id>.cache` in the data folder), so unlocking again opens them and downloads only what changed (usually nothing: one `HEAD`). Offline, unlocking shows what was kept, and says so. The file is useless without the master password.
+- **Access:** the account's IAM key must be allowed to read the vault's folder. With the policy above (`arn:aws:s3:::BUCKET/*`) it can; a policy limited to the notes' folder only finds a vault kept in that folder.
+- The desktop app shows the vault; the iPhone app doesn't yet.
 
 ### SQLite database
 
@@ -197,7 +215,9 @@ Everything is kept in `data.db`, a SQLite database in `%APPDATA%\CleanNotes` on 
 
 ## Code layout
 
-A Cargo workspace: the shared core, the desktop app on it, and the core's Swift bindings for the iPhone app.
+A Cargo workspace: the shared core, the desktop app on it, the core's Swift bindings for the iPhone app, and what CleanNotes shares with CleanPassword.
+
+**`bucket/` (cleanbucket), shared with [CleanPassword](../CleanPassword):** the S3 client (Signature V4; GET, HEAD, conditional PUT, DELETE, paged listing; S3's errors in words) over a transport the app supplies, so it also builds for WebAssembly (CleanPassword's Chrome extension); sealing (XChaCha20-Poly1305 bound to associated data, padding); Argon2id keys with the costs both apps use (46 MiB, 3 passes) and the range a stored setting may ask for; and the change marker (`touch` / `head`). It has no threads or blocking I/O: CleanNotes drives it with a blocking HTTP client and `block_on`, CleanPassword with `fetch` in the browser and pollster on iOS. CleanPassword uses it as a git dependency pinned to a revision of this repository. Its tests run with an in-memory S3 (feature `fake`, which CleanPassword's sync tests use too).
 
 **`core/` (cleannotes-core), shared by both apps:** everything that isn't drawing.
 
@@ -218,6 +238,7 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `core/src/sync/worker.rs` | The background sync thread |
 | `core/src/sync/sqlite.rs` | The SQLite backend |
 | `core/src/sync/s3/` | The S3 backend: Signature V4, Markdown files, optional encryption |
+| `core/src/passwords/` | CleanPassword's vault: finding it in an S3 account's bucket, unlocking it, reading its items, deleting and recovering them, verification codes |
 
 **`src/` (the desktop app):** what's drawn and selected.
 
@@ -228,6 +249,7 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 | `src/app/sidebar.rs` | Accounts, folders, Recently Deleted, tags, New Folder |
 | `src/app/list.rs` | The notes list and the gallery |
 | `src/app/locked.rs` | The lock screen and password sheets |
+| `src/app/passwords.rs` | CleanPassword's section in the sidebar, its items and their details, its lock screen |
 | `src/app/note_pane.rs` | The note's toolbar, Aa and "…" menus, search, find bar, link sheet |
 | `src/app/settings_window.rs` | Settings: General, Accounts, Locked Notes and Import, with the sign-in sheets |
 | `src/app/import.rs`, `src/enex.rs` | Importing Evernote exports (`.enex`) |
@@ -245,6 +267,7 @@ A Cargo workspace: the shared core, the desktop app on it, and the core's Swift 
 - **Document and Markdown:** every paragraph and character style round-trips; escaping; Markdown from elsewhere; editing operations (Return in lists, Backspace at a bullet, pasting, numbering, moving items); the editor's undo grouping, auto-lists, find, links and checklist sorting.
 - **Sync engine** (`core/src/sync/engine/tests.rs`): two "devices" with their own stores share one SQLite backend: merges, clashing edits kept as two notes, edit beats delete, Recently Deleted and pins, folder moves, renames and deletes, edits during a sync, lost replies, offline changes on both sides.
 - **S3** (`core/src/sync/s3/tests.rs`) against a fake S3 that checks Signature V4 and honours conditional writes: Markdown objects, conflicts, tombstones (and never deleting a note brought back over one), hand-written and unreadable files, paged listings, downloading only what changed, folder renames moving their notes, encryption, the bucket check, two devices syncing, and pictures travelling with their notes (byte for byte, uploaded before the note, sealed and renamed when encrypted, fetched again when missing).
+- **CleanPassword** (`core/src/passwords/tests.rs`): a vault made and synced by CleanPassword's own core (`testdata/`), read from the fake S3 in its own folder or in the notes' one; wrong master passwords, tombstones and Recently Deleted, objects that can't be opened, reading again only what changed, a lock during unlocking, out-of-range key settings, RFC 6238 codes; and in the desktop app, every view drawn locked and unlocked.
 - **SQLite backend, local storage, model** unit tests; the **library** (list sections, new notes, deletion undo, folders, sign-ins replaced mid-sync) and the **bindings** (UTF-16 positions, which edits the text view may make itself, notes and locking through `NotesCore`).
 
 ## Ideas for next steps
