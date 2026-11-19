@@ -266,7 +266,7 @@ impl App {
             return self.lock_selection_button(ui, p, center);
         }
         let note = self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned());
-        let note = note.filter(|n| n.deleted.is_none() && !self.is_closed(&n.id));
+        let note = note.filter(|n| n.deleted.is_none() && !self.is_closed(&n.id) && !self.lib.is_tabs_account(&n.account));
         let open = note.as_ref().is_some_and(|n| self.is_locked(&n.id));
         let icon = if open { Icon::LockOpen } else { Icon::LockOutline };
         let resp = glass_button(ui, p, center, icon, if open { "Unlocked" } else { "Lock Note" }, note.is_some());
@@ -330,6 +330,8 @@ impl App {
         }
         let Some(note) = self.selected.clone().and_then(|s| self.lib.store.note(&s).cloned()) else { return };
         let ids = vec![note.id.clone()];
+        // A saved tab: not moved out of CleanTabs, copied or locked.
+        let tab = self.lib.is_tabs_account(&note.account);
         popover_below(ui, p, id, resp, |ui| {
             ui.set_min_width(220.0);
             let mut close = false;
@@ -347,7 +349,9 @@ impl App {
                     self.toggle_pin(&note.id);
                     close = true;
                 }
-                if !self.is_locked(&note.id) {
+                if tab {
+                    // Saved tabs aren't locked (CleanTabs couldn't read them).
+                } else if !self.is_locked(&note.id) {
                     if ui.button("Lock Note").clicked() {
                         self.lock_note(&note.id);
                         close = true;
@@ -378,8 +382,10 @@ impl App {
                     }
                     close = true;
                 }
-                submenu(ui, p, "Move to", |ui| self.move_to_menu(ui, &ids));
-                if ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
+                if !tab {
+                    submenu(ui, p, "Move to", |ui| self.move_to_menu(ui, &ids));
+                }
+                if !tab && ui.add(egui::Button::new("Duplicate Note").shortcut_text(cmd_key!("D"))).clicked() {
                     self.duplicate_note(&note.id);
                     close = true;
                 }

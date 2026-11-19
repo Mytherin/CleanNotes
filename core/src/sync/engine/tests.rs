@@ -25,6 +25,7 @@ impl Device {
             enabled: true,
             cursor: None,
             last_sync: None,
+            tabs_of: None,
         });
         store.ensure_local();
         Device { store, backend: SqliteBackend::open(&Config { path: path.into() }).unwrap(), att: tempfile::tempdir().unwrap() }

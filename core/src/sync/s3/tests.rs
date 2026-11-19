@@ -300,6 +300,7 @@ impl Device {
             enabled: true,
             cursor: None,
             last_sync: None,
+            tabs_of: None,
         });
         store.ensure_local();
         Device { store, backend: backend(server), att: tempfile::tempdir().unwrap() }
@@ -768,4 +769,43 @@ fn pictures_travel_with_their_notes() {
         phone.sync();
         assert!(attachments::exists(phone.att.path(), &name));
     }
+}
+
+#[test]
+fn saved_tabs_are_a_folder_of_their_own_that_the_notes_sync_leaves_alone() {
+    let server = FakeS3::start();
+    let tabs = tabs_config(&config(&server));
+    assert_eq!(tabs.prefix, format!("{PREFIX}/tabs"));
+    assert!(!tabs_exist(&config(&server), &keys().to_secret()).unwrap());
+
+    // CleanTabs saves a tab (and a collection) in tabs/.
+    let mut t = S3Backend::open(&tabs, Some(keys().to_secret())).unwrap();
+    let tab = note("tab-1", &["Research"], "# Rust\n\n[rust-lang.org](https://rust-lang.org)\n");
+    t.save_note(None, None, &tab).unwrap();
+    t.create_folder(&["Research".to_owned()]).unwrap();
+    t.finish().unwrap();
+    assert!(tabs_exist(&config(&server), &keys().to_secret()).unwrap());
+    let in_tabs = |s: &FakeS3| -> Vec<(String, String)> {
+        s.state().objects.iter().filter(|(k, _)| k.starts_with(&format!("{PREFIX}/tabs/"))).map(|(k, o)| (k.clone(), o.etag.clone())).collect()
+    };
+    let before = in_tabs(&server);
+    assert_eq!(before.len(), 3, "{before:?}");
+
+    // The notes' sync neither sees them nor touches them.
+    let mut laptop = Device::new(&server);
+    let folder = laptop.store.ensure_folder_at("s3", &["Recipes".into()]);
+    let n = Note::new("s3", &folder, "# Pancakes\n");
+    let id = n.id.clone();
+    laptop.store.notes.push(n);
+    laptop.sync();
+    laptop.store.purge_note(&id);
+    laptop.sync();
+    laptop.sync();
+    assert!(laptop.store.note("tab-1").is_none());
+    assert!(laptop.store.folders.iter().all(|f| f.name != "Research"));
+    assert_eq!(in_tabs(&server), before);
+
+    // Synced as a folder of its own, they're there.
+    let snap = S3Backend::open(&tabs, Some(keys().to_secret())).unwrap().pull().unwrap();
+    assert_eq!(snap.notes.iter().map(|n| n.data.id.as_str()).collect::<Vec<_>>(), ["tab-1"]);
 }

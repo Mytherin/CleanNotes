@@ -176,7 +176,7 @@ impl App {
     }
 
     fn general_tab(&mut self, ui: &mut Ui, p: &Palette) {
-        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled && !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone())).collect();
         let s = &mut self.lib.settings;
         ui.spacing_mut().item_spacing.y = 8.0;
         form_row(ui, p, "Sort notes by:", |ui| {
@@ -259,7 +259,7 @@ impl App {
                     ui.set_min_size(Vec2::new(170.0, 280.0));
                     ui.spacing_mut().item_spacing.y = 0.0;
                     let accounts: Vec<(String, String, String)> =
-                        self.lib.store.accounts.iter().map(|a| (a.id.clone(), a.name.clone(), a.backend.kind_name().to_owned())).collect();
+                        self.lib.store.accounts.iter().filter(|a| !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone(), a.backend.kind_name().to_owned())).collect();
                     for (id, name, kind) in accounts {
                         let (r, resp) = ui.allocate_exact_size(Vec2::new(170.0, 40.0), Sense::click());
                         if id == selected {

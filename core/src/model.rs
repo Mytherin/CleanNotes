@@ -56,9 +56,25 @@ pub struct Account {
     pub cursor: Option<String>,
     #[serde(default)]
     pub last_sync: Option<DateTime<Utc>>,
+    /// CleanTabs' saved tabs of an S3 account (its id): the `tabs/`
+    /// directory in that account's folder, synced as an account of its own
+    /// with the same access key (and encryption key). It's never shown as
+    /// an account: only as the CleanTabs section (see [`tabs_account_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs_of: Option<String>,
+}
+
+/// The id of the account syncing an S3 account's saved tabs.
+pub fn tabs_account_id(account: &str) -> String {
+    format!("{account}/{}", tabs::DIR)
 }
 
 impl Account {
+    /// CleanTabs' saved tabs of another account, not an account of notes.
+    pub fn is_tabs(&self) -> bool {
+        self.tabs_of.is_some()
+    }
+
     pub fn local() -> Account {
         Account {
             id: LOCAL.to_owned(),
@@ -67,6 +83,7 @@ impl Account {
             enabled: true,
             cursor: None,
             last_sync: None,
+            tabs_of: None,
         }
     }
 
@@ -362,7 +379,9 @@ impl Store {
 
     fn ensure_default_folders(&mut self) {
         for a in self.accounts.clone() {
-            if !self.folders.iter().any(|f| f.account == a.id && f.default) {
+            // (Saved tabs are all in collections: a "Notes" folder there
+            // would be uploaded, and show in CleanTabs.)
+            if !a.is_tabs() && !self.folders.iter().any(|f| f.account == a.id && f.default) {
                 self.folders.push(Folder::default_for(&a.id));
             }
         }
@@ -709,6 +728,7 @@ mod tests {
             enabled: true,
             cursor: None,
             last_sync: None,
+            tabs_of: None,
         });
         let folder = s.ensure_folder_at("acc", &["Notes".into()]);
         let n = Note::new("acc", &folder, "x");

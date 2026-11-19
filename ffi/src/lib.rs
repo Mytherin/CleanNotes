@@ -90,6 +90,8 @@ impl From<Location> for Place {
             Location::Deleted(account) => Place::Deleted { account },
             Location::Tag(name) => Place::Tag { name },
             Location::Smart(id) => Place::Smart { id },
+            // (CleanTabs isn't on the iPhone yet.)
+            Location::Tabs(..) | Location::TabsDeleted(_) => Place::AllNotes,
         }
     }
 }

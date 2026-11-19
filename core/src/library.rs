@@ -29,6 +29,8 @@ fn smart_name(name: &str) -> String {
 use crate::sync::engine::{self, AccountSnapshot};
 use crate::sync::worker::{Reply, Synced, Worker};
 
+mod tabs;
+
 /// Wait this long after the last edit before uploading.
 const SYNC_AFTER_EDIT: Duration = Duration::from_secs(3);
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(60);
@@ -53,6 +55,19 @@ pub enum Location {
     Tag(String),
     /// A Smart Folder (its id in the settings).
     Smart(String),
+    /// CleanTabs' saved tabs (see [`crate::model::Account::tabs_of`]): the
+    /// tabs account's id, and a folder (with those in it), or `None` for
+    /// All Tabs.
+    Tabs(String, Option<String>),
+    /// CleanTabs' Recently Deleted (the tabs account's id).
+    TabsDeleted(String),
+}
+
+impl Location {
+    /// One of CleanTabs' places (shown as a gallery of websites).
+    pub fn is_tabs(&self) -> bool {
+        matches!(self, Location::Tabs(..) | Location::TabsDeleted(_))
+    }
 }
 
 /// A note as the notes list shows it.
@@ -207,6 +222,10 @@ pub struct Library {
     lock: LockKeys,
     /// A sync downloaded attachments since the last [`Library::tick`].
     attachments_arrived: bool,
+    /// Look for CleanTabs' saved tabs in S3 accounts (see [`Library::find_tabs`]):
+    /// the desktop app does.
+    pub find_tabs: bool,
+    tabs_search: Option<tabs::Search>,
 }
 
 impl Library {
@@ -242,6 +261,8 @@ impl Library {
             redo_deletes: Vec::new(),
             lock: LockKeys::default(),
             attachments_arrived: false,
+            find_tabs: false,
+            tabs_search: None,
         }
     }
 
@@ -349,7 +370,8 @@ impl Library {
     }
 
     pub fn account_enabled(&self, id: &str) -> bool {
-        self.store.account(id).is_some_and(|a| a.enabled)
+        // (A tabs account isn't one: its saved tabs are in CleanTabs' section.)
+        self.store.account(id).is_some_and(|a| a.enabled && !a.is_tabs())
     }
 
     /// Whether a location still exists (a folder may have been deleted, an
@@ -361,6 +383,8 @@ impl Library {
             Location::Deleted(a) => self.account_enabled(a),
             Location::Tag(_) => true,
             Location::Smart(s) => self.smart_folder(s).is_some(),
+            Location::Tabs(t, f) => self.tabs_shown(t) && f.as_ref().is_none_or(|f| self.store.folder(f).is_some_and(|f| &f.account == t)),
+            Location::TabsDeleted(t) => self.tabs_shown(t),
         }
     }
 
@@ -410,6 +434,9 @@ impl Library {
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
             Location::Smart(s) => self.smart_folder(s).map(|s| s.name.clone()).unwrap_or_default(),
+            Location::Tabs(_, Some(f)) => self.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
+            Location::Tabs(_, None) => "All Tabs".into(),
+            Location::TabsDeleted(_) => "Recently Deleted".into(),
         }
     }
 
@@ -424,6 +451,9 @@ impl Library {
     /// ids. A search (every word must match) looks through every note.
     pub fn list_sections(&self, loc: &Location, search: &str) -> Vec<(String, Vec<String>)> {
         let words: Vec<String> = search.split_whitespace().map(|w| w.to_lowercase()).collect();
+        if loc.is_tabs() {
+            return self.tab_sections(loc, &words);
+        }
         let searching = !words.is_empty();
         let smart = match loc {
             Location::Smart(s) => self.smart_folder(s),
@@ -447,6 +477,7 @@ impl Library {
                         Location::Deleted(a) => n.deleted.is_some() && &n.account == a,
                         Location::Tag(t) => n.deleted.is_none() && n.tags().contains(t),
                         Location::Smart(_) => n.deleted.is_none() && smart.is_some_and(|f| self.in_smart_folder(f, n, now)),
+                        Location::Tabs(..) | Location::TabsDeleted(_) => false,
                     }
                 }
             })
@@ -558,7 +589,7 @@ impl Library {
     /// Whether a list at `loc` shows each note's folder (All Notes, tags and
     /// search results mix folders).
     pub fn list_shows_folders(&self, loc: &Location, search: &str) -> bool {
-        !search.trim().is_empty() || matches!(loc, Location::All | Location::Tag(_) | Location::Smart(_))
+        !loc.is_tabs() && (!search.trim().is_empty() || matches!(loc, Location::All | Location::Tag(_) | Location::Smart(_)))
     }
 
     /// Notes (not deleted) in a folder.
@@ -680,6 +711,7 @@ impl Library {
         }
         let account = match loc {
             Location::Deleted(a) if self.account_enabled(a) => a.clone(),
+            Location::Tabs(t, _) | Location::TabsDeleted(t) => self.store.account(t).and_then(|a| a.tabs_of.clone()).unwrap_or_default(),
             _ => self.settings.default_account.clone(),
         };
         let account = if self.account_enabled(&account) { account } else { self.fallback_account() };
@@ -900,9 +932,13 @@ impl Library {
     }
 
     /// Moves notes to a folder, possibly in another account.
+    /// Saved tabs stay in CleanTabs (and its account), notes out of it.
     pub fn move_notes(&mut self, ids: &[String], folder: &str) {
+        let Some(into_tabs) = self.store.folder(folder).map(|f| self.is_tabs_account(&f.account)) else { return };
         for id in ids {
-            self.move_one(id, folder);
+            if self.store.note(id).is_some_and(|n| self.is_tabs_account(&n.account) == into_tabs) {
+                self.move_one(id, folder);
+            }
         }
     }
 
@@ -1196,7 +1232,7 @@ impl Library {
 
     /// Whether an account can be removed: any but the last one.
     pub fn can_remove_account(&self, id: &str) -> bool {
-        self.store.account(id).is_some() && self.store.accounts.len() > 1
+        self.store.account(id).is_some_and(|a| !a.is_tabs()) && self.store.accounts.iter().filter(|a| !a.is_tabs()).count() > 1
     }
 
     /// How many notes (Recently Deleted included) an account has here.
@@ -1214,7 +1250,7 @@ impl Library {
         if self.account_enabled(&home) {
             return home;
         }
-        self.store.accounts.iter().find(|a| a.enabled).map(|a| a.id.clone()).unwrap_or(home)
+        self.store.accounts.iter().find(|a| a.enabled && !a.is_tabs()).map(|a| a.id.clone()).unwrap_or(home)
     }
 
     /// Adds "On My PC" back after it was removed.
@@ -1230,6 +1266,16 @@ impl Library {
         if !self.can_remove_account(id) {
             return;
         }
+        // Its saved tabs go with it.
+        let linked: Vec<String> = self.store.accounts.iter().filter(|a| a.tabs_of.as_deref() == Some(id)).map(|a| a.id.clone()).collect();
+        for l in linked {
+            self.forget_account(&l);
+        }
+        self.forget_account(id);
+    }
+
+    /// An account and its notes gone from this device.
+    fn forget_account(&mut self, id: &str) {
         self.worker.forget(id);
         let _ = self.db.set_secret(id, None);
         let notes: Vec<String> = self.store.notes.iter().filter(|n| n.account == id).map(|n| n.id.clone()).collect();
@@ -1251,7 +1297,7 @@ impl Library {
     pub fn account_for(&self, id: &str, name: String, backend: crate::sync::BackendConfig) -> Account {
         match self.store.account(id) {
             Some(a) => Account { name, backend, enabled: true, ..a.clone() },
-            None => Account { id: id.to_owned(), name, backend, enabled: true, cursor: None, last_sync: None },
+            None => Account { id: id.to_owned(), name, backend, enabled: true, cursor: None, last_sync: None, tabs_of: None },
         }
     }
 
@@ -1307,6 +1353,7 @@ impl Library {
             }
         }
         self.schedule_syncs();
+        t.changed |= self.find_tabs();
         if self.last_purge.elapsed() > PURGE_EVERY {
             self.last_purge = Instant::now();
             t.changed |= self.purge_expired();
@@ -1476,7 +1523,7 @@ impl Library {
             return;
         }
         let snapshot = AccountSnapshot::of(&self.store, account).with_attachments(&self.attachments_dir());
-        let secret = self.db.secret(account);
+        let secret = self.db.secret(&self.secret_owner(account));
         self.sync_started.insert(account.to_owned(), Instant::now());
         self.sync_secret.insert(account.to_owned(), secret.clone());
         self.worker.sync(a.backend.clone(), secret, snapshot);
@@ -1528,12 +1575,12 @@ impl Library {
     /// unless the account was removed or signed in again since the sync
     /// started (then they belong to a sign-in that's gone).
     fn handle_renewed(&mut self, account: &str, secret: String) {
-        let current = self.db.secret(account);
+        let current = self.db.secret(&self.secret_owner(account));
         let ours = self.store.account(account).is_some() && self.sync_secret.get(account).is_some_and(|s| *s == current);
         if !ours {
             return;
         }
-        if let Err(e) = self.db.set_secret(account, Some(&secret)) {
+        if let Err(e) = self.db.set_secret(&self.secret_owner(account), Some(&secret)) {
             eprintln!("saving the renewed sign-in: {e:#}");
             return;
         }
@@ -1548,10 +1595,10 @@ impl Library {
         // about the old sign-in no longer applies.
         let started_with = self.sync_secret.remove(&r.account);
         let exists = self.store.account(&r.account).is_some();
-        let replaced = exists && started_with.is_some_and(|s| s != self.db.secret(&r.account));
+        let replaced = exists && started_with.is_some_and(|s| s != self.db.secret(&self.secret_owner(&r.account)));
         if exists && !replaced {
             if let Some(s) = &r.renewed_secret {
-                if let Err(e) = self.db.set_secret(&r.account, Some(s)) {
+                if let Err(e) = self.db.set_secret(&self.secret_owner(&r.account), Some(s)) {
                     eprintln!("saving the renewed sign-in: {e:#}");
                 }
             }
@@ -1723,7 +1770,8 @@ impl Library {
 
     /// A note "Lock Note" applies to: there, not deleted, not locked yet.
     pub fn can_lock(&self, id: &str) -> bool {
-        self.store.note(id).is_some_and(|n| n.deleted.is_none() && !lock::is_locked(&n.body))
+        // (Not saved tabs: CleanTabs couldn't read them.)
+        self.store.note(id).is_some_and(|n| n.deleted.is_none() && !lock::is_locked(&n.body) && !self.is_tabs_account(&n.account))
     }
 
     /// "Lock Notes" with several notes selected: the password is asked for

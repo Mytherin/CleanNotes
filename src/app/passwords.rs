@@ -152,7 +152,7 @@ impl App {
             .store
             .accounts
             .iter()
-            .filter(|a| a.enabled)
+            .filter(|a| a.enabled && !a.is_tabs())
             .filter_map(|a| match &a.backend {
                 BackendConfig::S3(c) => Some((a.id.clone(), c.clone())),
                 _ => None,

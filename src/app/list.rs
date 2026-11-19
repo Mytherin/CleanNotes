@@ -24,7 +24,7 @@ impl App {
             Location::Folder(f) => self.lib.store.folder(f).map(|f| f.name.clone()).unwrap_or_default(),
             Location::Deleted(_) => "Recently Deleted".into(),
             Location::Tag(t) => format!("#{t}"),
-            Location::Smart(_) => self.lib.location_title(&self.location, ""),
+            Location::Smart(_) | Location::Tabs(..) | Location::TabsDeleted(_) => self.lib.location_title(&self.location, ""),
         }
     }
 
@@ -43,7 +43,8 @@ impl App {
         let max_w = (more_x - 24.0 - x).max(40.0);
         let title = truncate(&self.location_title(), max_w, ui);
         ui.painter().text(Pos2::new(x, y - 8.0), Align2::LEFT_CENTER, title, theme::bold_font(15.0), p.text);
-        let count = if n == 1 { "1 note".to_owned() } else { format!("{n} notes") };
+        let noun = if self.location.is_tabs() { "tab" } else { "note" };
+        let count = if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") };
         ui.painter().text(Pos2::new(x, y + 11.0), Align2::LEFT_CENTER, count, theme::font(12.5), p.secondary);
 
         let resp = glass_button(ui, p, Pos2::new(more_x, y), Icon::More, "View Options", true);
@@ -239,6 +240,15 @@ impl App {
                 }
                 return;
             }
+            // A saved tab: its page; not moved out of CleanTabs or copied.
+            let tab = self.lib.is_tabs_account(&n.account);
+            if let Some(url) = n.tab().map(|t| t.url) {
+                if menu::item("Open in Browser").icon(Icon::OpenApp).show(ui).clicked() {
+                    let _ = open::that(url);
+                    ui.close_menu();
+                }
+                menu::separator(ui);
+            }
             let all_pinned = ids.iter().all(|i| self.lib.store.note(i).is_some_and(|n| n.pinned));
             if menu::item(&format!("{} {noun}", if all_pinned { "Unpin" } else { "Pin" })).icon(Icon::Pin).show(ui).clicked() {
                 for id in &ids {
@@ -247,8 +257,10 @@ impl App {
                     }
                 }
             }
-            menu::submenu(ui, "Move to", Some(Icon::Folder), true, |ui| self.move_to_menu(ui, &ids));
-            if !several && menu::item("Duplicate Note").icon(Icon::Copy).shortcut(cmd_key!("D")).show(ui).clicked() {
+            if !tab {
+                menu::submenu(ui, "Move to", Some(Icon::Folder), true, |ui| self.move_to_menu(ui, &ids));
+            }
+            if !several && !tab && menu::item("Duplicate Note").icon(Icon::Copy).shortcut(cmd_key!("D")).show(ui).clicked() {
                 self.duplicate_note(id);
             }
             // Locks those not locked yet; hidden once they all are.
@@ -278,7 +290,7 @@ impl App {
 
     /// The folders of every account, to move `ids` into one.
     pub(super) fn move_to_menu(&mut self, ui: &mut Ui, ids: &[String]) {
-        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled && !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone())).collect();
         let several = accounts.len() > 1;
         for (aid, aname) in accounts {
             if several {
@@ -297,31 +309,44 @@ impl App {
         }
     }
 
-    /// The gallery: thumbnails in a grid; double-click opens a note.
+    /// The gallery: thumbnails in a grid; double-click opens a note. In
+    /// CleanTabs, websites: a click opens the tab's note, a double-click
+    /// its page.
     pub(super) fn gallery(&mut self, ui: &mut Ui, p: &Palette) {
         if self.gallery_open && self.editor.is_some() {
             self.note_pane(ui, p);
             return;
         }
         self.gallery_open = false;
+        let tabs = self.location.is_tabs();
         let full = ui.max_rect();
         let bar = Rect::from_min_size(full.min, Vec2::new(full.width(), TOOLBAR_H));
         ui.allocate_rect(bar, Sense::hover());
         let sections = self.cached_sections();
         self.shown = sections.iter().flat_map(|(_, ids)| ids.clone()).collect();
         let left = self.search_control(ui, p, bar.right() - 14.0, bar.center().y);
-        if glass_button(ui, p, Pos2::new(left - 28.0, bar.center().y), Icon::Compose, "New Note (Ctrl+N)", true).clicked() {
+        // (Tabs are saved in the browser, not made here.)
+        if !tabs && glass_button(ui, p, Pos2::new(left - 28.0, bar.center().y), Icon::Compose, "New Note (Ctrl+N)", true).clicked() {
             self.new_note();
             self.gallery_open = true;
         }
-        self.list_header(ui, p, bar, left - 74.0);
+        self.list_header(ui, p, bar, if tabs { left - 28.0 } else { left - 74.0 });
         let area = Rect::from_min_max(Pos2::new(full.left(), bar.bottom() + 1.0), full.max);
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(egui::Layout::top_down(egui::Align::LEFT)));
+        if tabs {
+            self.open_clicked_tab(ui);
+        }
         if self.shown.is_empty() {
-            child.painter().text(area.center(), Align2::CENTER_CENTER, "No Notes", theme::font(15.0), p.secondary);
+            let msg = match (tabs, self.search.trim().is_empty()) {
+                (_, false) => "No Results",
+                (true, _) => "No Tabs",
+                (false, _) => "No Notes",
+            };
+            child.painter().text(area.center(), Align2::CENTER_CENTER, msg, theme::font(15.0), p.secondary);
             return;
         }
-        let (card_w, card_h) = (172.0, 132.0);
+        // Websites are wider, as pages are.
+        let (card_w, card_h) = if tabs { (220.0, 138.0) } else { (172.0, 132.0) };
         let gap = 22.0;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(&mut child, |ui| {
             let cols = (((ui.available_width() - gap) / (card_w + gap)).floor() as usize).max(1);
@@ -377,17 +402,52 @@ impl App {
                 break;
             }
         }
-        let title = tab.map_or_else(|| n.title(), |t| t.title);
+        let title = tab.as_ref().map_or_else(|| n.title(), |t| t.title.clone());
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let t = truncate(&title, r.width(), ui);
         painter.text(Pos2::new(r.center().x, r.bottom() + 14.0), Align2::CENTER_CENTER, t, theme::bold_font(12.5), p.text);
-        painter.text(Pos2::new(r.center().x, r.bottom() + 31.0), Align2::CENTER_CENTER, list_time(n.modified), theme::font(11.5), p.secondary);
+        // A website says where it is; a note when it was edited.
+        let sub = match &tab {
+            Some(t) => truncate(&super::tabs::site(t), r.width(), ui),
+            None => list_time(n.modified),
+        };
+        painter.text(Pos2::new(r.center().x, r.bottom() + 31.0), Align2::CENTER_CENTER, sub, theme::font(11.5), p.secondary);
         let resp = ui.interact(r, ui.id().with(("card", id)), Sense::click_and_drag());
-        self.note_clicks(ui, &resp, id);
-        if resp.double_clicked() {
-            self.select(Some(id.to_owned()));
-            self.gallery_open = true;
+        if self.location.is_tabs() {
+            let url = tab.map(|t| t.url);
+            if super::tabs::open_button(ui, p, r, id, resp.hovered()) || (resp.double_clicked() && url.is_some()) {
+                self.tab_click = None;
+                if let Some(url) = url {
+                    let _ = open::that(url);
+                }
+            } else if resp.clicked() && ui.input(|i| i.modifiers.is_none()) {
+                // Opened once it's clear this isn't a double-click.
+                self.tab_click = Some((id.to_owned(), ui.input(|i| i.time)));
+            }
+            self.note_clicks(ui, &resp, id);
+        } else {
+            self.note_clicks(ui, &resp, id);
+            if resp.double_clicked() {
+                self.select(Some(id.to_owned()));
+                self.gallery_open = true;
+            }
         }
         self.note_menu(&resp, id);
+    }
+
+    /// A website clicked in CleanTabs' gallery, once a double-click (which
+    /// opens its page) can't follow: its note, full size.
+    fn open_clicked_tab(&mut self, ui: &Ui) {
+        let Some((id, at)) = self.tab_click.clone() else { return };
+        let wait = ui.ctx().options(|o| o.input_options.max_double_click_delay);
+        let since = ui.input(|i| i.time) - at;
+        if since < wait {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(wait - since + 0.01));
+            return;
+        }
+        self.tab_click = None;
+        if self.selected.as_deref() == Some(id.as_str()) && self.multi.is_empty() && self.editor.is_some() {
+            self.gallery_open = true;
+        }
     }
 }

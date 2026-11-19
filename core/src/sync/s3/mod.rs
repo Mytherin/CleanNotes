@@ -401,6 +401,25 @@ impl S3Backend {
     }
 }
 
+/// The folder of an account's saved tabs: its `tabs/` directory (see
+/// [`cleanbucket::notes::tabs`]), a folder laid out as the account's own,
+/// encrypted (with the same key) when the account's is.
+pub fn tabs_config(config: &Config) -> Config {
+    Config { prefix: cleanbucket::notes::tabs::dir_prefix(&config.prefix), ..config.clone() }
+}
+
+/// Whether CleanTabs keeps saved tabs in an account's folder: one `HEAD`
+/// of its `tabs/head` (CleanTabs always writes it). An error if it
+/// couldn't be looked for (offline, say).
+pub fn tabs_exist(config: &Config, secret: &str) -> Result<bool> {
+    let keys: Keys = serde_json::from_str(secret).map_err(|_| NeedsSignIn("the saved access key is unreadable".into()))?;
+    let credentials = Credentials { access_key_id: keys.access_key_id, secret_access_key: keys.secret_access_key, session_token: None };
+    let location = tabs_config(config).location();
+    let http = Blocking::new();
+    let found = block_on(Client::new(&location, &credentials, &http).head(HEAD)).map_err(fail)?;
+    Ok(found.is_some())
+}
+
 /// Tests the bucket and access key, and that the service honours
 /// conditional writes (without them, two devices could overwrite each
 /// other's edits). With a passphrase, sets up encryption for the folder or,

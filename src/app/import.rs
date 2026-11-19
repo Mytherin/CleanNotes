@@ -153,7 +153,7 @@ impl App {
 
     pub(super) fn import_sheet(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some(sheet) = self.import.as_mut() else { return };
-        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+        let accounts: Vec<(String, String)> = self.lib.store.accounts.iter().filter(|a| a.enabled && !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone())).collect();
         let mut close = false;
         let mut go = false;
         modal(ctx, "import", p, |ui| {

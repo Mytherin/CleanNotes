@@ -70,7 +70,7 @@ impl App {
             ui.spacing_mut().item_spacing.y = 1.0;
             // "All Notes": every note, whatever its folder or account.
             if self.show_all_notes() {
-                let count = self.lib.store.notes.iter().filter(|n| n.deleted.is_none() && self.account_enabled(&n.account)).count();
+                let count = self.lib.all_count();
                 let selected = self.location == Location::All && self.search.is_empty();
                 ui.add_space(4.0);
                 let resp = self.row(ui, p, 0, Icon::Notes, "All Notes", Some(count), selected, None);
@@ -84,9 +84,16 @@ impl App {
                 self.go_to(Location::Folder(f));
             }
             let accounts: Vec<(String, String)> =
-                self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+                self.lib.store.accounts.iter().filter(|a| a.enabled && !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone())).collect();
             for (id, name) in accounts {
                 self.account_section(ui, p, &id, &name);
+                ui.add_space(10.0);
+            }
+            // CleanTabs' saved tabs, for each S3 account they're in.
+            let tabs = self.lib.tabs_accounts();
+            let several = tabs.len() > 1;
+            for (account, owner) in tabs {
+                self.tabs_section(ui, p, &account, &owner, several);
                 ui.add_space(10.0);
             }
             // CleanPassword's vault, when an account's bucket holds one.
@@ -115,7 +122,7 @@ impl App {
     /// its folders.
     fn folder_move_to_menu(&mut self, ui: &mut Ui, id: &str) {
         let accounts: Vec<(String, String)> =
-            self.lib.store.accounts.iter().filter(|a| a.enabled).map(|a| (a.id.clone(), a.name.clone())).collect();
+            self.lib.store.accounts.iter().filter(|a| a.enabled && !a.is_tabs()).map(|a| (a.id.clone(), a.name.clone())).collect();
         let mut chosen: Option<(String, Option<String>)> = None;
         for (i, (account, name)) in accounts.iter().enumerate() {
             if i > 0 {
@@ -396,7 +403,7 @@ impl App {
 
     /// A sidebar row: icon, name, count, selection highlight.
     #[allow(clippy::too_many_arguments)]
-    fn row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
+    pub(super) fn row(&self, ui: &mut Ui, p: &Palette, depth: usize, icon: Icon, label: &str, count: Option<usize>, selected: bool, folded: Option<bool>) -> egui::Response {
         // While CleanPassword is shown, no notes folder is the selected one.
         let selected = selected && self.pw.view.is_none();
         self.paint_row(ui, p, depth, icon, label, count, selected, folded)

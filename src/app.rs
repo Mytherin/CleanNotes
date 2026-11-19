@@ -107,6 +107,9 @@ pub struct App {
     pub pdfs: PdfCache,
     /// Quick Look: an attached PDF (its reference and name) shown whole.
     pub quick_look: Option<(String, String)>,
+    /// A website clicked in CleanTabs' gallery (and when): its note opens
+    /// unless a double-click follows.
+    pub tab_click: Option<(String, f64)>,
     /// CleanPassword's vault, when it's in an S3 account's bucket.
     pub pw: passwords::PasswordsUi,
 }
@@ -132,6 +135,8 @@ impl App {
         }
         let ctx = cc.egui_ctx.clone();
         let mut lib = Library::open(&db::data_dir(), Secrets::Keyring, move || ctx.request_repaint())?;
+        // CleanTabs' saved tabs, in the S3 accounts' folders.
+        lib.find_tabs = true;
         // Example notes (`CLEANNOTES_SEED=1` with an empty data folder), for
         // trying the app out and for screenshots.
         let seed = std::env::var_os("CLEANNOTES_SEED").is_some() && lib.store.notes.is_empty();
@@ -152,6 +157,7 @@ impl App {
             images: ImageCache::new(lib.attachments_dir()),
             pdfs: PdfCache::new(lib.attachments_dir()),
             quick_look: None,
+            tab_click: None,
             pw: passwords::PasswordsUi::new(cleannotes_core::passwords::Passwords::new(|| {})),
             lib,
             location: Location::Folder(String::new()),
@@ -197,6 +203,11 @@ impl App {
     /// "All Notes" is in the sidebar once there's more than one folder.
     pub fn show_all_notes(&self) -> bool {
         self.lib.show_all_notes()
+    }
+
+    /// The list is shown as a gallery: as chosen, or CleanTabs' websites.
+    pub fn shows_gallery(&self) -> bool {
+        self.lib.settings.view == ListView::Gallery || self.location.is_tabs()
     }
 
     pub fn account_enabled(&self, id: &str) -> bool {
@@ -386,6 +397,10 @@ impl App {
     }
 
     pub fn duplicate_note(&mut self, id: &str) {
+        // (Saved tabs are CleanTabs': a copy would be a tab it didn't save.)
+        if self.lib.store.note(id).is_some_and(|n| self.lib.is_tabs_account(&n.account)) {
+            return;
+        }
         self.flush_editor();
         let copy = self.lib.duplicate_note(id);
         if copy.is_some() {
@@ -419,7 +434,8 @@ impl App {
         if self.lib.location_exists(&r.location) && self.location != r.location {
             self.go_to(r.location.clone());
         }
-        if !self.visible_notes().contains(&r.ids[0]) {
+        let tab = self.lib.store.note(&r.ids[0]).is_some_and(|n| self.lib.is_tabs_account(&n.account));
+        if !tab && !self.visible_notes().contains(&r.ids[0]) {
             let folder = self.lib.store.note(&r.ids[0]).map(|n| n.folder.clone()).unwrap_or_default();
             self.go_to(Location::Folder(folder));
         }
@@ -659,7 +675,7 @@ impl App {
             }
         }
         if !self.lib.location_exists(&self.location) {
-            if let Location::Folder(_) = self.location {
+            if matches!(self.location, Location::Folder(_)) || self.location.is_tabs() {
                 let (_, folder) = self.new_note_target();
                 self.location = Location::Folder(folder);
             }
@@ -839,6 +855,10 @@ impl App {
                 self.delete_notes(self.selected_ids());
             }
             if pressed(Modifiers::NONE, Key::Enter) || pressed(Modifiers::NONE, Key::Tab) {
+                // CleanTabs' gallery: the tab's note, full size.
+                if self.location.is_tabs() && self.editor.is_some() {
+                    self.gallery_open = true;
+                }
                 if let Some(e) = &mut self.editor {
                     e.focus_requested = true;
                     self.focus = Pane::Note;
@@ -1091,8 +1111,8 @@ impl App {
         }
         // CleanPassword's items are always a list (there are no thumbnails).
         let vault = self.pw.view.is_some();
-        let list_w = if self.lib.settings.view == ListView::Gallery && !vault { 0.0 } else { 300.0 };
-        if self.lib.settings.view == ListView::List || vault {
+        let list_w = if self.shows_gallery() && !vault { 0.0 } else { 300.0 };
+        if !self.shows_gallery() || vault {
             egui::SidePanel::left("notes-list")
                 .resizable(true)
                 .default_width(list_w)
@@ -1104,7 +1124,7 @@ impl App {
         egui::CentralPanel::default().frame(egui::Frame::none().fill(p.bg)).show(ctx, |ui| {
             if vault {
                 self.password_pane(ui, &p);
-            } else if self.lib.settings.view == ListView::Gallery {
+            } else if self.shows_gallery() {
                 self.gallery(ui, &p);
             } else {
                 self.note_pane(ui, &p);
