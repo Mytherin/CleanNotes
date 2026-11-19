@@ -183,6 +183,9 @@ pub struct NoteItem {
     pub pinned: bool,
     pub locked: bool,
     pub deleted: bool,
+    /// The note's first picture (an attachment's name, for
+    /// `attachment_path`), shown beside the row. Never a locked note's.
+    pub thumbnail: Option<String>,
     /// While searching: the title, and the snippet from the line where the
     /// words are, in parts with the matches marked (shown in bold). Empty
     /// otherwise.
@@ -1033,6 +1036,7 @@ fn item(r: library::NoteRow) -> NoteItem {
         pinned: r.pinned,
         locked: r.locked,
         deleted: r.deleted,
+        thumbnail: r.thumbnail,
         title_parts: Vec::new(),
         snippet_parts: Vec::new(),
         tab: None,
@@ -2923,6 +2927,30 @@ mod tests {
         assert_eq!(core.markdown(n.id.clone()).unwrap(), format!("# Trip\n![](attachments/{name})\n"));
         let path = core.attachment_path(name.clone()).unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG\r\n\x1a\nphoto");
+        // The list shows it beside the note, and says what's after the title.
+        let row = core.note(n.id.clone(), Place::AllNotes).unwrap();
+        assert_eq!((row.thumbnail.as_deref(), row.snippet.as_str()), (Some(name.as_str()), "1 photo"));
+        core.lib().set_body(&n.id, &format!("# Trip
+![](attachments/{name})
+Beach
+![](attachments/{name})
+"));
+        let row = core.note(n.id.clone(), Place::AllNotes).unwrap();
+        assert_eq!((row.thumbnail.as_deref(), row.snippet.as_str()), (Some(name.as_str()), "Beach"));
+        core.lib().set_body(&n.id, &format!("# Trip
+![](attachments/{name})
+![](attachments/{name})
+"));
+        assert_eq!(core.note(n.id.clone(), Place::AllNotes).unwrap().snippet, "2 photos");
+        // An attached file's link is no picture.
+        core.lib().set_body(&n.id, &format!("# Trip
+[ticket.pdf](attachments/{name})
+"));
+        let row = core.note(n.id.clone(), Place::AllNotes).unwrap();
+        assert_eq!((row.thumbnail, row.snippet.as_str()), (None, "ticket.pdf"));
+        core.lib().set_body(&n.id, &format!("# Trip
+![](attachments/{name})
+"));
         assert_eq!(core.attachment_path("../x.png".into()), None);
         // Backspace after it takes it out, as typed.
         e.replace(5, 6, String::new());

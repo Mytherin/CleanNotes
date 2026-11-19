@@ -1,4 +1,5 @@
 import SwiftUI
+import ImageIO
 
 /// A folder's notes (or All Notes, a tag, Recently Deleted), as in Apple
 /// Notes: sections by date with pinned notes on top, swipe right to pin,
@@ -29,7 +30,7 @@ struct NotesListView: View {
         let sections = store.core.sections(place: place, search: search)
         let count = sections.reduce(0) { $0 + $1.notes.count }
         let title = store.core.title(place: place, search: "")
-        Group {
+        withToolbar(settings: settings, count: count, sections: sections) {
             if count == 0 && search.isEmpty {
                 ContentUnavailableView("No Notes", systemImage: deletedView ? "trash" : "note.text", description: Text(deletedView ? "Notes you delete stay here for 30 days." : "Tap the compose button to make a note."))
             } else if settings.gallery && !editMode.isEditing {
@@ -44,7 +45,6 @@ struct NotesListView: View {
         .onChange(of: search) { _, s in store.search = s }
         .refreshable { await store.refresh() }
         .environment(\.editMode, $editMode)
-        .toolbar { toolbar(settings: settings, count: count, sections: sections) }
         .sheet(isPresented: Binding(get: { moving != nil }, set: { if !$0 { moving = nil } })) {
             MoveSheet(ids: moving ?? []) {
                 moving = nil
@@ -93,10 +93,14 @@ struct NotesListView: View {
                 Section {
                     if section.title.isEmpty || !collapsed.contains(section.title) {
                         ForEach(section.notes) { note in
-                            NavigationLink(value: Route.note(id: note.id, isNew: false)) {
-                                NoteRow(note: note)
-                            }
-                            .tag(note.id)
+                            // A link without its chevron, as Apple Notes' rows.
+                            NoteRow(note: note)
+                                .background {
+                                    NavigationLink(value: Route.note(id: note.id, isNew: false)) { EmptyView() }
+                                        .opacity(0)
+                                }
+                                .listRowInsets(EdgeInsets(top: 8, leading: 26, bottom: 8, trailing: 16))
+                                .tag(note.id)
                             .swipeActions(edge: .leading, allowsFullSwipe: true) { leadingSwipe(note) }
                             .swipeActions(edge: .trailing, allowsFullSwipe: true) { trailingSwipe(note) }
                             .contextMenu {
@@ -126,6 +130,9 @@ struct NotesListView: View {
             }
         }
         .listStyle(.insetGrouped)
+        // Wide cards, close to the screen's edges, as in Apple Notes.
+        .contentMargins(.horizontal, 8, for: .scrollContent)
+        .listSectionSpacing(18)
     }
 
     @ViewBuilder
@@ -190,47 +197,91 @@ struct NotesListView: View {
         }
     }
 
+    /// The list with its toolbars. On iOS 26 as in Apple Notes: the note
+    /// count under the title, and Search and the compose button floating at
+    /// the bottom; before, the count between them in the bottom toolbar.
+    @ViewBuilder
+    private func withToolbar<Content: View>(settings: AppSettings, count: Int, sections: [NoteSection], @ViewBuilder _ content: () -> Content) -> some View {
+        if #available(iOS 26.0, *) {
+            Group(content: content)
+                .navigationSubtitle(editMode.isEditing || (count == 0 && search.isEmpty) ? "" : notesCount(count))
+                .toolbar { glassToolbar(settings: settings, sections: sections) }
+        } else {
+            Group(content: content)
+                .toolbar { toolbar(settings: settings, count: count, sections: sections) }
+        }
+    }
+
+    @available(iOS 26.0, *)
+    @ToolbarContentBuilder
+    private func glassToolbar(settings: AppSettings, sections: [NoteSection]) -> some ToolbarContent {
+        ToolbarItem(placement: .topBarTrailing) { topButton(settings) }
+        if editMode.isEditing {
+            selectionBar(sections: sections)
+        } else {
+            DefaultToolbarItem(kind: .search, placement: .bottomBar)
+            ToolbarSpacer(.fixed, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) { composeButton.tint(Color.primary) }
+        }
+    }
+
+    @ViewBuilder
+    private func topButton(_ settings: AppSettings) -> some View {
+        if editMode.isEditing {
+            Button("Done") {
+                editMode = .inactive
+                selection = []
+            }
+            .bold()
+        } else {
+            viewMenu(settings)
+        }
+    }
+
+    private var composeButton: some View {
+        Button {
+            newNote()
+        } label: { Image(systemName: "square.and.pencil") }
+            .disabled(deletedView)
+            .accessibilityLabel("New Note")
+    }
+
+    /// Selecting notes: Move, Recover and Delete (all of them with none
+    /// selected).
+    @ToolbarContentBuilder
+    private func selectionBar(sections: [NoteSection]) -> some ToolbarContent {
+        ToolbarItemGroup(placement: .bottomBar) {
+            let ids = selection.isEmpty ? sections.flatMap { $0.notes.map(\.id) } : Array(selection)
+            Button(selection.isEmpty ? "Move All" : "Move") { moving = ids }
+                .disabled(ids.isEmpty)
+            Spacer()
+            if deletedView {
+                Button(selection.isEmpty ? "Recover All" : "Recover") {
+                    store.perform { core in ids.forEach { core.recoverNote(id: $0) } }
+                    selection = []
+                    editMode = .inactive
+                }
+                .disabled(ids.isEmpty)
+                Spacer()
+            }
+            Button(selection.isEmpty ? "Delete All" : "Delete") { delete(ids) }
+                .disabled(ids.isEmpty)
+        }
+    }
+
     @ToolbarContentBuilder
     private func toolbar(settings: AppSettings, count: Int, sections: [NoteSection]) -> some ToolbarContent {
-        ToolbarItem(placement: .topBarTrailing) {
-            if editMode.isEditing {
-                Button("Done") {
-                    editMode = .inactive
-                    selection = []
-                }
-                .bold()
-            } else {
-                viewMenu(settings)
-            }
-        }
-        ToolbarItemGroup(placement: .bottomBar) {
-            if editMode.isEditing {
-                let ids = selection.isEmpty ? sections.flatMap { $0.notes.map(\.id) } : Array(selection)
-                Button(selection.isEmpty ? "Move All" : "Move") { moving = ids }
-                    .disabled(ids.isEmpty)
-                Spacer()
-                if deletedView {
-                    Button(selection.isEmpty ? "Recover All" : "Recover") {
-                        store.perform { core in ids.forEach { core.recoverNote(id: $0) } }
-                        selection = []
-                        editMode = .inactive
-                    }
-                    .disabled(ids.isEmpty)
-                    Spacer()
-                }
-                Button(selection.isEmpty ? "Delete All" : "Delete") { delete(ids) }
-                    .disabled(ids.isEmpty)
-            } else {
+        ToolbarItem(placement: .topBarTrailing) { topButton(settings) }
+        if editMode.isEditing {
+            selectionBar(sections: sections)
+        } else {
+            ToolbarItemGroup(placement: .bottomBar) {
                 Spacer()
                 Text(notesCount(count))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    newNote()
-                } label: { Image(systemName: "square.and.pencil") }
-                    .disabled(deletedView)
-                    .accessibilityLabel("New Note")
+                composeButton
             }
         }
     }
@@ -266,8 +317,13 @@ struct NotesListView: View {
                 Label("Sort By", systemImage: "arrow.up.arrow.down")
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            if #available(iOS 26.0, *) {
+                Image(systemName: "ellipsis")
+            } else {
+                Image(systemName: "ellipsis.circle")
+            }
         }
+        .accessibilityLabel("More")
     }
 
     private func update(_ settings: AppSettings, _ change: (inout AppSettings) -> Void) {
@@ -320,18 +376,23 @@ private struct SectionHeader: View {
         Button(action: toggle) {
             HStack {
                 Text(title)
-                    .font(.title3.bold())
-                    .foregroundStyle(.primary)
+                    .font(.title2.bold())
+                    .foregroundStyle(Color.primary)
                 Spacer()
-                Image(systemName: "chevron.down")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(Color.notesAccent)
-                    .rotationEffect(.degrees(collapsed ? -90 : 0))
+                // As in Apple Notes, only a folded section shows its chevron.
+                if collapsed {
+                    Image(systemName: "chevron.forward")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color.notesAccent)
+                }
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .textCase(nil)
+        // Lined up with the cards' edge, not their text.
+        .padding(.leading, -20)
+        .padding(.bottom, 2)
         .accessibilityLabel(title)
         .accessibilityHint(collapsed ? "Shows the notes in this section." : "Hides the notes in this section.")
     }
@@ -353,8 +414,8 @@ struct NoteRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 4) {
                     NoteRow.text(note.title, parts: note.titleParts)
                         .font(.headline)
@@ -367,26 +428,85 @@ struct NoteRow: View {
                 }
                 HStack(spacing: 6) {
                     Text(note.time)
-                        .foregroundStyle(.primary)
                     NoteRow.text(note.snippet, parts: note.snippetParts)
-                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
                 .font(.subheadline)
+                .foregroundStyle(.secondary)
                 if let folder = note.folder {
                     Label(folder, systemImage: "folder")
+                        .labelStyle(FolderLabelStyle())
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
-            // A tab note's picture.
-            if let tab = note.tab, tab.thumbnail != nil {
-                Spacer(minLength: 0)
+            Spacer(minLength: 0)
+            if let name = note.thumbnail {
+                Thumbnail(name: name)
+            } else if let tab = note.tab, tab.thumbnail != nil {
+                // A tab note's picture.
                 TabPicture(page: tab, cornerRadius: 6, compact: true)
                     .frame(width: 44, height: 44)
             }
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+    }
+}
+
+/// The folder line: a small folder icon close to its name.
+private struct FolderLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 3) {
+            configuration.icon.imageScale(.small)
+            configuration.title
+        }
+    }
+}
+
+/// A note's first picture beside its row, as in Apple Notes.
+private struct Thumbnail: View {
+    @EnvironmentObject private var store: NotesStore
+    let name: String
+
+    var body: some View {
+        let size: CGFloat = 54
+        Group {
+            if let image = ThumbnailCache.shared.image(name: name, path: store.core.attachmentPath(name: name), side: size) {
+                Image(uiImage: image).resizable().scaledToFill()
+            } else {
+                Color(.tertiarySystemFill)
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color(.separator), lineWidth: 0.5))
+        .accessibilityHidden(true)
+    }
+}
+
+/// Small copies of the notes' pictures, made once each (pictures are
+/// named by their content, so a name always means the same picture).
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private let cache = NSCache<NSString, UIImage>()
+
+    func image(name: String, path: String?, side: CGFloat) -> UIImage? {
+        if let hit = cache.object(forKey: name as NSString) { return hit }
+        // Not on this device yet (still syncing): try again next time.
+        guard let path else { return nil }
+        let pixels = side * UIScreen.main.scale
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, options),
+              let small = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: pixels * 2,
+              ] as CFDictionary)
+        else { return nil }
+        let image = UIImage(cgImage: small)
+        cache.setObject(image, forKey: name as NSString)
+        return image
     }
 }
 

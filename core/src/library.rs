@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 
+use crate::attachments;
 use crate::dates;
 use crate::db::{Db, Secrets};
 use crate::lock::{self, Keys};
@@ -87,6 +88,9 @@ pub struct NoteRow {
     pub pinned: bool,
     pub locked: bool,
     pub deleted: bool,
+    /// The note's first picture (its attachment's name), shown beside the
+    /// row as in Apple Notes. Never a locked note's.
+    pub thumbnail: Option<String>,
 }
 
 /// A note for the system's search (Spotlight on the iPhone).
@@ -551,8 +555,15 @@ impl Library {
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
         let locked = lock::is_locked(&n.body);
         let snippet = if locked { "Locked".to_owned() } else { markdown::snippet_of(&n.body, 120) };
+        let pictures = if locked { Vec::new() } else { attachments::pictures_in(&n.body) };
         let empty = snippet.is_empty();
-        let snippet = if empty { "No additional text".to_owned() } else { snippet };
+        // Only pictures after the title: "1 photo", "3 photos", as in Apple Notes.
+        let snippet = match pictures.len() {
+            _ if !empty => snippet,
+            0 => "No additional text".to_owned(),
+            1 => "1 photo".to_owned(),
+            k => format!("{k} photos"),
+        };
         let when = match n.deleted {
             Some(d) if matches!(loc, Location::Deleted(_)) => d,
             _ if self.settings.sort_by == SortBy::Created => n.created,
@@ -569,6 +580,7 @@ impl Library {
             pinned: n.pinned,
             locked,
             deleted: n.deleted.is_some(),
+            thumbnail: pictures.into_iter().next(),
         })
     }
 

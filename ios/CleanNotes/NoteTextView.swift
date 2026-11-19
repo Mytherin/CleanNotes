@@ -1131,13 +1131,13 @@ struct NoteEditorView: UIViewRepresentable {
             command(.insertImage(name: name))
         }
 
-        @objc fileprivate func photoTapped() {
+        func photoTapped() {
             if readOnly {
                 blockedEdit()
                 return
             }
             var config = PHPickerConfiguration()
-            config.filter = .images
+            config.filter = .any(of: [.images, .videos])
             config.selectionLimit = 0
             let picker = PHPickerViewController(configuration: config)
             picker.delegate = self
@@ -1149,13 +1149,13 @@ struct NoteEditorView: UIViewRepresentable {
         // ---- Other files (PDFs, …) ----
 
         /// The view controller to present over.
-        private func topController() -> UIViewController? {
+        func topController() -> UIViewController? {
             guard var top = textView?.window?.rootViewController else { return nil }
             while let next = top.presentedViewController { top = next }
             return top
         }
 
-        fileprivate func fileTapped() {
+        func fileTapped() {
             if readOnly {
                 blockedEdit()
                 return
@@ -1215,10 +1215,25 @@ struct NoteEditorView: UIViewRepresentable {
 
         func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
             picker.dismiss(animated: true)
-            for r in results where r.itemProvider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
-                r.itemProvider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
-                    guard let data else { return }
-                    DispatchQueue.main.async { self?.attachImage(data) }
+            for r in results {
+                let provider = r.itemProvider
+                if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                    provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { [weak self] data, _ in
+                        guard let data else { return }
+                        DispatchQueue.main.async { self?.attachImage(data) }
+                    }
+                } else if provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) {
+                    // A video is attached as a file. Its copy here is gone
+                    // once this returns: keep one of our own.
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { [weak self] url, _ in
+                        guard let url else { return }
+                        let name = (provider.suggestedName ?? "Video") + "." + url.pathExtension
+                        guard let copy = Attaching.temporaryCopy(of: url, named: name) else { return }
+                        DispatchQueue.main.async {
+                            self?.attachFile(copy)
+                            try? FileManager.default.removeItem(at: copy.deletingLastPathComponent())
+                        }
+                    }
                 }
             }
         }
@@ -1227,7 +1242,7 @@ struct NoteEditorView: UIViewRepresentable {
 
         /// The document camera, as in Apple Notes: its pages are attached
         /// as one PDF.
-        fileprivate func scanDocumentsTapped() {
+        func scanDocumentsTapped() {
             if readOnly {
                 blockedEdit()
                 return
@@ -1541,74 +1556,106 @@ struct NoteEditorView: UIViewRepresentable {
 
         // ---- The keyboard bar and the Aa panel ----
 
+        /// The bar above the keyboard, as in Apple Notes: a floating capsule
+        /// of buttons (Aa, checklist, table, attach, link, indents) that
+        /// scrolls sideways when they don't fit. Done is the checkmark in
+        /// the navigation bar.
+        ///
+        /// (Not a UIToolbar: on a narrow iPhone it moved the buttons that
+        /// didn't fit into an overflow menu, which showed them without
+        /// names, since they have only icons.)
         func makeAccessoryBar() -> UIView {
-            let bar = UIToolbar(frame: CGRect(x: 0, y: 0, width: 320, height: 44))
-            let item = { (symbol: String, label: String, action: Selector) -> UIBarButtonItem in
-                let b = UIBarButtonItem(image: UIImage(systemName: symbol), style: .plain, target: self, action: action)
+            let height: CGFloat = 50
+            let container = UIView(frame: CGRect(x: 0, y: 0, width: 320, height: height + 10))
+            container.backgroundColor = .clear
+
+            let capsule: UIVisualEffectView
+            if #available(iOS 26.0, *) {
+                capsule = UIVisualEffectView(effect: UIGlassEffect())
+            } else {
+                capsule = UIVisualEffectView(effect: UIBlurEffect(style: .systemThickMaterial))
+            }
+            capsule.layer.cornerRadius = height / 2
+            capsule.layer.cornerCurve = .continuous
+            capsule.clipsToBounds = true
+            capsule.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(capsule)
+
+            let scroll = UIScrollView()
+            scroll.showsHorizontalScrollIndicator = false
+            scroll.alwaysBounceHorizontal = false
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            capsule.contentView.addSubview(scroll)
+
+            let button = { (symbol: String, label: String) -> UIButton in
+                var config = UIButton.Configuration.plain()
+                config.image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 19, weight: .regular))
+                config.baseForegroundColor = .label
+                let b = UIButton(configuration: config)
                 b.accessibilityLabel = label
+                b.largeContentTitle = label
+                b.showsLargeContentViewer = true
+                b.translatesAutoresizingMaskIntoConstraints = false
+                b.widthAnchor.constraint(equalToConstant: 56).isActive = true
                 return b
             }
-            let flex = { UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil) }
-            // The Table button's menu is made when it opens: Insert Table,
-            // or in a table its rows, columns and headers.
-            let table = UIBarButtonItem(image: UIImage(systemName: "tablecells"), menu: UIMenu(children: [
-                UIDeferredMenuElement.uncached { [weak self] completion in
-                    completion(TableActions.items(self?.formatting) { c in self?.command(c) })
-                },
-            ]))
-            table.accessibilityLabel = "Table"
-            // As in Apple Notes: photos, the two scanners, then files. The
-            // menu is made when it opens (scanning needs a camera, and Scan
-            // Text an editable note).
-            let attach = UIBarButtonItem(image: UIImage(systemName: "paperclip"), menu: UIMenu(children: [
-                UIDeferredMenuElement.uncached { [weak self] completion in
-                    completion(self?.attachMenuItems() ?? [])
-                },
-            ]))
-            attach.accessibilityLabel = "Attach"
-            bar.items = [
-                table, flex(),
-                item("textformat", "Format", #selector(formatTapped)), flex(),
-                item("checklist", "Checklist", #selector(checklistTapped)), flex(),
-                item("decrease.indent", "Outdent", #selector(outdentTapped)), flex(),
-                item("increase.indent", "Indent", #selector(indentTapped)), flex(),
-                attach, flex(),
-                item("link", "Link", #selector(linkTapped)), flex(),
-                item("xmark.circle", "Done", #selector(doneTapped)),
-            ]
-            bar.tintColor = .label
-            return bar
-        }
-
-        /// The paperclip's menu.
-        private func attachMenuItems() -> [UIMenuElement] {
-            var items: [UIMenuElement] = [
-                UIAction(title: "Choose Photo", image: UIImage(systemName: "photo.on.rectangle")) { [weak self] _ in self?.photoTapped() },
-            ]
-            let scanDocuments = UIAction(title: "Scan Documents", image: UIImage(systemName: "doc.viewfinder")) { [weak self] _ in self?.scanDocumentsTapped() }
-            if !VNDocumentCameraViewController.isSupported { scanDocuments.attributes = .disabled }
-            items.append(scanDocuments)
-            if let tv = textView {
-                // The system's Live Text camera: what it reads is typed at
-                // the caret, as from the keyboard.
-                let scanText = UIAction.captureTextFromCamera(responder: tv, identifier: nil)
-                scanText.title = "Scan Text"
-                scanText.image = UIImage(systemName: "text.viewfinder")
-                if readOnly || !tv.canPerformAction(#selector(UIResponder.captureTextFromCamera(_:)), withSender: nil) {
-                    scanText.attributes = .disabled
-                }
-                items.append(scanText)
+            let tap = { (symbol: String, label: String, action: @escaping () -> Void) -> UIButton in
+                let b = button(symbol, label)
+                b.addAction(UIAction { _ in action() }, for: .touchUpInside)
+                return b
             }
-            items.append(UIAction(title: "Attach File", image: UIImage(systemName: "doc")) { [weak self] _ in self?.fileTapped() })
-            return items
-        }
+            let menu = { (symbol: String, label: String, menu: UIMenu) -> UIButton in
+                let b = button(symbol, label)
+                b.menu = menu
+                b.showsMenuAsPrimaryAction = true
+                return b
+            }
 
-        @objc private func formatTapped() { toggleFormatPanel() }
-        @objc private func checklistTapped() { command(.toggleChecklist) }
-        @objc private func indentTapped() { command(.indent) }
-        @objc private func outdentTapped() { command(.outdent) }
-        @objc private func linkTapped() { onLink() }
-        @objc private func doneTapped() { textView?.resignFirstResponder() }
+            let buttons = [
+                tap("textformat", "Format") { [weak self] in self?.toggleFormatPanel() },
+                tap("checklist", "Checklist") { [weak self] in self?.command(.toggleChecklist) },
+                // Made when it opens: Insert Table, or in a table its rows,
+                // columns and headers.
+                menu("tablecells", "Table", UIMenu(children: [
+                    UIDeferredMenuElement.uncached { [weak self] completion in
+                        completion(TableActions.items(self?.formatting) { c in self?.command(c) })
+                    },
+                ])),
+                {
+                    let b = menu("paperclip", "Attach", Attaching.menu { [weak self] kind in self?.attach(kind) })
+                    // Top to bottom as listed, as Apple Notes shows it.
+                    b.preferredMenuElementOrder = .fixed
+                    return b
+                }(),
+                tap("link", "Link") { [weak self] in self?.onLink() },
+                tap("decrease.indent", "Outdent") { [weak self] in self?.command(.outdent) },
+                tap("increase.indent", "Indent") { [weak self] in self?.command(.indent) },
+            ]
+            let row = UIStackView(arrangedSubviews: buttons)
+            row.axis = .horizontal
+            row.distribution = .equalSpacing
+            row.translatesAutoresizingMaskIntoConstraints = false
+            scroll.addSubview(row)
+
+            NSLayoutConstraint.activate([
+                capsule.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
+                capsule.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
+                capsule.topAnchor.constraint(equalTo: container.topAnchor, constant: 2),
+                capsule.heightAnchor.constraint(equalToConstant: height),
+                scroll.leadingAnchor.constraint(equalTo: capsule.contentView.leadingAnchor, constant: 6),
+                scroll.trailingAnchor.constraint(equalTo: capsule.contentView.trailingAnchor, constant: -6),
+                scroll.topAnchor.constraint(equalTo: capsule.contentView.topAnchor),
+                scroll.bottomAnchor.constraint(equalTo: capsule.contentView.bottomAnchor),
+                row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+                row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+                row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+                row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+                row.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+                // Spread out when they fit; scroll when they don't.
+                row.widthAnchor.constraint(greaterThanOrEqualTo: scroll.frameLayoutGuide.widthAnchor),
+            ])
+            return container
+        }
 
         /// The Aa panel takes the keyboard's place, as in Apple Notes.
         func toggleFormatPanel() {

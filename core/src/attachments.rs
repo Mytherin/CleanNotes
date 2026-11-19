@@ -287,6 +287,21 @@ pub fn image_refs_in(md: &str) -> Vec<String> {
     out
 }
 
+/// The pictures (`![…](attachments/<name>)`) a note's Markdown shows, in
+/// order, each time it shows them; not attached files' links, nor
+/// encrypted pictures. What the notes list shows a thumbnail of.
+pub fn pictures_in(md: &str) -> Vec<String> {
+    let link = format!("]({URL_PREFIX}");
+    ref_spans(md)
+        .into_iter()
+        .filter(|(at, r)| {
+            let before = &md[..at.start - link.len()];
+            !is_sealed_ref(r) && before.rfind('[').is_some_and(|open| before[..open].ends_with('!'))
+        })
+        .map(|(_, r)| r.to_owned())
+        .collect()
+}
+
 /// The attachments' files a note's stored body needs: those its Markdown
 /// shows, or a locked note's, listed beside its sealed text (see
 /// [`crate::lock::Envelope::att`]). What a sync uploads and downloads.

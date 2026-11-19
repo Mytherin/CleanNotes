@@ -28,7 +28,7 @@ struct NoteView: View {
         let _ = store.revision
         let item = store.core.note(id: noteId, place: .allNotes)
         let deleted = store.core.isDeleted(id: noteId)
-        Group {
+        withToolbar(item: item, deleted: deleted) {
             if gone || item == nil {
                 ContentUnavailableView("No Note", systemImage: "note.text", description: Text("This note was deleted."))
             } else if closed {
@@ -53,7 +53,6 @@ struct NoteView: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar { toolbar(item: item, deleted: deleted) }
         .toolbar(bridge.isEditing ? .hidden : .visible, for: .bottomBar)
         .sheet(isPresented: $moving) {
             MoveSheet(ids: [noteId]) { moving = false }
@@ -98,71 +97,163 @@ struct NoteView: View {
         }
     }
 
+    /// The note with its toolbars: iOS 26's look there, the earlier one
+    /// before.
+    @ViewBuilder
+    private func withToolbar<Content: View>(item: NoteItem?, deleted: Bool, @ViewBuilder _ content: () -> Content) -> some View {
+        if #available(iOS 26.0, *) {
+            Group(content: content).toolbar { glassToolbar(item: item, deleted: deleted) }
+        } else {
+            Group(content: content).toolbar { toolbar(item: item, deleted: deleted) }
+        }
+    }
+
+    /// iOS 26's look, as in Apple Notes: undo, then share and "…" in a
+    /// capsule, then a yellow checkmark for Done while typing.
+    @available(iOS 26.0, *)
+    @ToolbarContentBuilder
+    private func glassToolbar(item: NoteItem?, deleted: Bool) -> some ToolbarContent {
+        // Undo stays after Done while there's something to undo, as in
+        // Apple Notes.
+        if bridge.isEditing || (bridge.formatting?.canUndo ?? false) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                undoButtons(symbols: ("arrow.uturn.backward", "arrow.uturn.forward"))
+                    .tint(Color.primary)
+            }
+            ToolbarSpacer(.fixed, placement: .topBarTrailing)
+        }
+        ToolbarItemGroup(placement: .topBarTrailing) {
+            // White, as Apple Notes' (the checkmark is the yellow one).
+            shareButton(item: item)
+                .tint(Color.primary)
+            if let item {
+                noteMenu(item: item, deleted: deleted, symbol: "ellipsis")
+                    .tint(Color.primary)
+            }
+        }
+        if bridge.isEditing {
+            ToolbarSpacer(.fixed, placement: .topBarTrailing)
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(role: .confirm) {
+                    bridge.endEditing()
+                } label: { Image(systemName: "checkmark") }
+                    .tint(Color.notesAccent)
+                    .accessibilityLabel("Done")
+            }
+        }
+        // As in Apple Notes: checklist, attach and table together, the
+        // compose button on its own at the other end.
+        if !deleted && !closed {
+            ToolbarItemGroup(placement: .bottomBar) {
+                checklistButton
+                AttachMenu { kind in
+                    bridge.beginEditing()
+                    bridge.attach(kind)
+                }
+                .tint(Color.primary)
+                tableMenu
+            }
+            ToolbarSpacer(.flexible, placement: .bottomBar)
+            ToolbarItem(placement: .bottomBar) { composeButton.tint(Color.primary) }
+        }
+    }
+
     @ToolbarContentBuilder
     private func toolbar(item: NoteItem?, deleted: Bool) -> some ToolbarContent {
         ToolbarItemGroup(placement: .topBarTrailing) {
             if bridge.isEditing {
-                Button {
-                    bridge.command(.undo)
-                } label: { Image(systemName: "arrow.uturn.backward.circle") }
-                    .disabled(!(bridge.formatting?.canUndo ?? false))
-                    .accessibilityLabel("Undo")
-                Button {
-                    bridge.command(.redo)
-                } label: { Image(systemName: "arrow.uturn.forward.circle") }
-                    .disabled(!(bridge.formatting?.canRedo ?? false))
-                    .accessibilityLabel("Redo")
+                undoButtons(symbols: ("arrow.uturn.backward.circle", "arrow.uturn.forward.circle"))
             }
-            if let editor, !closed {
-                let title = item?.title ?? "Note"
-                ShareLink(
-                    item: SharedNote(title: title, textSize: store.core.settings().textSize, editor: editor),
-                    subject: Text(title),
-                    preview: SharePreview(title)
-                ) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                .accessibilityLabel("Share")
-            }
+            shareButton(item: item)
             if let item {
-                noteMenu(item: item, deleted: deleted)
+                noteMenu(item: item, deleted: deleted, symbol: "ellipsis.circle")
             }
             if bridge.isEditing {
                 Button("Done") { bridge.endEditing() }
                     .bold()
             }
         }
+        bottomBar(deleted: deleted)
+    }
+
+    /// Undo, and Redo once there's something to redo (as Apple Notes shows
+    /// it).
+    @ViewBuilder
+    private func undoButtons(symbols: (undo: String, redo: String)) -> some View {
+        Button {
+            bridge.command(.undo)
+        } label: { Image(systemName: symbols.undo) }
+            .disabled(!(bridge.formatting?.canUndo ?? false))
+            .accessibilityLabel("Undo")
+        if bridge.formatting?.canRedo ?? false {
+            Button {
+                bridge.command(.redo)
+            } label: { Image(systemName: symbols.redo) }
+                .accessibilityLabel("Redo")
+        }
+    }
+
+    @ViewBuilder
+    private func shareButton(item: NoteItem?) -> some View {
+        if let editor, !closed {
+            let title = item?.title ?? "Note"
+            ShareLink(
+                item: SharedNote(title: title, textSize: store.core.settings().textSize, editor: editor),
+                subject: Text(title),
+                preview: SharePreview(title)
+            ) {
+                Image(systemName: "square.and.arrow.up")
+            }
+            .accessibilityLabel("Share")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private func bottomBar(deleted: Bool) -> some ToolbarContent {
         ToolbarItemGroup(placement: .bottomBar) {
             if !deleted && !closed {
-                Button {
+                checklistButton
+                Spacer()
+                AttachMenu { kind in
                     bridge.beginEditing()
-                    bridge.command(.toggleChecklist)
-                } label: { Image(systemName: "checklist") }
-                    .accessibilityLabel("Checklist")
+                    bridge.attach(kind)
+                }
                 Spacer()
-                Menu {
-                    TableMenu(formatting: bridge.formatting) { c in
-                        bridge.beginEditing()
-                        bridge.command(c)
-                    }
-                } label: { Image(systemName: "tablecells") }
-                    .accessibilityLabel("Table")
+                tableMenu
                 Spacer()
-                Button {
-                    bridge.beginEditing()
-                    bridge.toggleFormatPanel()
-                } label: { Image(systemName: "textformat") }
-                    .accessibilityLabel("Format")
-                Spacer()
-                Button {
-                    newNote()
-                } label: { Image(systemName: "square.and.pencil") }
-                    .accessibilityLabel("New Note")
+                composeButton
             }
         }
     }
 
-    private func noteMenu(item: NoteItem, deleted: Bool) -> some View {
+    private var checklistButton: some View {
+        Button {
+            bridge.beginEditing()
+            bridge.command(.toggleChecklist)
+        } label: { Image(systemName: "checklist") }
+            .accessibilityLabel("Checklist")
+            .tint(Color.primary)
+    }
+
+    private var tableMenu: some View {
+        Menu {
+            TableMenu(formatting: bridge.formatting) { c in
+                bridge.beginEditing()
+                bridge.command(c)
+            }
+        } label: { Image(systemName: "tablecells") }
+            .accessibilityLabel("Table")
+            .tint(Color.primary)
+    }
+
+    private var composeButton: some View {
+        Button {
+            newNote()
+        } label: { Image(systemName: "square.and.pencil") }
+            .accessibilityLabel("New Note")
+    }
+
+    private func noteMenu(item: NoteItem, deleted: Bool, symbol: String) -> some View {
         Menu {
             if deleted {
                 Button { store.perform { $0.recoverNote(id: noteId) } } label: { Label("Recover", systemImage: "arrow.uturn.backward") }
@@ -210,8 +301,9 @@ struct NoteView: View {
                 Button(role: .destructive) { delete() } label: { Label("Delete", systemImage: "trash") }
             }
         } label: {
-            Image(systemName: "ellipsis.circle")
+            Image(systemName: symbol)
         }
+        .accessibilityLabel("More")
     }
 
     // ---- Opening and leaving ----
