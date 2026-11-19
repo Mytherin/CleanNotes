@@ -122,7 +122,9 @@ fn view_title(view: &View) -> String {
     }
 }
 
-/// The circle with the item's first letter, in a color of its own.
+/// The circle with the item's first letter, in a color of its own (a
+/// note's shows a note, a passkey's — a login with a passkey and no
+/// password — a key).
 fn item_badge(painter: &egui::Painter, center: Pos2, radius: f32, item: &Item) {
     const COLORS: [egui::Color32; 6] = [
         egui::Color32::from_rgb(0x34, 0x8B, 0xF6),
@@ -137,6 +139,8 @@ fn item_badge(painter: &egui::Painter, center: Pos2, radius: f32, item: &Item) {
     painter.circle_filled(center, radius, COLORS[n % COLORS.len()]);
     if item.kind == ItemKind::Note {
         icons::paint(painter, Icon::Notes, Rect::from_center_size(center, Vec2::splat(radius)), egui::Color32::WHITE);
+    } else if !item.passkeys.is_empty() && item.password.is_empty() {
+        icons::paint(painter, Icon::Key, Rect::from_center_size(center, Vec2::splat(radius * 1.1)), egui::Color32::WHITE);
     } else {
         let letter: String = title.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
         painter.text(center, Align2::CENTER_CENTER, letter, theme::bold_font(radius * 0.95), egui::Color32::WHITE);
