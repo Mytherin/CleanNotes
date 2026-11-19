@@ -2279,7 +2279,7 @@ mod passwords_tests {
 
 // ---- Tab notes (browser tabs CleanTabs saved) ----------------------------------
 //
-// A tab note (id `tab-…`, kept under `Tabs/`; see
+// A tab note (id `tab-…`, in CleanTabs' hidden account; see
 // `cleannotes_core::model::tabs`) shows as a preview of its web page: in the
 // list, the page's title, its site in place of the text and its picture; in
 // the gallery, the picture as the card; in the note, a card with the page
@@ -2382,10 +2382,10 @@ mod tab_tests {
         TabNote { title: "Rust *is* great".into(), url: "https://www.example.com/rust".into(), thumbnail: Some(PIC.into()), text: "Read this later.\n\n- point".into() }
     }
 
-    /// A note with this id and Markdown in `Tabs/Reading`: its place.
+    /// A note with this id and Markdown in `Reading`: its place.
     fn add(core: &NotesCore, id: &str, body: &str) -> Place {
         let mut lib = core.lib();
-        let folder = lib.store.ensure_folder_at(LOCAL, &[tabs::FOLDER.to_owned(), "Reading".to_owned()]);
+        let folder = lib.store.ensure_folder_at(LOCAL, &["Reading".to_owned()]);
         let mut n = Note::new(LOCAL, &folder, body);
         n.id = id.to_owned();
         lib.store.notes.push(n);
