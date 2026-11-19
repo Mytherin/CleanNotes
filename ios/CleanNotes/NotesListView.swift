@@ -23,6 +23,12 @@ struct NotesListView: View {
     @State private var collapsed: Set<String> = []
 
     private var deletedView: Bool { place.isDeleted }
+    /// CleanTabs' saved tabs: always a gallery of websites, as on the desktop.
+    private var tabsView: Bool { place.isTabs }
+
+    private func countText(_ n: Int) -> String {
+        tabsView ? tabsCount(n) : notesCount(n)
+    }
 
     var body: some View {
         let _ = store.revision
@@ -31,9 +37,11 @@ struct NotesListView: View {
         let count = sections.reduce(0) { $0 + $1.notes.count }
         let title = store.core.title(place: place, search: "")
         withToolbar(settings: settings, count: count, sections: sections) {
-            if count == 0 && search.isEmpty {
+            if count == 0 && search.isEmpty && tabsView {
+                ContentUnavailableView("No Tabs", systemImage: deletedView ? "trash" : "safari", description: Text(deletedView ? "Tabs you delete stay here for 30 days." : "Tabs you save with CleanTabs show here."))
+            } else if count == 0 && search.isEmpty {
                 ContentUnavailableView("No Notes", systemImage: deletedView ? "trash" : "note.text", description: Text(deletedView ? "Notes you delete stay here for 30 days." : "Tap the compose button to make a note."))
-            } else if settings.gallery && !editMode.isEditing {
+            } else if (settings.gallery || tabsView) && !editMode.isEditing {
                 GalleryView(sections: sections, place: place, path: $path, menu: noteMenu)
             } else {
                 list(sections)
@@ -46,7 +54,7 @@ struct NotesListView: View {
         .refreshable { await store.refresh() }
         .environment(\.editMode, $editMode)
         .sheet(isPresented: Binding(get: { moving != nil }, set: { if !$0 { moving = nil } })) {
-            MoveSheet(ids: moving ?? []) {
+            MoveSheet(ids: moving ?? [], tabs: place.tabsAccount) {
                 moving = nil
                 selection = []
                 editMode = .inactive
@@ -172,9 +180,12 @@ struct NotesListView: View {
             Button { moving = [note.id] } label: { Label("Move", systemImage: "folder") }
             Button(role: .destructive) { delete([note.id]) } label: { Label("Delete", systemImage: "trash") }
         } else {
-            Button {
-                store.perform { $0.togglePin(id: note.id) }
-            } label: { Label(note.pinned ? "Unpin Note" : "Pin Note", systemImage: note.pinned ? "pin.slash" : "pin") }
+            // (Saved tabs are in the order they were saved: none is pinned.)
+            if !tabsView {
+                Button {
+                    store.perform { $0.togglePin(id: note.id) }
+                } label: { Label(note.pinned ? "Unpin Note" : "Pin Note", systemImage: note.pinned ? "pin.slash" : "pin") }
+            }
             if note.locked {
                 Button {
                     store.perform { $0.removeLock(id: note.id) }
@@ -204,7 +215,7 @@ struct NotesListView: View {
     private func withToolbar<Content: View>(settings: AppSettings, count: Int, sections: [NoteSection], @ViewBuilder _ content: () -> Content) -> some View {
         if #available(iOS 26.0, *) {
             Group(content: content)
-                .navigationSubtitle(editMode.isEditing || (count == 0 && search.isEmpty) ? "" : notesCount(count))
+                .navigationSubtitle(editMode.isEditing || (count == 0 && search.isEmpty) ? "" : countText(count))
                 .toolbar { glassToolbar(settings: settings, sections: sections) }
         } else {
             Group(content: content)
@@ -277,7 +288,7 @@ struct NotesListView: View {
         } else {
             ToolbarItemGroup(placement: .bottomBar) {
                 Spacer()
-                Text(notesCount(count))
+                Text(countText(count))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -288,7 +299,7 @@ struct NotesListView: View {
 
     private func viewMenu(_ settings: AppSettings) -> some View {
         Menu {
-            if !deletedView {
+            if !deletedView && !tabsView {
                 Picker("View", selection: Binding(
                     get: { settings.gallery },
                     set: { g in update(settings) { $0.gallery = g } }
@@ -299,7 +310,20 @@ struct NotesListView: View {
             }
             Button {
                 editMode = .active
-            } label: { Label("Select Notes", systemImage: "checkmark.circle") }
+            } label: { Label(tabsView ? "Select Tabs" : "Select Notes", systemImage: "checkmark.circle") }
+            // (Saved tabs are listed by collection, in the order saved.)
+            if !tabsView { sortMenu(settings) }
+        } label: {
+            if #available(iOS 26.0, *) {
+                Image(systemName: "ellipsis")
+            } else {
+                Image(systemName: "ellipsis.circle")
+            }
+        }
+        .accessibilityLabel("More")
+    }
+
+    private func sortMenu(_ settings: AppSettings) -> some View {
             Menu {
                 Picker("Sort By", selection: Binding(
                     get: { settings.sortBy },
@@ -316,14 +340,6 @@ struct NotesListView: View {
             } label: {
                 Label("Sort By", systemImage: "arrow.up.arrow.down")
             }
-        } label: {
-            if #available(iOS 26.0, *) {
-                Image(systemName: "ellipsis")
-            } else {
-                Image(systemName: "ellipsis.circle")
-            }
-        }
-        .accessibilityLabel("More")
     }
 
     private func update(_ settings: AppSettings, _ change: (inout AppSettings) -> Void) {

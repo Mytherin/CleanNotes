@@ -282,24 +282,22 @@ struct ChangePasswordView: View {
 struct MoveSheet: View {
     @EnvironmentObject private var store: NotesStore
     let ids: [String]
+    /// Saved tabs' tabs account: they move between CleanTabs' folders only.
+    var tabs: String? = nil
     let done: () -> Void
 
     var body: some View {
         let overview = store.core.overview()
         NavigationStack {
             List {
-                ForEach(overview.accounts) { account in
-                    Section(account.name) {
-                        ForEach(account.folders) { f in
-                            Button {
-                                store.saveEditor()
-                                store.perform { $0.moveNotes(ids: ids, folder: f.id) }
-                                done()
-                            } label: {
-                                Label(f.name, systemImage: "folder")
-                                    .padding(.leading, CGFloat(f.depth) * 18)
-                            }
-                            .foregroundStyle(.primary)
+                if let tabs, let t = overview.tabs.first(where: { $0.id == tabs }) {
+                    Section("CleanTabs") {
+                        ForEach(t.folders) { f in folderButton(f) }
+                    }
+                } else {
+                    ForEach(overview.accounts) { account in
+                        Section(account.name) {
+                            ForEach(account.folders) { f in folderButton(f) }
                         }
                     }
                 }
@@ -310,5 +308,17 @@ struct MoveSheet: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { done() } }
             }
         }
+    }
+
+    private func folderButton(_ f: FolderItem) -> some View {
+        Button {
+            store.saveEditor()
+            store.perform { $0.moveNotes(ids: ids, folder: f.id) }
+            done()
+        } label: {
+            Label(f.name, systemImage: "folder")
+                .padding(.leading, CGFloat(f.depth) * 18)
+        }
+        .foregroundStyle(.primary)
     }
 }

@@ -40,10 +40,25 @@ extension UIColor {
 }
 
 extension Place {
+    /// An account's Recently Deleted, or CleanTabs'.
     var isDeleted: Bool {
-        if case .deleted = self { return true }
-        return false
+        switch self {
+        case .deleted, .tabsDeleted: return true
+        default: return false
+        }
     }
+
+    /// CleanTabs' tabs account, in its section (All Tabs, a folder of tabs,
+    /// its Recently Deleted).
+    var tabsAccount: String? {
+        switch self {
+        case let .tabs(account, _): return account
+        case let .tabsDeleted(account): return account
+        default: return nil
+        }
+    }
+
+    var isTabs: Bool { tabsAccount != nil }
 
     var folderId: String? {
         if case let .folder(id) = self { return id }

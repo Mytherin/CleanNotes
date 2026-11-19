@@ -172,6 +172,8 @@ struct FoldersView: View {
             }
             // CleanPassword's vault, when an S3 account's bucket holds one.
             PasswordsSection(collapsed: $collapsed)
+            // CleanTabs' saved tabs, when an S3 account's folder has them.
+            TabsSection(tabs: overview.tabs, showCount: overview.showNoteCount, collapsed: $collapsed)
             if !overview.smartFolders.isEmpty {
                 Section("Smart Folders") {
                     ForEach(overview.smartFolders) { s in

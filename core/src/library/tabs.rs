@@ -8,7 +8,7 @@
 //! Tabs, its folders, its Recently Deleted), not in All Notes, search,
 //! tags or counts ([`Library::account_enabled`] is false for it).
 //!
-//! Desktop only for now: [`Library::find_tabs`] turns the looking on.
+//! The desktop and the iPhone app turn the looking on ([`Library::find_tabs`]).
 
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 

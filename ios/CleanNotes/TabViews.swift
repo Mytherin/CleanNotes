@@ -214,3 +214,47 @@ final class TabCardView: UIView {
         separator.frame = CGRect(x: 0, y: y, width: w, height: 1 / max(1, traitCollection.displayScale))
     }
 }
+
+/// CleanTabs' section on the Folders screen (like CleanPassword's, but not
+/// locked): an S3 account's saved tabs, synced as a hidden account of their
+/// own, with All Tabs, their folders (CleanTabs' collections) and Recently
+/// Deleted, each shown as a gallery of websites.
+struct TabsSection: View {
+    let tabs: [TabsItem]
+    let showCount: Bool
+    /// The Folders screen's folded sections ("#cleantabs:<id>" for these).
+    @Binding var collapsed: Set<String>
+
+    var body: some View {
+        ForEach(tabs, id: \.id) { t in
+            let key = "#cleantabs:\(t.id)"
+            Section(isExpanded: Binding(
+                get: { !collapsed.contains(key) },
+                set: { open in if open { collapsed.remove(key) } else { collapsed.insert(key) } }
+            )) {
+                NavigationLink(value: Route.list(.tabs(account: t.id, folder: nil))) {
+                    FolderRow(name: "All Tabs", icon: "safari", count: showCount ? Int(t.allCount) : nil)
+                }
+                ForEach(t.folders) { f in
+                    NavigationLink(value: Route.list(.tabs(account: t.id, folder: f.id))) {
+                        FolderRow(name: f.name, icon: "folder", count: showCount ? Int(f.count) : nil)
+                            .padding(.leading, CGFloat(f.depth) * 18)
+                    }
+                }
+                if t.deletedCount > 0 {
+                    NavigationLink(value: Route.list(.tabsDeleted(account: t.id))) {
+                        FolderRow(name: "Recently Deleted", icon: "trash", count: showCount ? Int(t.deletedCount) : nil)
+                    }
+                }
+            } header: {
+                // With more than one S3 account's tabs, whose these are.
+                Text(tabs.count > 1 ? "CleanTabs (\(t.accountName))" : "CleanTabs")
+            }
+        }
+    }
+}
+
+/// "1 Tab", "12 Tabs".
+func tabsCount(_ n: Int) -> String {
+    n == 1 ? "1 Tab" : "\(n) Tabs"
+}

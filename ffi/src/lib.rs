@@ -68,6 +68,11 @@ pub enum Place {
     Tag { name: String },
     /// A Smart Folder.
     Smart { id: String },
+    /// CleanTabs' saved tabs (a tabs account's id): a folder of them (with
+    /// those in its folders), or All Tabs when `folder` is `None`.
+    Tabs { account: String, folder: Option<String> },
+    /// CleanTabs' Recently Deleted.
+    TabsDeleted { account: String },
 }
 
 impl From<&Place> for Location {
@@ -78,6 +83,8 @@ impl From<&Place> for Location {
             Place::Deleted { account } => Location::Deleted(account.clone()),
             Place::Tag { name } => Location::Tag(name.clone()),
             Place::Smart { id } => Location::Smart(id.clone()),
+            Place::Tabs { account, folder } => Location::Tabs(account.clone(), folder.clone()),
+            Place::TabsDeleted { account } => Location::TabsDeleted(account.clone()),
         }
     }
 }
@@ -90,8 +97,8 @@ impl From<Location> for Place {
             Location::Deleted(account) => Place::Deleted { account },
             Location::Tag(name) => Place::Tag { name },
             Location::Smart(id) => Place::Smart { id },
-            // (CleanTabs isn't on the iPhone yet.)
-            Location::Tabs(..) | Location::TabsDeleted(_) => Place::AllNotes,
+            Location::Tabs(account, folder) => Place::Tabs { account, folder },
+            Location::TabsDeleted(account) => Place::TabsDeleted { account },
         }
     }
 }
@@ -297,6 +304,23 @@ pub struct Overview {
     pub show_note_count: bool,
     /// Smart Folders, with their note counts.
     pub smart_folders: Vec<SmartFolderItem>,
+    /// CleanTabs' sections: an S3 account's saved tabs each, when its
+    /// folder has them.
+    pub tabs: Vec<TabsItem>,
+}
+
+/// CleanTabs' section for an S3 account's saved tabs (a hidden account of
+/// their own): All Tabs, their folders, Recently Deleted.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TabsItem {
+    /// The tabs account's id, for [`Place::Tabs`].
+    pub id: String,
+    /// The S3 account's name.
+    pub account_name: String,
+    pub all_count: u32,
+    pub deleted_count: u32,
+    /// Its folders (CleanTabs' collections), depth first.
+    pub folders: Vec<FolderItem>,
 }
 
 /// A note for the system's search (Spotlight). A locked note's text and
@@ -452,6 +476,8 @@ impl NotesCore {
         if seed && lib.store.notes.is_empty() {
             lib.seed();
         }
+        // CleanTabs' saved tabs, in the S3 accounts' folders.
+        lib.find_tabs = true;
         Ok(Arc::new(NotesCore { lib: Mutex::new(lib) }))
     }
 
@@ -529,7 +555,7 @@ impl NotesCore {
             .store
             .accounts
             .iter()
-            .filter(|a| a.enabled)
+            .filter(|a| lib.account_enabled(&a.id))
             .map(|a| {
                 let folders = lib
                     .store
@@ -575,7 +601,32 @@ impl NotesCore {
                 filter: s.filter.clone().into(),
             })
             .collect();
+        let tabs = lib
+            .tabs_accounts()
+            .into_iter()
+            .map(|(id, account_name)| {
+                let (counts, all, deleted) = lib.tab_counts(&id);
+                let folders = lib
+                    .tab_folders(&id)
+                    .into_iter()
+                    .map(|(fid, name, depth)| {
+                        let f = lib.store.folder(&fid);
+                        FolderItem {
+                            count: counts.get(&fid).copied().unwrap_or(0) as u32,
+                            parent: f.and_then(|f| f.parent.clone()),
+                            is_default: f.is_some_and(|f| f.default),
+                            has_children: lib.store.folders.iter().any(|c| c.parent.as_deref() == Some(fid.as_str())),
+                            id: fid,
+                            name,
+                            depth: depth as u32,
+                        }
+                    })
+                    .collect();
+                TabsItem { id, account_name, all_count: all as u32, deleted_count: deleted as u32, folders }
+            })
+            .collect();
         Overview {
+            tabs,
             show_all_notes: lib.show_all_notes(),
             all_count: lib.all_count() as u32,
             accounts,
@@ -1818,7 +1869,7 @@ impl PasswordsCore {
             .store
             .accounts
             .iter()
-            .filter(|a| a.enabled)
+            .filter(|a| lib.account_enabled(&a.id))
             .filter_map(|a| match &a.backend {
                 BackendConfig::S3(c) => Some((a.id.clone(), c.clone())),
                 _ => None,
@@ -2398,6 +2449,57 @@ mod tab_tests {
 
     fn row(core: &NotesCore, place: &Place, id: &str) -> NoteItem {
         core.sections(place.clone(), String::new()).into_iter().flat_map(|s| s.notes).find(|n| n.id == id).unwrap()
+    }
+
+    #[test]
+    fn cleantabs_has_a_section_of_its_own_on_the_folders_screen() {
+        use cleannotes_core::model::{self, Account};
+        let (core, _dir) = core();
+        let tabs = {
+            let mut lib = core.lib();
+            let config = s3::Config { bucket: "b".into(), region: "eu-west-1".into(), prefix: "CleanNotes".into(), endpoint: None, encrypted: false };
+            lib.store.accounts.push(Account {
+                id: "work".into(),
+                name: "Work".into(),
+                backend: BackendConfig::S3(config),
+                enabled: true,
+                cursor: None,
+                last_sync: None,
+                tabs_of: None,
+            });
+            lib.store.ensure_local();
+            assert!(lib.set_tabs_found("work", true));
+            let tabs = model::tabs_account_id("work");
+            let research = lib.store.ensure_folder_at(&tabs, &["Research".to_owned()]);
+            for (i, title) in ["Rust book", "Rust docs"].iter().enumerate() {
+                let body = TabNote { title: (*title).into(), url: format!("https://example.com/{i}"), thumbnail: None, text: String::new() }.to_markdown();
+                let mut n = Note::new(&tabs, &research, &body);
+                n.id = format!("tab-{i}");
+                lib.store.notes.push(n);
+            }
+            tabs
+        };
+        let o = core.overview();
+        // Not an account of notes, but CleanTabs' section, named for its S3 account.
+        assert!(o.accounts.iter().all(|a| a.id != tabs));
+        assert_eq!(o.tabs.len(), 1);
+        let t = &o.tabs[0];
+        assert_eq!((t.id.as_str(), t.account_name.as_str(), t.all_count, t.deleted_count), (tabs.as_str(), "Work", 2, 0));
+        assert_eq!(t.folders.iter().map(|f| (f.name.as_str(), f.count)).collect::<Vec<_>>(), [("Research", 2)]);
+
+        let all = Place::Tabs { account: tabs.clone(), folder: None };
+        assert_eq!(core.title(all.clone(), String::new()), "All Tabs");
+        let shown: Vec<_> = core.sections(all.clone(), String::new()).into_iter().flat_map(|s| s.notes).collect();
+        assert_eq!(shown.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(), ["Rust book", "Rust docs"]);
+        assert!(shown.iter().all(|n| n.tab.is_some()));
+        assert!(core.place_exists(all.clone()));
+
+        // Deleted, it's in CleanTabs' Recently Deleted.
+        core.trash_notes(vec!["tab-0".into()], all.clone());
+        assert_eq!(core.overview().tabs[0].deleted_count, 1);
+        let deleted = Place::TabsDeleted { account: tabs.clone() };
+        let ids: Vec<_> = core.sections(deleted, String::new()).into_iter().flat_map(|s| s.notes).map(|n| n.id).collect();
+        assert_eq!(ids, ["tab-0"]);
     }
 
     #[test]
