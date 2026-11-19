@@ -338,7 +338,8 @@ private struct SectionHeader: View {
 }
 
 /// A note in the list: its title, then its time and first line, and its
-/// folder when the list mixes folders.
+/// folder when the list mixes folders. A tab note shows its page's title,
+/// its site in place of the first line, and its picture on the right.
 struct NoteRow: View {
     let note: NoteItem
 
@@ -352,45 +353,72 @@ struct NoteRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 4) {
-                NoteRow.text(note.title, parts: note.titleParts)
-                    .font(.headline)
-                    .lineLimit(1)
-                if note.locked {
-                    Image(systemName: "lock.fill")
-                        .font(.caption)
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 4) {
+                    NoteRow.text(note.title, parts: note.titleParts)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if note.locked {
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                HStack(spacing: 6) {
+                    Text(note.time)
+                        .foregroundStyle(.primary)
+                    NoteRow.text(note.snippet, parts: note.snippetParts)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .font(.subheadline)
+                if let folder = note.folder {
+                    Label(folder, systemImage: "folder")
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
             }
-            HStack(spacing: 6) {
-                Text(note.time)
-                    .foregroundStyle(.primary)
-                NoteRow.text(note.snippet, parts: note.snippetParts)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .font(.subheadline)
-            if let folder = note.folder {
-                Label(folder, systemImage: "folder")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
+            // A tab note's picture.
+            if let tab = note.tab, tab.thumbnail != nil {
+                Spacer(minLength: 0)
+                TabPicture(page: tab, cornerRadius: 6, compact: true)
+                    .frame(width: 44, height: 44)
             }
         }
         .padding(.vertical, 2)
     }
 }
 
-/// The note's text, for the touch-and-hold preview.
+/// The note's text, for the touch-and-hold preview (a tab note's page above
+/// it).
 struct NotePreview: View {
     @EnvironmentObject private var store: NotesStore
     let id: String
 
     var body: some View {
         let closed = store.core.isClosed(id: id)
-        let text = closed ? nil : store.core.openEditor(id: id).map { NoteTextRenderer.attributed($0.state().paragraphs, textSize: store.core.settings().textSize) }
+        let editor = closed ? nil : store.core.openEditor(id: id)
+        let text = editor.map { NoteTextRenderer.attributed($0.state().paragraphs, textSize: store.core.settings().textSize) }
+        let tab = editor?.tabPage()
         Group {
-            if let text {
+            if let text, let tab {
+                VStack(alignment: .leading, spacing: 0) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        TabPicture(page: tab)
+                            .frame(height: 160)
+                        Text(tab.title)
+                            .font(.headline)
+                            .lineLimit(2)
+                        Label(tab.shortUrl, systemImage: "link")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    .padding([.horizontal, .top], 16)
+                    AttributedTextPreview(text: text)
+                }
+            } else if let text {
                 AttributedTextPreview(text: text)
             } else {
                 VStack(spacing: 12) {
@@ -454,6 +482,11 @@ private struct GalleryCard: View {
                         .font(.title)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let tab = note.tab {
+                    // A tab note: its page's picture (or site) is the card.
+                    TabPicture(page: tab)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color(.separator), lineWidth: 0.5))
                 } else {
                     Text(note.empty ? note.title : "\(note.title)\n\(note.snippet)")
                         .font(.system(size: 9))

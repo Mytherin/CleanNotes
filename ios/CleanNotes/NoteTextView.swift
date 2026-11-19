@@ -708,12 +708,68 @@ final class NoteTextView: UITextView {
     override func layoutSubviews() {
         super.layoutSubviews()
         dateLabel.frame = CGRect(x: 0, y: 6, width: bounds.width, height: 18)
+        layoutCard()
         // Pictures fit the text's width: shown again when it changes (the
         // first layout, turning the phone).
         if abs(bounds.width - laidOutWidth) > 0.5 {
             laidOutWidth = bounds.width
             coordinator?.widthChanged()
         }
+    }
+
+    // ---- A tab note's page ----
+
+    /// A tab note's page as a card between the date and the text, so it
+    /// scrolls with the text (see TabViews.swift).
+    private(set) var card: TabCardView?
+    /// Where the text starts without the card.
+    private var plainTop: CGFloat?
+
+    /// Shows a tab note's page above the text, or takes the card away.
+    func showTabPage(_ page: TabPage?) {
+        if let page {
+            if card == nil {
+                let c = TabCardView()
+                addSubview(c)
+                card = c
+                plainTop = textContainerInset.top
+            }
+            card?.page = page
+        } else if let c = card {
+            c.removeFromSuperview()
+            card = nil
+            if let top = plainTop { textContainerInset.top = top }
+            plainTop = nil
+        }
+        setNeedsLayout()
+    }
+
+    /// The card in the text's column, and the text below it.
+    private func layoutCard() {
+        guard let card, let plainTop else { return }
+        let x = textContainerInset.left + textContainer.lineFragmentPadding
+        let w = max(0, bounds.width - x - textContainerInset.right - textContainer.lineFragmentPadding)
+        let h = card.height(for: w)
+        card.frame = CGRect(x: x, y: plainTop - 4, width: w, height: h)
+        let top = card.frame.maxY + 14
+        if abs(textContainerInset.top - top) > 0.5 {
+            textContainerInset.top = top
+        }
+    }
+
+    /// Touches on the card are the card's: they don't put the caret in the
+    /// text or select it (dragging there still scrolls).
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        if let card, !(gestureRecognizer is UIPanGestureRecognizer), card.frame.contains(gestureRecognizer.location(in: self)) {
+            return false
+        }
+        return super.gestureRecognizerShouldBegin(gestureRecognizer)
+    }
+
+    /// Dragging that starts on the card's button scrolls too.
+    override func touchesShouldCancel(in view: UIView) -> Bool {
+        if let card, view.isDescendant(of: card) { return true }
+        return super.touchesShouldCancel(in: view)
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
@@ -1027,6 +1083,8 @@ struct NoteEditorView: UIViewRepresentable {
             guard let tv = textView else { return }
             let state = editor.state()
             rendering = true
+            // A tab note: its page above the text (the editor has the text).
+            tv.showTabPage(editor.tabPage())
             tv.notesLayout.textSize = textSize
             let text = NoteTextRenderer.attributed(state.paragraphs, textSize: textSize, images: imageLayout())
             tv.storage.beginEditing()

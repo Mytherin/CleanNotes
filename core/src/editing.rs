@@ -11,6 +11,7 @@
 
 use crate::doc::{Attr, Block, Doc, Kind, Pos, Selection, Style};
 use crate::markdown;
+use crate::model::tabs::TabNote;
 
 /// Things the editor can be asked to do (from the Format menu, toolbar,
 /// shortcuts or the right-click menu).
@@ -907,9 +908,103 @@ pub fn normalize_url(u: &str) -> String {
     }
 }
 
+// ---- Tab notes ----
+//
+// A tab note (a browser tab CleanTabs saved; see `model::tabs`) is shown as
+// a card with its page above what's written about it. Its editor holds only
+// that text: the page is kept apart, and put back on top whenever the
+// note's Markdown is made, so the note keeps the tab note's format. Both
+// apps' editors do this the same way, through these.
+
+/// A tab note as its editor holds it: the page (with no text) and the
+/// Markdown of the text below it. `None` if it isn't a tab note.
+pub fn split_tab(note_id: &str, md: &str) -> Option<(TabNote, String)> {
+    let mut tab = crate::model::tab_of(note_id, md)?;
+    let text = std::mem::take(&mut tab.text);
+    let text = if text.is_empty() { text } else { text + "\n" };
+    Some((tab, text))
+}
+
+/// A note's Markdown from what its editor holds ([`split_tab`] undone): a
+/// tab note's page with the text's Markdown below it, or just the text's.
+pub fn join_tab(tab: Option<&TabNote>, text: String) -> String {
+    match tab {
+        Some(t) => TabNote { text, ..t.clone() }.to_markdown(),
+        None => text,
+    }
+}
+
+impl Editing {
+    /// The editor for a note, and a tab note's page: its editor has only the
+    /// text below the page.
+    pub fn for_note(note_id: &str, md: &str) -> (Editing, Option<TabNote>) {
+        match split_tab(note_id, md) {
+            Some((tab, text)) => (Editing::new(note_id, &text), Some(tab)),
+            None => (Editing::new(note_id, md), None),
+        }
+    }
+
+    /// [`Editing::reload`] for an editor made by [`Editing::for_note`],
+    /// with its page `tab`. Returns whether anything shown changed (the
+    /// page too).
+    pub fn reload_with_tab(&mut self, tab: &mut Option<TabNote>, md: &str) -> bool {
+        match split_tab(&self.note_id, md) {
+            Some((page, text)) => {
+                let card = tab.as_ref() != Some(&page);
+                *tab = Some(page);
+                self.reload(&text) | card
+            }
+            None => {
+                let was_tab = tab.take().is_some();
+                self.reload(md) | was_tab
+            }
+        }
+    }
+
+    /// [`Editing::set_markdown`] for an editor made by
+    /// [`Editing::for_note`]: `md` is the whole note, page and text.
+    pub fn set_markdown_with_tab(&mut self, tab: &mut Option<TabNote>, md: &str) {
+        match split_tab(&self.note_id, md) {
+            Some((page, text)) => {
+                *tab = Some(page);
+                self.set_markdown(&text);
+            }
+            None => {
+                *tab = None;
+                self.set_markdown(md);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tab_notes_editor_has_only_its_text_and_puts_the_page_back() {
+        let md = "# Rust \\*is\\* great\n\n[example.com/rust](https://www.example.com/rust)\n\nRead this later.\n";
+        let (mut e, mut tab) = Editing::for_note("tab-1", md);
+        assert_eq!(tab.as_ref().map(|t| t.title.as_str()), Some("Rust *is* great"));
+        assert_eq!(e.doc.plain_text(), "Read this later.");
+        assert_eq!(join_tab(tab.as_ref(), e.markdown_seen.clone()), md, "nothing lost");
+        e.set_selection(Pos::new(0, 0), Pos::new(0, 0));
+        e.replace_range(Pos::new(0, 0), Pos::new(0, 0), "Really. ");
+        let saved = join_tab(tab.as_ref(), e.take_markdown().unwrap());
+        assert_eq!(saved, md.replace("Read this", "Really. Read this"));
+        // The page changed elsewhere: shown.
+        assert!(e.reload_with_tab(&mut tab, &saved.replace("Rust", "Go")));
+        assert_eq!(tab.as_ref().unwrap().title, "Go *is* great");
+        assert!(!e.reload_with_tab(&mut tab, &saved.replace("Rust", "Go")));
+        // No longer a tab note (written by hand): the whole note is text.
+        e.set_markdown_with_tab(&mut tab, "# Plain\nnote\n");
+        assert!(tab.is_none());
+        assert_eq!(e.doc.plain_text(), "Plain\nnote");
+        // Other notes, even shaped like one, are edited whole.
+        let (e, tab) = Editing::for_note("6f1c", md);
+        assert!(tab.is_none());
+        assert_eq!(e.doc.blocks[0].text, "Rust *is* great");
+    }
 
     #[test]
     fn markdown_edited_by_hand_is_kept_as_written_and_can_be_undone() {

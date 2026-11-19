@@ -19,6 +19,7 @@ use crate::menu;
 use crate::theme::{self, Palette};
 pub use cleannotes_core::editing::{Command, Editing};
 use crate::model::tabs::TabNote;
+use cleannotes_core::editing::join_tab;
 
 pub mod images;
 pub mod layout;
@@ -147,14 +148,6 @@ pub struct Editor {
     pub tab: Option<TabNote>,
 }
 
-/// A tab note: its page (with no text) and the Markdown of its text.
-fn split_tab(note_id: &str, md: &str) -> Option<(TabNote, String)> {
-    let mut tab = crate::model::tab_of(note_id, md)?;
-    let text = std::mem::take(&mut tab.text);
-    let text = if text.is_empty() { text } else { text + "\n" };
-    Some((tab, text))
-}
-
 /// Clicks closer together than this make a double- or triple-click (macOS's
 /// default).
 const DOUBLE_CLICK_SECS: f64 = 0.5;
@@ -181,16 +174,12 @@ impl DerefMut for Editor {
 
 impl Editor {
     /// The editor for a note. A tab note's page goes to [`Editor::tab`] and
-    /// only the text below it is edited.
+    /// only the text below it is edited (see [`Editing::for_note`]).
     pub fn new(note_id: &str, md: &str) -> Editor {
-        match split_tab(note_id, md) {
-            Some((tab, text)) => {
-                let mut e = Editor::wrap(Editing::new(note_id, &text));
-                e.tab = Some(tab);
-                e
-            }
-            None => Editor::wrap(Editing::new(note_id, md)),
-        }
+        let (ed, tab) = Editing::for_note(note_id, md);
+        let mut e = Editor::wrap(ed);
+        e.tab = tab;
+        e
     }
 
     /// The note's Markdown, if changed since last asked (see
@@ -209,40 +198,18 @@ impl Editor {
     /// The note changed elsewhere (see [`Editing::reload`]). Whether
     /// anything shown changed.
     pub fn reload(&mut self, md: &str) -> bool {
-        match split_tab(&self.ed.note_id, md) {
-            Some((tab, text)) => {
-                let card = self.tab.as_ref() != Some(&tab);
-                self.tab = Some(tab);
-                self.ed.reload(&text) | card
-            }
-            None => {
-                let was_tab = self.tab.take().is_some();
-                self.ed.reload(md) | was_tab
-            }
-        }
+        self.ed.reload_with_tab(&mut self.tab, md)
     }
 
     /// The note's Markdown was edited by hand (see
     /// [`Editing::set_markdown`]).
     pub fn set_markdown(&mut self, md: &str) {
-        match split_tab(&self.ed.note_id, md) {
-            Some((tab, text)) => {
-                self.tab = Some(tab);
-                self.ed.set_markdown(&text);
-            }
-            None => {
-                self.tab = None;
-                self.ed.set_markdown(md);
-            }
-        }
+        self.ed.set_markdown_with_tab(&mut self.tab, md);
     }
 
     /// The text's Markdown with a tab note's page above it.
     fn with_tab(&self, text: String) -> String {
-        match &self.tab {
-            Some(t) => TabNote { text, ..t.clone() }.to_markdown(),
-            None => text,
-        }
+        join_tab(self.tab.as_ref(), text)
     }
 
     /// A new note: its Markdown from the library (empty, or a tag), the
