@@ -253,6 +253,12 @@ impl<'a, T: Transport> Client<'a, T> {
 
     /// An object in the folder, `None` if there's none.
     pub async fn get(&self, name: &str) -> Result<Option<Object>> {
+        Ok(self.get_dated(name).await?.map(|(o, _)| o))
+    }
+
+    /// [`Client::get`], with when the object was last modified (its
+    /// `Last-Modified`, if S3 sent one that reads).
+    pub async fn get_dated(&self, name: &str) -> Result<Option<(Object, Option<DateTime<Utc>>)>> {
         let r = self.send("GET", &self.key(name), &[], Vec::new(), &[]).await?;
         if r.status == 404 && error_code(&r) != "NoSuchBucket" {
             return Ok(None);
@@ -261,7 +267,11 @@ impl<'a, T: Transport> Client<'a, T> {
             return Err(r.error().into());
         }
         let etag = r.header("etag").ok_or_else(|| Error::invalid("S3 sent no ETag"))?.to_owned();
-        Ok(Some(Object { data: r.body, etag }))
+        let modified = r
+            .header("last-modified")
+            .and_then(|s| DateTime::parse_from_rfc2822(s).or_else(|_| DateTime::parse_from_rfc3339(s)).ok())
+            .map(|t| t.with_timezone(&Utc));
+        Ok(Some((Object { data: r.body, etag }, modified)))
     }
 
     /// An object's ETag, without its contents; `None` if there's none.
@@ -277,7 +287,12 @@ impl<'a, T: Transport> Client<'a, T> {
     }
 
     pub async fn put(&self, name: &str, data: Vec<u8>, cond: Cond<'_>) -> Result<Put> {
-        let mut extra = vec![("content-type", "application/octet-stream".to_owned())];
+        self.put_as(name, data, cond, "application/octet-stream").await
+    }
+
+    /// [`Client::put`] with the object's `Content-Type`.
+    pub async fn put_as(&self, name: &str, data: Vec<u8>, cond: Cond<'_>, content_type: &str) -> Result<Put> {
+        let mut extra = vec![("content-type", content_type.to_owned())];
         match cond {
             Cond::Match(e) => extra.push(("if-match", e.to_owned())),
             Cond::Absent => extra.push(("if-none-match", "*".to_owned())),
@@ -531,6 +546,9 @@ mod tests {
         assert_eq!(block_on(c.put("items/a", b"2".to_vec(), Cond::Match("\"other\""))).unwrap(), Put::Conflict);
         assert!(matches!(block_on(c.put("items/a", b"2".to_vec(), Cond::Match(&etag))).unwrap(), Put::Stored { .. }));
         assert_eq!(block_on(c.get("items/a")).unwrap().unwrap().data, b"2");
+        assert!(matches!(block_on(c.put_as("items/b", b"3".to_vec(), Cond::Absent, "text/plain")).unwrap(), Put::Stored { .. }));
+        assert_eq!(block_on(c.get_dated("items/b")).unwrap().unwrap().0.data, b"3");
+        block_on(c.delete("items/b")).unwrap();
         assert!(s3.objects.borrow().contains_key("My Folder/items/a"));
         for i in 0..5 {
             block_on(c.put(&format!("items/{i}"), vec![], Cond::Absent)).unwrap();

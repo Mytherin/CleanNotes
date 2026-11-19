@@ -28,8 +28,12 @@
 //!   several at once. Notes and folders still at the ETag this device last
 //!   synced them at aren't downloaded at all ([`Backend::known`]: the saved
 //!   store has them), so a newly started app fetches only what changed.
-//! - Requests are signed with AWS Signature V4 ([`sigv4`]). The access key
-//!   is kept in the OS credential store.
+//! - Requests go through the S3 client shared with CleanPassword
+//!   ([`cleanbucket::s3::Client`]), signed with AWS Signature V4. The access
+//!   key is kept in the OS credential store.
+//!
+//! Inside the backend, objects are named relative to the folder (`head`,
+//! `notes/<id>.md`, …), as the shared client names them.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -39,7 +43,8 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use cleanbucket::s3::{decode, xml_tag, xml_tags, Client, Credentials, HttpRequest, HttpResponse, Location, Transport};
+use cleanbucket::block_on;
+use cleanbucket::s3::{Client, Cond, Credentials, HttpRequest, HttpResponse, Listed, Location, Put, Transport};
 
 use super::{Backend, Conflict, NeedsSignIn, NoteData, RemoteFolder, RemoteNote, Snapshot};
 
@@ -61,6 +66,8 @@ const PARALLEL: usize = 16;
 const TOMBSTONE_DAYS: i64 = 30;
 /// Everything is listed at least this often (seconds).
 const FULL_LIST_EVERY: i64 = 15 * 60;
+const MARKDOWN: &str = "text/markdown; charset=utf-8";
+const HEAD: &str = "head";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -79,16 +86,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// The key prefix: the folder with a trailing `/`, or nothing.
-    fn root(&self) -> String {
-        let p = self.prefix.trim().trim_matches('/');
-        if p.is_empty() {
-            String::new()
-        } else {
-            format!("{p}/")
-        }
-    }
-
     /// The bucket and folder, for the shared S3 client.
     fn location(&self) -> Location {
         Location { bucket: self.bucket.clone(), region: self.region.clone(), prefix: self.prefix.clone(), endpoint: self.endpoint.clone() }
@@ -111,36 +108,14 @@ impl Keys {
     }
 }
 
-struct Resp {
-    status: u16,
-    etag: Option<String>,
-    last_modified: Option<String>,
-    /// `x-amz-bucket-region`.
-    region: Option<String>,
-    /// The reply as text (listings, notes, errors).
-    body: String,
-    /// The reply as it came (attachments).
-    data: Vec<u8>,
-}
-
-impl Resp {
-    fn ok(&self) -> bool {
-        (200..300).contains(&self.status)
-    }
-
-    /// Refused because of `If-Match` / `If-None-Match` (or a concurrent
-    /// conditional write), or the object to update is gone.
-    fn conflict(&self) -> bool {
-        matches!(self.status, 404 | 409 | 412)
-    }
-
-    fn error(&self) -> anyhow::Error {
-        let code = xml_tag(&self.body, "Code").map(decode).unwrap_or_default();
-        if matches!(code.as_str(), "InvalidAccessKeyId" | "SignatureDoesNotMatch" | "InvalidToken" | "ExpiredToken") {
-            return NeedsSignIn(format!("S3 refused the access key ({code})")).into();
-        }
-        let region = self.region.clone().or_else(|| xml_tag(&self.body, "Region").map(decode)).filter(|r| !r.is_empty());
-        S3Error { status: self.status, code, message: xml_tag(&self.body, "Message").map(decode).unwrap_or_default(), region }.into()
+/// The shared client's errors as the app reads them: a refused access key
+/// asks to sign in again, and S3's other errors stay [`S3Error`]s (which
+/// callers look for).
+fn fail(e: cleanbucket::Error) -> anyhow::Error {
+    match e {
+        cleanbucket::Error::S3(s) if s.is_auth() => NeedsSignIn(format!("S3 refused the access key ({})", s.code)).into(),
+        cleanbucket::Error::S3(s) => s.into(),
+        e => anyhow::Error::new(e),
     }
 }
 
@@ -188,23 +163,12 @@ impl Transport for Blocking {
     }
 }
 
-fn http_date(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc2822(s).or_else(|_| DateTime::parse_from_rfc3339(s)).ok().map(|t| t.with_timezone(&Utc))
-}
-
-/// Whether a key (relative to the folder) is a note or folder of ours.
-/// Keys with `.` or `..` segments are left alone: a URL can't carry them
-/// as they are (they'd be collapsed, and the signature then fails).
+/// Whether an object (named relative to the folder) is a note or folder of
+/// ours. Names with `.` or `..` segments are left alone: a URL can't carry
+/// them as they are (they'd be collapsed, and the signature then fails).
 fn ours(rel: &str) -> bool {
     let kind = (rel.starts_with("notes/") && rel.ends_with(".md")) || (rel.starts_with("folders/") && rel.ends_with(".json"));
     kind && !rel.split('/').any(|s| s == "." || s == "..")
-}
-
-/// A listed object.
-struct Listed {
-    key: String,
-    etag: String,
-    modified: DateTime<Utc>,
 }
 
 /// What an object was found to hold, by ETag.
@@ -216,26 +180,21 @@ enum Cached {
     Unreadable,
 }
 
-/// A conditional write.
-enum Cond<'a> {
-    None,
-    Match(&'a str),
-    Absent,
-}
+/// An object's text, ETag and when it was last modified.
+type Fetched = (String, String, Option<DateTime<Utc>>);
 
 pub struct S3Backend {
     http: Blocking,
-    config: Config,
     /// The bucket and folder, and the access key, for the shared client.
     location: Location,
     credentials: Credentials,
     /// The encryption key, if the folder is encrypted.
     key: Option<[u8; 32]>,
-    /// Objects as last downloaded: key → (ETag, contents).
+    /// Objects as last downloaded: name → (ETag, contents).
     cache: HashMap<String, (String, Cached)>,
     /// Written since `head` was last rewritten (see [`Self::mark_changed`]).
     pending_touch: bool,
-    /// The attachment objects (keys) the last full listing showed, and
+    /// The attachment objects (names) the last full listing showed, and
     /// those uploaded since.
     attachments: std::collections::HashSet<String>,
 }
@@ -259,7 +218,6 @@ impl S3Backend {
         let credentials = Credentials { access_key_id: keys.access_key_id.clone(), secret_access_key: keys.secret_access_key.clone(), session_token: None };
         Ok(S3Backend {
             http: Blocking::new(),
-            config: config.clone(),
             location: config.location(),
             credentials,
             key,
@@ -269,21 +227,20 @@ impl S3Backend {
         })
     }
 
-    /// The key an attachment is kept under.
+    /// The client CleanPassword shares.
+    fn client(&self) -> Client<'_, Blocking> {
+        Client::new(&self.location, &self.credentials, &self.http)
+    }
+
+    /// The object an attachment is kept as.
     fn attachment_key(&self, name: &str) -> String {
-        let object = match &self.key {
-            Some(k) => crypto::attachment_object(k, name),
-            None => name.to_owned(),
-        };
-        format!("{}attachments/{object}", self.config.root())
+        match &self.key {
+            Some(k) => format!("attachments/{}", crypto::attachment_object(k, name)),
+            None => format!("attachments/{name}"),
+        }
     }
 
-    /// A key's name inside the folder (what encryption binds an object to).
-    fn rel<'a>(&self, key: &'a str) -> &'a str {
-        key.strip_prefix(&self.config.root()).unwrap_or(key)
-    }
-
-    /// Whether objects under this key are encrypted (notes and folders).
+    /// Whether objects under this name are encrypted (notes and folders).
     fn sealable(rel: &str) -> bool {
         rel.starts_with("notes/") || rel.starts_with("folders/")
     }
@@ -291,75 +248,43 @@ impl S3Backend {
     /// An object's text, decrypted if needed. `None` if it's encrypted and
     /// can't be read with our key (or we have none). Unencrypted objects
     /// are read as they are, also in an encrypted folder.
-    fn unseal(&self, key: &str, raw: String) -> Option<String> {
+    fn unseal(&self, rel: &str, raw: String) -> Option<String> {
         if !crypto::is_sealed(&raw) {
             return Some(raw);
         }
-        crypto::open(self.key.as_ref()?, self.rel(key), &raw)
+        crypto::open(self.key.as_ref()?, rel, &raw)
     }
 
-    fn request(&self, method: &str, key: &str, query: &[(String, String)], body: Option<&[u8]>, extra: &[(&str, String)]) -> Result<Resp> {
-        // Signed and sent by the client CleanPassword shares.
-        let client = Client::new(&self.location, &self.credentials, &self.http);
-        let body = body.map(<[u8]>::to_vec).unwrap_or_default();
-        let r = cleanbucket::block_on(client.send(method, key, query, body, extra)).map_err(anyhow::Error::new)?;
-        let header = |n: &str| r.header(n).map(str::to_owned);
-        let (etag, last_modified, region) = (header("etag"), header("last-modified"), header("x-amz-bucket-region"));
-        let body = String::from_utf8_lossy(&r.body).into_owned();
-        Ok(Resp { status: r.status, etag, last_modified, region, body, data: r.body })
-    }
-
-    fn put(&self, key: &str, body: &str, content_type: &str, cond: Cond) -> Result<Resp> {
-        let mut extra = vec![("content-type", content_type.to_owned())];
-        match cond {
-            Cond::None => {}
-            Cond::Match(e) => extra.push(("if-match", e.to_owned())),
-            Cond::Absent => extra.push(("if-none-match", "*".to_owned())),
-        }
-        let rel = self.rel(key);
-        let sealed;
-        let body = match &self.key {
-            Some(k) if Self::sealable(rel) => {
-                sealed = crypto::seal(k, rel, body);
-                extra[0].1 = "application/octet-stream".to_owned();
-                sealed.as_str()
-            }
-            _ => body,
+    /// Writes an object, sealed if it's a note or folder in an encrypted
+    /// folder. Its new ETag, or `None` if refused as a conflict.
+    fn put(&self, rel: &str, body: &str, content_type: &str, cond: Cond) -> Result<Option<String>> {
+        let (body, content_type) = match &self.key {
+            Some(k) if Self::sealable(rel) => (crypto::seal(k, rel, body), "application/octet-stream"),
+            _ => (body.to_owned(), content_type),
         };
-        self.request("PUT", key, &[], Some(body.as_bytes()), &extra)
+        Ok(match block_on(self.client().put_as(rel, body.into_bytes(), cond, content_type)).map_err(fail)? {
+            Put::Stored { etag } => Some(etag),
+            Put::Conflict => None,
+        })
     }
 
     /// The object's text and ETag; `None` if there's none.
-    fn get(&self, key: &str) -> Result<Option<(String, String, Option<DateTime<Utc>>)>> {
-        let r = self.request("GET", key, &[], None, &[])?;
-        if r.status == 404 {
-            return Ok(None);
-        }
-        if !r.ok() {
-            return Err(r.error());
-        }
-        let etag = r.etag.clone().context("S3 sent no ETag")?;
-        Ok(Some((r.body, etag, r.last_modified.as_deref().and_then(http_date))))
-    }
-
-    fn head_key(&self) -> String {
-        format!("{}head", self.config.root())
+    fn get(&self, rel: &str) -> Result<Option<Fetched>> {
+        let o = block_on(self.client().get_dated(rel)).map_err(fail)?;
+        Ok(o.map(|(o, modified)| (String::from_utf8_lossy(&o.data).into_owned(), o.etag, modified)))
     }
 
     fn note_key(&self, stem: &str) -> String {
-        format!("{}notes/{stem}.md", self.config.root())
+        format!("notes/{stem}.md")
     }
 
     fn folder_key(&self, id: &str) -> String {
-        format!("{}folders/{id}.json", self.config.root())
+        format!("folders/{id}.json")
     }
 
     /// Marks that something changed, for other devices' [`Backend::cursor`].
     fn touch(&self) -> Result<()> {
-        let r = self.put(&self.head_key(), &uuid::Uuid::new_v4().to_string(), "text/plain", Cond::None)?;
-        if !r.ok() {
-            return Err(r.error());
-        }
+        block_on(self.client().touch(HEAD)).map_err(fail)?;
         Ok(())
     }
 
@@ -381,49 +306,17 @@ impl S3Backend {
     /// Every object under `sub` in the folder. Anything short of the whole
     /// list is an error: the engine would take what's missing as deleted.
     fn list(&self, sub: &str) -> Result<Vec<Listed>> {
-        let prefix = format!("{}{sub}", self.config.root());
-        let mut out = Vec::new();
-        let mut token: Option<String> = None;
-        for _ in 0..100_000 {
-            let mut q = vec![("list-type".to_owned(), "2".to_owned()), ("prefix".to_owned(), prefix.clone())];
-            if let Some(t) = &token {
-                q.push(("continuation-token".to_owned(), t.clone()));
-            }
-            let r = self.request("GET", "", &q, None, &[])?;
-            if !r.ok() {
-                return Err(r.error());
-            }
-            if !r.body.contains("<ListBucketResult") {
-                bail!("S3's reply isn't a bucket listing (a proxy or captive portal in the way?)");
-            }
-            for c in xml_tags(&r.body, "Contents") {
-                let (Some(key), Some(etag)) = (xml_tag(c, "Key"), xml_tag(c, "ETag")) else { continue };
-                let modified = xml_tag(c, "LastModified").and_then(http_date).unwrap_or_default();
-                out.push(Listed { key: decode(key), etag: decode(etag), modified });
-            }
-            if xml_tag(&r.body, "IsTruncated") != Some("true") {
-                return Ok(out);
-            }
-            match xml_tag(&r.body, "NextContinuationToken").map(decode) {
-                Some(t) if token.as_deref() != Some(&t) => token = Some(t),
-                _ => bail!("S3 said the listing goes on but gave no way to continue it"),
-            }
-        }
-        bail!("the S3 folder has too many objects to list")
+        block_on(self.client().list(sub)).map_err(fail)
     }
 
     /// Lists `sub`, downloads what changed since last time (several at
     /// once), and returns the listing; the contents are in `self.cache`.
     fn refresh(&mut self, sub: &str) -> Result<Vec<Listed>> {
         let listed = self.list(sub)?;
-        let root = self.config.root();
-        let wanted: Vec<&Listed> = listed
-            .iter()
-            .filter(|l| ours(&l.key[root.len().min(l.key.len())..]))
-            .filter(|l| self.cache.get(&l.key).map_or(true, |(e, _)| *e != l.etag))
-            .collect();
+        let wanted: Vec<&Listed> =
+            listed.iter().filter(|l| ours(&l.name)).filter(|l| self.cache.get(&l.name).map_or(true, |(e, _)| *e != l.etag)).collect();
         let next = Mutex::new(0usize);
-        let results: Mutex<Vec<(String, Result<Option<(String, String, Option<DateTime<Utc>>)>>)>> = Mutex::new(Vec::new());
+        let results: Mutex<Vec<(String, Result<Option<Fetched>>)>> = Mutex::new(Vec::new());
         let this = &*self;
         std::thread::scope(|s| {
             for _ in 0..PARALLEL.min(wanted.len()) {
@@ -435,20 +328,20 @@ impl S3Backend {
                         i
                     };
                     let Some(l) = wanted.get(i) else { return };
-                    let r = this.get(&l.key);
-                    results.lock().unwrap().push((l.key.clone(), r));
+                    let r = this.get(&l.name);
+                    results.lock().unwrap().push((l.name.clone(), r));
                 });
             }
         });
-        let modified: HashMap<&str, DateTime<Utc>> = listed.iter().map(|l| (l.key.as_str(), l.modified)).collect();
-        for (key, r) in results.into_inner().unwrap() {
+        let modified: HashMap<&str, DateTime<Utc>> = listed.iter().map(|l| (l.name.as_str(), l.modified.unwrap_or_default())).collect();
+        for (rel, r) in results.into_inner().unwrap() {
             let r = match r {
                 // This one object refused (e.g. encrypted with a key the
                 // user may not use): kept as it is, not taken as deleted,
                 // and the rest still syncs. (A refused access key is an
                 // error for the whole account.)
                 Err(e) if e.downcast_ref::<S3Error>().is_some_and(|s| (400..500).contains(&s.status)) => {
-                    self.cache.insert(key, (String::new(), Cached::Unreadable));
+                    self.cache.insert(rel, (String::new(), Cached::Unreadable));
                     continue;
                 }
                 r => r?,
@@ -456,13 +349,12 @@ impl S3Backend {
             let Some((text, etag, lm)) = r else {
                 // Gone between listing and downloading: not known to be
                 // deleted, so it's left alone this time.
-                self.cache.insert(key, (String::new(), Cached::Unreadable));
+                self.cache.insert(rel, (String::new(), Cached::Unreadable));
                 continue;
             };
-            let rel = key[root.len()..].to_owned();
-            let lm = lm.or_else(|| modified.get(key.as_str()).copied()).unwrap_or_else(Utc::now);
-            let Some(text) = self.unseal(&key, text) else {
-                self.cache.insert(key, (etag, Cached::Unreadable));
+            let lm = lm.or_else(|| modified.get(rel.as_str()).copied()).unwrap_or_else(Utc::now);
+            let Some(text) = self.unseal(&rel, text) else {
+                self.cache.insert(rel, (etag, Cached::Unreadable));
                 continue;
             };
             let cached = if let Some(stem) = rel.strip_prefix("notes/").and_then(|r| r.strip_suffix(".md")) {
@@ -476,23 +368,21 @@ impl S3Backend {
                     _ => Cached::Unreadable,
                 }
             };
-            self.cache.insert(key, (etag, cached));
+            self.cache.insert(rel, (etag, cached));
         }
-        let prefix = format!("{root}{sub}");
-        let present: std::collections::HashSet<&str> = listed.iter().map(|l| l.key.as_str()).collect();
-        self.cache.retain(|k, _| !k.starts_with(&prefix) || present.contains(k.as_str()));
+        let present: std::collections::HashSet<&str> = listed.iter().map(|l| l.name.as_str()).collect();
+        self.cache.retain(|k, _| !k.starts_with(sub) || present.contains(k.as_str()));
         Ok(listed)
     }
 
     /// Folders: (id, path, ETag).
     fn folders(&mut self) -> Result<Vec<(String, Vec<String>, String)>> {
         let listed = self.refresh("folders/")?;
-        let root = self.config.root();
         Ok(listed
             .iter()
             .filter_map(|l| {
-                let id = l.key[root.len()..].strip_prefix("folders/")?.strip_suffix(".json")?;
-                match self.cache.get(&l.key) {
+                let id = l.name.strip_prefix("folders/")?.strip_suffix(".json")?;
+                match self.cache.get(&l.name) {
                     Some((etag, Cached::Folder(p))) => Some((id.to_owned(), p.clone(), etag.clone())),
                     _ => None,
                 }
@@ -500,13 +390,12 @@ impl S3Backend {
             .collect())
     }
 
-    fn put_folder(&mut self, id: &str, path: &[String], cond: Cond) -> Result<Resp> {
+    /// Writes a folder; its new ETag, or `None` if refused as a conflict.
+    fn put_folder(&mut self, id: &str, path: &[String], cond: Cond) -> Result<Option<String>> {
         let key = self.folder_key(id);
         let r = self.put(&key, &serde_json::to_string(path)?, "application/json", cond)?;
-        if r.ok() {
-            if let Some(e) = &r.etag {
-                self.cache.insert(key, (e.clone(), Cached::Folder(path.to_vec())));
-            }
+        if let Some(e) = &r {
+            self.cache.insert(key, (e.clone(), Cached::Folder(path.to_vec())));
         }
         Ok(r)
     }
@@ -527,23 +416,28 @@ pub fn check(config: &Config, keys: &Keys, passphrase: Option<&str>) -> Result<(
     let b = S3Backend::open(&plain, Some(keys.to_secret()))?;
     b.touch().context("writing to the bucket")?;
     b.list("").context("listing the bucket")?;
-    b.get(&b.head_key()).context("reading from the bucket")?.context("what was just written can't be read back")?;
-    let r = b.put(&b.head_key(), "check", "text/plain", Cond::Absent)?;
-    let r2 = b.put(&b.head_key(), "check", "text/plain", Cond::Match("\"0123456789abcdef0123456789abcdef\""))?;
-    if r.ok() || r2.ok() {
+    b.get(HEAD).context("reading from the bucket")?.context("what was just written can't be read back")?;
+    let client = b.client();
+    let r = block_on(client.put_as(HEAD, b"check".to_vec(), Cond::Absent, "text/plain"));
+    let r2 = block_on(client.put_as(HEAD, b"check".to_vec(), Cond::Match("\"0123456789abcdef0123456789abcdef\""), "text/plain"));
+    if matches!(r, Ok(Put::Stored { .. })) || matches!(r2, Ok(Put::Stored { .. })) {
         bail!("this storage service ignores conditional writes (If-Match / If-None-Match), so devices could overwrite each other's edits; it can't be used");
     }
     // Refused, but not as outdated (e.g. 501: not supported): every save
     // would fail the same way.
     for r in [r, r2] {
-        if !matches!(r.status, 409 | 412) {
-            return Err(r.error().context("this storage service doesn't support conditional writes (If-Match / If-None-Match), which syncing needs"));
+        match r {
+            Err(e @ cleanbucket::Error::S3(_)) => {
+                return Err(fail(e).context("this storage service doesn't support conditional writes (If-Match / If-None-Match), which syncing needs"))
+            }
+            r => {
+                r.map_err(fail)?;
+            }
         }
     }
     b.touch()?;
 
-    let settings_key = format!("{}{}", config.root(), crypto::SETTINGS);
-    let existing = match b.get(&settings_key)? {
+    let existing = match b.get(crypto::SETTINGS)? {
         Some((text, _, _)) => Some(serde_json::from_str::<crypto::Settings>(&text).context("the folder's encryption.json is damaged")?),
         None => None,
     };
@@ -554,12 +448,8 @@ pub fn check(config: &Config, keys: &Keys, passphrase: Option<&str>) -> Result<(
         (Some(s), Some(p)) => Some(crypto::unlock(p, &s)?),
         (None, Some(p)) => {
             let (s, key) = crypto::create(p)?;
-            let r = b.put(&settings_key, &serde_json::to_string_pretty(&s)?, "application/json", Cond::Absent)?;
-            if r.conflict() {
+            if b.put(crypto::SETTINGS, &serde_json::to_string_pretty(&s)?, "application/json", Cond::Absent)?.is_none() {
                 bail!("another device set up encryption for this folder just now; try again");
-            }
-            if !r.ok() {
-                return Err(r.error());
             }
             Some(key)
         }
@@ -572,31 +462,24 @@ impl Backend for S3Backend {
     fn cursor(&mut self) -> Result<Option<String>> {
         // Our own writes first, so the cursor read covers them.
         self.flush_touch()?;
-        let r = self.request("HEAD", &self.head_key(), &[], None, &[])?;
-        let etag = match r.status {
-            404 => "none".to_owned(),
-            _ if r.ok() => r.etag.unwrap_or_default(),
-            _ => return Err(r.error()),
-        };
+        let etag = block_on(self.client().head(HEAD)).map_err(fail)?.unwrap_or_else(|| "none".to_owned());
         Ok(Some(format!("{etag}@{}", Utc::now().timestamp() / FULL_LIST_EVERY)))
     }
 
     fn pull(&mut self) -> Result<Snapshot> {
         let listed = self.refresh("")?;
-        let root = self.config.root();
-        let att = format!("{root}attachments/");
-        self.attachments = listed.iter().filter(|l| l.key.starts_with(&att)).map(|l| l.key.clone()).collect();
+        self.attachments = listed.iter().filter(|l| l.name.starts_with("attachments/")).map(|l| l.name.clone()).collect();
         let mut snap = Snapshot::default();
         let mut old_tombstones = Vec::new();
         for l in &listed {
-            let rel = &l.key[root.len().min(l.key.len())..];
-            let Some((etag, cached)) = self.cache.get(&l.key) else { continue };
+            let rel = l.name.as_str();
+            let Some((etag, cached)) = self.cache.get(rel) else { continue };
             if let Some(stem) = rel.strip_prefix("notes/").and_then(|r| r.strip_suffix(".md")) {
                 match cached {
                     Cached::Note(n) => snap.notes.push(RemoteNote { remote_id: stem.to_owned(), revision: etag.clone(), data: n.clone() }),
                     Cached::Gone(t) => {
                         if Utc::now() - *t > chrono::Duration::days(TOMBSTONE_DAYS) {
-                            old_tombstones.push((l.key.clone(), etag.clone()));
+                            old_tombstones.push((rel.to_owned(), etag.clone()));
                         }
                     }
                     _ => snap.unreadable.push(stem.to_owned()),
@@ -608,11 +491,13 @@ impl Backend for S3Backend {
                 }
             }
         }
-        for (key, etag) in old_tombstones {
+        for (rel, etag) in old_tombstones {
             // Only if it's still that tombstone: another device may have
             // just brought the note back over it. (Best effort: one left
-            // over is cleaned up next time.)
-            let _ = self.request("DELETE", &key, &[], None, &[("if-match", etag)]);
+            // over is cleaned up next time.) The client's `delete` isn't
+            // conditional, so this one is sent as it is.
+            let key = format!("{}{rel}", self.location.root());
+            let _ = block_on(self.client().send("DELETE", &key, &[], Vec::new(), &[("if-match", etag)]));
         }
         Ok(snap)
     }
@@ -622,9 +507,8 @@ impl Backend for S3Backend {
             return Ok(id);
         }
         let id = uuid::Uuid::new_v4().to_string();
-        let r = self.put_folder(&id, path, Cond::Absent)?;
-        if !r.ok() {
-            return Err(r.error());
+        if self.put_folder(&id, path, Cond::Absent)?.is_none() {
+            bail!("S3 refused to create the folder: there's one with its new id already");
         }
         self.mark_changed();
         Ok(id)
@@ -640,12 +524,8 @@ impl Backend for S3Backend {
             } else {
                 continue;
             };
-            let r = self.put_folder(&id, &renamed, Cond::Match(&etag))?;
-            if r.conflict() {
+            if self.put_folder(&id, &renamed, Cond::Match(&etag))?.is_none() {
                 bail!("a folder was changed on another device during the rename; will try again");
-            }
-            if !r.ok() {
-                return Err(r.error());
             }
             changed = true;
         }
@@ -666,19 +546,13 @@ impl Backend for S3Backend {
             })
             .collect();
         for (key, etag, n) in moves {
-            let r = self.put(&key, &format::write(&n), "text/markdown; charset=utf-8", Cond::Match(&etag))?;
-            if r.conflict() {
+            let Some(e) = self.put(&key, &format::write(&n), MARKDOWN, Cond::Match(&etag))? else {
                 if changed {
                     self.mark_changed();
                 }
                 bail!("a note was changed on another device during the folder rename; will try again");
-            }
-            if !r.ok() {
-                return Err(r.error());
-            }
-            if let Some(e) = r.etag {
-                self.cache.insert(key, (e, Cached::Note(n)));
-            }
+            };
+            self.cache.insert(key, (e, Cached::Note(n)));
             changed = true;
         }
         if changed {
@@ -689,10 +563,7 @@ impl Backend for S3Backend {
 
     fn delete_folder(&mut self, remote_id: &str, _path: &[String]) -> Result<()> {
         let key = self.folder_key(remote_id);
-        let r = self.request("DELETE", &key, &[], None, &[])?;
-        if !r.ok() && r.status != 404 {
-            return Err(r.error());
-        }
+        block_on(self.client().delete(&key)).map_err(fail)?;
         self.cache.remove(&key);
         self.mark_changed();
         Ok(())
@@ -700,32 +571,23 @@ impl Backend for S3Backend {
 
     fn save_note(&mut self, remote_id: Option<&str>, base_revision: Option<&str>, note: &NoteData) -> Result<(String, String)> {
         let text = format::write(note);
-        const MD: &str = "text/markdown; charset=utf-8";
-        let (stem, r) = match remote_id {
+        let (stem, etag) = match remote_id {
             Some(stem) => {
                 let cond = base_revision.map_or(Cond::None, Cond::Match);
-                let r = self.put(&self.note_key(stem), &text, MD, cond)?;
-                if r.conflict() {
-                    return Err(Conflict.into());
-                }
-                (stem.to_owned(), r)
+                let etag = self.put(&self.note_key(stem), &text, MARKDOWN, cond)?.ok_or(Conflict)?;
+                (stem.to_owned(), etag)
             }
             None => {
                 let mut stem = note.id.replace(['/', '\\'], "_");
-                let mut r = self.put(&self.note_key(&stem), &text, MD, Cond::Absent)?;
-                if r.conflict() {
+                let mut r = self.put(&self.note_key(&stem), &text, MARKDOWN, Cond::Absent)?;
+                if r.is_none() {
                     // Something is there already under this id.
                     let key = self.note_key(&stem);
                     let existing = self.get(&key)?.map(|(raw, etag, _)| (self.unseal(&key, raw), etag));
                     match existing {
                         Some((there, etag)) => match there.map(|t| format::read(&t, &stem, Utc::now())) {
                             // Deleted for good earlier: the note comes back.
-                            Some(format::Object::Gone) => {
-                                r = self.put(&self.note_key(&stem), &text, MD, Cond::Match(&etag))?;
-                                if r.conflict() {
-                                    return Err(Conflict.into());
-                                }
-                            }
+                            Some(format::Object::Gone) => r = self.put(&key, &text, MARKDOWN, Cond::Match(&etag))?,
                             // Our own create whose reply got lost: the next
                             // pull matches it up.
                             Some(format::Object::Note(n)) if n.id == note.id => return Err(Conflict.into()),
@@ -733,22 +595,15 @@ impl Backend for S3Backend {
                             // goes next to it.
                             _ => {
                                 stem = format!("{stem}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                                r = self.put(&self.note_key(&stem), &text, MD, Cond::Absent)?;
-                                if r.conflict() {
-                                    return Err(Conflict.into());
-                                }
+                                r = self.put(&self.note_key(&stem), &text, MARKDOWN, Cond::Absent)?;
                             }
                         },
                         None => return Err(Conflict.into()),
                     }
                 }
-                (stem, r)
+                (stem, r.ok_or(Conflict)?)
             }
         };
-        if !r.ok() {
-            return Err(r.error());
-        }
-        let etag = r.etag.context("S3 sent no ETag for the saved note")?;
         self.cache.insert(self.note_key(&stem), (etag.clone(), Cached::Note(note.clone())));
         self.mark_changed();
         Ok((stem, etag))
@@ -757,26 +612,18 @@ impl Backend for S3Backend {
     fn delete_note(&mut self, remote_id: &str, base_revision: Option<&str>) -> Result<()> {
         let key = self.note_key(remote_id);
         let now = Utc::now();
-        let r = self.put(&key, &format::tombstone(remote_id, now), "text/markdown; charset=utf-8", base_revision.map_or(Cond::None, Cond::Match))?;
-        match r.status {
-            // Gone already.
-            404 => return Ok(()),
-            409 | 412 => {
-                // Refused: fine if it's deleted already, else it was edited.
-                return match self.get(&key)? {
-                    None => Ok(()),
-                    Some((raw, _, _)) => match self.unseal(&key, raw) {
-                        Some(t) if format::read(&t, remote_id, now) == format::Object::Gone => Ok(()),
-                        _ => Err(Conflict.into()),
-                    },
-                };
-            }
-            _ if !r.ok() => return Err(r.error()),
-            _ => {}
-        }
-        if let Some(e) = r.etag {
-            self.cache.insert(key, (e, Cached::Gone(now)));
-        }
+        let Some(etag) = self.put(&key, &format::tombstone(remote_id, now), MARKDOWN, base_revision.map_or(Cond::None, Cond::Match))? else {
+            // Refused (or gone): fine if it's deleted already, else it was
+            // edited.
+            return match self.get(&key)? {
+                None => Ok(()),
+                Some((raw, _, _)) => match self.unseal(&key, raw) {
+                    Some(t) if format::read(&t, remote_id, now) == format::Object::Gone => Ok(()),
+                    _ => Err(Conflict.into()),
+                },
+            };
+        };
+        self.cache.insert(key, (etag, Cached::Gone(now)));
         self.mark_changed();
         Ok(())
     }
@@ -787,37 +634,24 @@ impl Backend for S3Backend {
 
     fn put_attachment(&mut self, name: &str, data: &[u8]) -> Result<()> {
         let key = self.attachment_key(name);
-        let sealed;
         let (body, content_type) = match &self.key {
-            Some(k) => {
-                sealed = crypto::seal_bytes(k, self.rel(&key), data);
-                (sealed.as_slice(), "application/octet-stream".to_owned())
-            }
-            None => (data, format!("image/{}", name.rsplit('.').next().unwrap_or("png").replace("jpg", "jpeg"))),
+            Some(k) => (crypto::seal_bytes(k, &key, data), "application/octet-stream".to_owned()),
+            None => (data.to_vec(), format!("image/{}", name.rsplit('.').next().unwrap_or("png").replace("jpg", "jpeg"))),
         };
-        let r = self.request("PUT", &key, &[], Some(body), &[("content-type", content_type), ("if-none-match", "*".to_owned())])?;
         // Refused as there already: it's the same picture.
-        if !r.ok() && !matches!(r.status, 409 | 412) {
-            return Err(r.error());
-        }
+        block_on(self.client().put_as(&key, body, Cond::Absent, &content_type)).map_err(fail)?;
         self.attachments.insert(key);
         Ok(())
     }
 
     fn get_attachment(&mut self, name: &str) -> Result<Option<Vec<u8>>> {
         let key = self.attachment_key(name);
-        let r = self.request("GET", &key, &[], None, &[])?;
-        if r.status == 404 {
-            return Ok(None);
-        }
-        if !r.ok() {
-            return Err(r.error());
-        }
-        if r.data.starts_with(crypto::MAGIC_BYTES) {
+        let Some(o) = block_on(self.client().get(&key)).map_err(fail)? else { return Ok(None) };
+        if o.data.starts_with(crypto::MAGIC_BYTES) {
             // One that can't be opened is as good as missing.
-            return Ok(self.key.as_ref().and_then(|k| crypto::open_bytes(k, self.rel(&key), &r.data)));
+            return Ok(self.key.as_ref().and_then(|k| crypto::open_bytes(k, &key, &o.data)));
         }
-        Ok(Some(r.data))
+        Ok(Some(o.data))
     }
 
     fn known(&mut self, notes: &[(&str, &str, &NoteData)], folders: &[(&str, &str, &[String])]) {

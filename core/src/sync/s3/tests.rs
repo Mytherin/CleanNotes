@@ -186,8 +186,8 @@ fn amazon_urls() {
     assert_eq!(c.location().url_parts("notes/a b.md"), ("https://my-notes.s3.eu-west-1.amazonaws.com".into(), "/notes/a%20b.md".into()));
     let c = Config { bucket: "my.notes".into(), ..c };
     assert_eq!(c.location().url_parts("head"), ("https://s3.eu-west-1.amazonaws.com".into(), "/my.notes/head".into()));
-    assert_eq!(Config { prefix: " /a/b/ ".into(), ..c.clone() }.root(), "a/b/");
-    assert_eq!(c.root(), "");
+    assert_eq!(Config { prefix: " /a/b/ ".into(), ..c.clone() }.location().root(), "a/b/");
+    assert_eq!(c.location().root(), "");
 }
 
 #[test]
@@ -234,8 +234,8 @@ fn wrong_region_names_the_right_one() {
     let e = S3Error { status: 301, code: "PermanentRedirect".into(), message: String::new(), region: Some("eu-west-1".into()) };
     assert!(e.to_string().contains("eu-west-1"), "{e}");
     let body = "<Error><Code>AuthorizationHeaderMalformed</Code><Message>the region 'us-east-1' is wrong; expecting 'eu-west-1'</Message><Region>eu-west-1</Region></Error>";
-    let r = Resp { status: 400, etag: None, last_modified: None, region: None, body: body.into(), data: body.as_bytes().to_vec() };
-    assert!(format!("{:#}", r.error()).contains("eu-west-1"));
+    let r = HttpResponse { status: 400, headers: vec![], body: body.as_bytes().to_vec() };
+    assert!(format!("{:#}", fail(r.error().into())).contains("eu-west-1"));
 }
 
 #[test]
@@ -280,7 +280,7 @@ fn one_object_that_cant_be_read_doesnt_stop_the_sync() {
 
 #[test]
 fn xml_entities() {
-    assert_eq!(decode("&quot;abc&quot; &amp; &#65;&#x42; &bogus;"), "\"abc\" & AB &bogus;");
+    assert_eq!(cleanbucket::s3::decode("&quot;abc&quot; &amp; &#65;&#x42; &bogus;"), "\"abc\" & AB &bogus;");
 }
 
 struct Device {
@@ -594,11 +594,11 @@ fn real_s3() {
     // Clean up the run's folder.
     let b = S3Backend::open(&config, Some(keys.to_secret())).unwrap();
     if let Ok(all) = b.list("") {
-        let objs: Vec<String> = all.into_iter().map(|l| l.key).collect();
+        let objs: Vec<String> = all.into_iter().map(|l| l.name).collect();
         std::thread::scope(|s| {
             for chunk in objs.chunks(objs.len().div_ceil(PARALLEL).max(1)) {
                 let b = &b;
-                s.spawn(move || chunk.iter().for_each(|k| drop(b.request("DELETE", k, &[], None, &[]))));
+                s.spawn(move || chunk.iter().for_each(|k| drop(block_on(b.client().delete(k)))));
             }
         });
         println!("cleaned up {} objects", objs.len());
@@ -705,7 +705,7 @@ fn real_s3_encrypted() {
     let b = S3Backend::open(&config, Some(keys.to_secret())).unwrap();
     if let Ok(all) = b.list("") {
         for l in &all {
-            let _ = b.request("DELETE", &l.key, &[], None, &[]);
+            let _ = block_on(b.client().delete(&l.name));
         }
         println!("cleaned up {} objects", all.len());
     }
