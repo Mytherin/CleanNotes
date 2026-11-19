@@ -1,10 +1,12 @@
 //! Tab notes: browser tabs that CleanTabs (a Chrome extension) saved as
-//! notes, which CleanNotes shows as previews of their web pages.
+//! notes, which CleanNotes shows on their own, as previews of their web
+//! pages, apart from the account's notes.
 //!
 //! A tab note's id starts with [`ID_PREFIX`] (so its object is
 //! `notes/tab-….md`, and CleanTabs lists just those), and it lives under
-//! the [`FOLDER`] folder: `Tabs/<collection>`, and a tab group saved with
-//! its window in `Tabs/<collection>/<group>`. Its Markdown is:
+//! the [`FOLDER`] folder: `CleanTabs/<collection>`, and a tab group saved
+//! with its window in `CleanTabs/<collection>/<group>`. (The first version
+//! used `Tabs`, [`LEGACY_FOLDER`]; CleanTabs moves those.) Its Markdown is:
 //!
 //! ```text
 //! # <the page's title>
@@ -24,7 +26,24 @@ use super::NoteData;
 /// What a tab note's id starts with.
 pub const ID_PREFIX: &str = "tab-";
 /// The folder tab notes are kept under.
-pub const FOLDER: &str = "Tabs";
+pub const FOLDER: &str = "CleanTabs";
+/// Where the first version of CleanTabs kept them.
+pub const LEGACY_FOLDER: &str = "Tabs";
+
+/// A tab note's folder below [`FOLDER`] (or [`LEGACY_FOLDER`]): `[]` for
+/// the top. A tab note elsewhere (moved by hand) is at the top too.
+pub fn relative_folder(folder: &[String]) -> &[String] {
+    match folder.first().map(String::as_str) {
+        Some(FOLDER) | Some(LEGACY_FOLDER) => &folder[1..],
+        _ => &[],
+    }
+}
+
+/// Whether a folder (by path from the top of an account) is CleanTabs'
+/// own: [`FOLDER`] and everything in it.
+pub fn is_tabs_folder(path: &[String]) -> bool {
+    path.first().map(String::as_str) == Some(FOLDER)
+}
 
 /// A tab note's contents.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -206,6 +225,16 @@ mod tests {
         let n = |id: &str| NoteData { id: id.into(), folder: vec![FOLDER.into()], body: "# A\n\n[a.b](https://a.b)\n".into(), created: t, modified: t, pinned: false, deleted: None };
         assert!(is_tab(&n("tab-1")));
         assert!(!is_tab(&n("6f1c0d3e")));
+    }
+
+    #[test]
+    fn folders() {
+        let p = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(relative_folder(&p(&["CleanTabs", "Research", "Docs"])), p(&["Research", "Docs"]));
+        assert_eq!(relative_folder(&p(&["Tabs", "Research"])), p(&["Research"]), "the first version's");
+        assert_eq!(relative_folder(&p(&["Notes"])), p(&[]));
+        assert!(is_tabs_folder(&p(&["CleanTabs"])) && is_tabs_folder(&p(&["CleanTabs", "A"])));
+        assert!(!is_tabs_folder(&p(&["Tabs"])) && !is_tabs_folder(&p(&[])));
     }
 
     #[test]
