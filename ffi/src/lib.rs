@@ -186,6 +186,9 @@ pub struct NoteItem {
     /// otherwise.
     pub title_parts: Vec<TextPart>,
     pub snippet_parts: Vec<TextPart>,
+    /// A tab note's web page (then `title` is the page's and `snippet` its
+    /// site). See [`TabPage`].
+    pub tab: Option<TabPage>,
 }
 
 /// Part of a search result's text: a match of the search, or not.
@@ -655,6 +658,7 @@ impl NotesCore {
                     .iter()
                     .filter_map(|id| {
                         let mut it = item(lib.note_row(id, &loc, show_folder)?);
+                        tab_row(&lib, &mut it);
                         if let Some((t, s)) = lib.search_parts(id, &search) {
                             it.snippet = s.iter().map(|(text, _)| text.as_str()).collect();
                             it.title_parts = parts(t);
@@ -668,7 +672,10 @@ impl NotesCore {
     }
 
     pub fn note(&self, id: String, place: Place) -> Option<NoteItem> {
-        self.lib().note_row(&id, &(&place).into(), false).map(item)
+        let lib = self.lib();
+        let mut it = item(lib.note_row(&id, &(&place).into(), false)?);
+        tab_row(&lib, &mut it);
+        Some(it)
     }
 
     /// "15 November 2026 at 11:32", for the top of the note.
@@ -743,6 +750,9 @@ impl NotesCore {
     /// and checkboxes written out. None if it's locked and closed.
     pub fn shared_text(&self, id: String) -> Option<String> {
         let md = self.lib().plain_body_now(&id)?;
+        if let Some((tab, text)) = split_tab(&id, &md) {
+            return Some(tab_shared_text(&tab, &cleannotes_core::markdown::from_markdown(&text)));
+        }
         Some(cleannotes_core::markdown::from_markdown(&md).shared_text())
     }
 
@@ -795,7 +805,7 @@ impl NotesCore {
     /// closed.
     pub fn open_editor(&self, id: String) -> Option<Arc<NoteEditor>> {
         let md = self.lib().plain_body(&id)?;
-        Some(NoteEditor::wrap(Editing::new(&id, &md)))
+        Some(NoteEditor::for_note(&id, &md))
     }
 
     /// The editor for a note just made with [`NotesCore::new_note`].
@@ -812,6 +822,7 @@ impl NotesCore {
         let Some(md) = e.take_markdown() else { return true };
         let id = e.note_id.clone();
         drop(e);
+        let md = join_tab(editor.tab().as_ref(), md);
         self.lib().set_body(&id, &md) != BodySet::Closed
     }
 
@@ -821,7 +832,7 @@ impl NotesCore {
         let id = editor.ed().note_id.clone();
         match self.lib().plain_body_now(&id) {
             Some(md) => {
-                editor.ed().reload(&md);
+                editor.ed().reload_with_tab(&mut editor.tab(), &md);
                 true
             }
             None => false,
@@ -1022,6 +1033,7 @@ fn item(r: library::NoteRow) -> NoteItem {
         deleted: r.deleted,
         title_parts: Vec::new(),
         snippet_parts: Vec::new(),
+        tab: None,
     }
 }
 
@@ -1220,6 +1232,9 @@ pub enum EditorCommand {
 #[derive(uniffi::Object)]
 pub struct NoteEditor {
     ed: Mutex<Editing>,
+    /// A tab note's page: `ed` has only the text below it (see
+    /// [`NoteEditor::tab_page`]).
+    tab: Mutex<Option<TabNote>>,
 }
 
 /// A clock for grouping typing into undo steps.
@@ -1230,7 +1245,7 @@ fn clock() -> f64 {
 
 impl NoteEditor {
     fn wrap(ed: Editing) -> Arc<NoteEditor> {
-        Arc::new(NoteEditor { ed: Mutex::new(ed) })
+        Arc::new(NoteEditor { ed: Mutex::new(ed), tab: Mutex::new(None) })
     }
 
     fn ed(&self) -> MutexGuard<'_, Editing> {
@@ -1430,7 +1445,11 @@ impl NoteEditor {
     /// The note as text to share: list markers and checkboxes written out
     /// (with changes not saved yet).
     pub fn shared_text(&self) -> String {
-        self.ed().doc.shared_text()
+        let e = self.ed();
+        match &*self.tab() {
+            Some(tab) => tab_shared_text(tab, &e.doc),
+            None => e.doc.shared_text(),
+        }
     }
 }
 
@@ -1574,6 +1593,245 @@ fn splice_utf16(s: &str, start: usize, end: usize, text: &str) -> String {
     out.extend(text.encode_utf16());
     out.extend_from_slice(&units[end..]);
     String::from_utf16_lossy(&out)
+}
+
+// ---- Tab notes (browser tabs CleanTabs saved) ----------------------------------
+//
+// A tab note (id `tab-…`, kept under `Tabs/`; see
+// `cleannotes_core::model::tabs`) shows as a preview of its web page: in the
+// list, the page's title, its site in place of the text and its picture; in
+// the gallery, the picture as the card; in the note, a card with the page
+// above the text. Its editor holds only that text (as the desktop's does,
+// with `Editing::for_note`), and saving puts the page back on top, so the
+// note keeps CleanTabs' format. A locked tab note isn't one until opened.
+
+use cleannotes_core::editing::{join_tab, split_tab};
+use cleannotes_core::model::tabs::{self, TabNote};
+
+/// A tab note's web page.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct TabPage {
+    pub title: String,
+    pub url: String,
+    /// The address as shown: without the scheme and `www.`, shortened.
+    pub short_url: String,
+    /// The site ("example.com"): in the list in place of the text, and on
+    /// the card when there's no picture.
+    pub site: String,
+    /// The page's picture: an attachment's name, for
+    /// [`NotesCore::attachment_data`]. None if CleanTabs took none.
+    pub thumbnail: Option<String>,
+}
+
+impl From<&TabNote> for TabPage {
+    fn from(t: &TabNote) -> TabPage {
+        TabPage {
+            title: t.title.clone(),
+            url: t.url.clone(),
+            short_url: tabs::short_url(&t.url),
+            site: tabs::host(&t.url).unwrap_or_else(|| tabs::short_url(&t.url)),
+            thumbnail: t.thumbnail.clone(),
+        }
+    }
+}
+
+/// A tab note's row in the list: the page's title, and its site in place of
+/// the first line.
+fn tab_row(lib: &Library, it: &mut NoteItem) {
+    let Some(n) = lib.store.note(&it.id) else { return };
+    if lock::is_locked(&n.body) {
+        return;
+    }
+    let Some(tab) = n.tab() else { return };
+    let page = TabPage::from(&tab);
+    it.title = if page.title.is_empty() { "New Note".to_owned() } else { page.title.clone() };
+    it.empty = page.site.is_empty();
+    it.snippet = if it.empty { "No additional text".to_owned() } else { page.site.clone() };
+    it.tab = Some(page);
+}
+
+/// A tab note as text to share: the page's title and address, then what's
+/// written about it.
+fn tab_shared_text(tab: &TabNote, text: &Doc) -> String {
+    let mut s = format!("{}\n{}", tab.title, tab.url);
+    let text = text.shared_text();
+    if !text.trim().is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&text);
+    }
+    s
+}
+
+impl NoteEditor {
+    /// The editor for a note: a tab note's page apart, its text to edit.
+    fn for_note(id: &str, md: &str) -> Arc<NoteEditor> {
+        let (ed, tab) = Editing::for_note(id, md);
+        Arc::new(NoteEditor { ed: Mutex::new(ed), tab: Mutex::new(tab) })
+    }
+
+    fn tab(&self) -> MutexGuard<'_, Option<TabNote>> {
+        self.tab.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[uniffi::export]
+impl NoteEditor {
+    /// A tab note's page, shown as a card above the text (the editor has
+    /// only the text below it). Ask again after [`NotesCore::reload_editor`].
+    pub fn tab_page(&self) -> Option<TabPage> {
+        self.tab().as_ref().map(TabPage::from)
+    }
+}
+
+#[cfg(test)]
+mod tab_tests {
+    use super::*;
+    use cleannotes_core::model::Note;
+
+    const PIC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.jpg";
+
+    fn core() -> (Arc<NotesCore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::open(dir.path(), Secrets::Memory, || {}).unwrap();
+        (Arc::new(NotesCore { lib: Mutex::new(lib) }), dir)
+    }
+
+    fn page() -> TabNote {
+        TabNote { title: "Rust *is* great".into(), url: "https://www.example.com/rust".into(), thumbnail: Some(PIC.into()), text: "Read this later.\n\n- point".into() }
+    }
+
+    /// A note with this id and Markdown in `Tabs/Reading`: its place.
+    fn add(core: &NotesCore, id: &str, body: &str) -> Place {
+        let mut lib = core.lib();
+        let folder = lib.store.ensure_folder_at(LOCAL, &[tabs::FOLDER.to_owned(), "Reading".to_owned()]);
+        let mut n = Note::new(LOCAL, &folder, body);
+        n.id = id.to_owned();
+        lib.store.notes.push(n);
+        Place::Folder { id: folder }
+    }
+
+    fn row(core: &NotesCore, place: &Place, id: &str) -> NoteItem {
+        core.sections(place.clone(), String::new()).into_iter().flat_map(|s| s.notes).find(|n| n.id == id).unwrap()
+    }
+
+    #[test]
+    fn tab_notes_in_the_list_show_their_page() {
+        let (core, _dir) = core();
+        let body = page().to_markdown();
+        let place = add(&core, "tab-1", &body);
+        add(&core, "tab-2", &TabNote { thumbnail: None, url: "about:blank".into(), ..page() }.to_markdown());
+        add(&core, "6f1c0d3e", &body);
+        add(&core, "6f1c0d3f", "# Shopping\neggs\n");
+
+        let r = row(&core, &place, "tab-1");
+        assert_eq!((r.title.as_str(), r.snippet.as_str(), r.empty), ("Rust *is* great", "example.com", false));
+        let tab = r.tab.unwrap();
+        assert_eq!(
+            tab,
+            TabPage {
+                title: "Rust *is* great".into(),
+                url: "https://www.example.com/rust".into(),
+                short_url: "example.com/rust".into(),
+                site: "example.com".into(),
+                thumbnail: Some(PIC.into()),
+            }
+        );
+        assert_eq!(core.note("tab-1".into(), place.clone()).unwrap().tab, Some(tab));
+        // No picture, no host: the address stands in for the site.
+        let r = row(&core, &place, "tab-2");
+        assert_eq!((r.snippet.as_str(), r.tab.unwrap().thumbnail), ("about:blank", None));
+        // Not made by CleanTabs, or not shaped like one: notes as ever.
+        let r = row(&core, &place, "6f1c0d3e");
+        assert!(r.tab.is_none());
+        assert!(r.snippet.starts_with("example.com/rust"), "{}", r.snippet);
+        let r = row(&core, &place, "6f1c0d3f");
+        assert_eq!((r.title.as_str(), r.snippet.as_str(), r.tab), ("Shopping", "eggs", None));
+        // Searching still shows where the words are.
+        let found = core.sections(place, "later".into()).into_iter().flat_map(|s| s.notes).find(|n| n.id == "tab-1").unwrap();
+        assert!(found.tab.is_some() && found.snippet.contains("later"), "{found:?}");
+    }
+
+    #[test]
+    fn editing_a_tab_notes_text_keeps_its_page() {
+        let (core, _dir) = core();
+        let body = page().to_markdown();
+        add(&core, "tab-1", &body);
+        let e = core.open_editor("tab-1".into()).unwrap();
+        assert_eq!(e.tab_page().map(|p| p.title), Some("Rust *is* great".into()));
+        assert_eq!(e.plain_text(), "Read this later.\n\npoint", "only the text is edited");
+        assert!(core.save_editor(e.clone()), "nothing changed");
+        assert_eq!(core.markdown("tab-1".into()).unwrap(), body);
+
+        // Typing at the start of the text.
+        e.select(0, 0);
+        assert!(e.replace(0, 0, "Really. ".into()));
+        assert!(core.save_editor(e.clone()));
+        let saved = core.markdown("tab-1".into()).unwrap();
+        assert_eq!(saved, TabNote { text: "Really. Read this later.\n\n- point".into(), ..page() }.to_markdown());
+        assert_eq!(saved, body.replace("Read this", "Really. Read this"));
+        assert!(saved.contains(&format!("![](attachments/{PIC})")));
+        assert_eq!(e.shared_text(), "Rust *is* great\nhttps://www.example.com/rust\n\nReally. Read this later.\n\n– point");
+        assert_eq!(core.shared_text("tab-1".into()).unwrap(), e.shared_text());
+
+        // Changed elsewhere: the editor follows, page and text.
+        core.lib().set_body("tab-1", &saved.replace("Rust", "Go").replace("Really. ", ""));
+        assert!(core.reload_editor(e.clone()));
+        assert_eq!(e.tab_page().unwrap().title, "Go *is* great");
+        assert_eq!(e.plain_text(), "Read this later.\n\npoint");
+
+        // Emptied: the page stays.
+        let n = e.plain_text().encode_utf16().count() as u32;
+        e.select(0, n);
+        e.replace(0, n, String::new());
+        assert!(core.save_editor(e.clone()));
+        let tab = TabNote::parse(&core.markdown("tab-1".into()).unwrap()).unwrap();
+        assert_eq!((tab.title.as_str(), tab.thumbnail.as_deref(), tab.text.as_str()), ("Go *is* great", Some(PIC), ""));
+    }
+
+    #[test]
+    fn other_notes_are_edited_whole() {
+        let (core, _dir) = core();
+        let body = page().to_markdown();
+        add(&core, "6f1c0d3e", &body);
+        let e = core.open_editor("6f1c0d3e".into()).unwrap();
+        assert!(e.tab_page().is_none());
+        assert!(e.plain_text().starts_with("Rust *is* great\n\nexample.com/rust\n"), "{}", e.plain_text());
+        e.select(0, 0);
+        assert!(e.replace(0, 0, "x".into()));
+        assert!(core.save_editor(e.clone()));
+        let md = core.markdown("6f1c0d3e".into()).unwrap();
+        assert!(md.starts_with("# xRust"), "{md}");
+        assert_eq!(e.shared_text().lines().next(), Some("xRust *is* great"));
+        // A new note isn't a tab note either.
+        let n = core.new_note(Place::AllNotes);
+        assert!(core.new_note_editor(n.id).tab_page().is_none());
+    }
+
+    #[test]
+    fn a_locked_tab_note_is_a_tab_note_once_opened() {
+        let (core, _dir) = core();
+        // (A note can't be locked while its pictures are on their way.)
+        let body = TabNote { thumbnail: None, ..page() }.to_markdown();
+        let place = add(&core, "tab-1", &body);
+        core.set_password("pw".into(), String::new()).unwrap();
+        assert_eq!(core.lock_note("tab-1".into()), LockOutcome::Locked);
+        core.lock_now();
+        let r = row(&core, &place, "tab-1");
+        assert!(r.locked && r.tab.is_none(), "{r:?}");
+        assert_eq!(r.snippet, "Locked");
+        assert!(core.open_editor("tab-1".into()).is_none());
+
+        core.unlock("tab-1".into(), "pw".into()).unwrap();
+        assert!(row(&core, &place, "tab-1").tab.is_none(), "the list never shows a locked note's page");
+        let e = core.open_editor("tab-1".into()).unwrap();
+        assert_eq!(e.tab_page().unwrap().url, "https://www.example.com/rust");
+        e.select(0, 0);
+        assert!(e.replace(0, 0, "Really. ".into()));
+        assert!(core.save_editor(e.clone()));
+        assert!(core.is_locked("tab-1".into()), "still locked");
+        assert_eq!(core.markdown("tab-1".into()).unwrap(), body.replace("Read this", "Really. Read this"));
+        assert!(!core.lib().store.note("tab-1").unwrap().body.contains("example.com"), "stored sealed");
+    }
 }
 
 #[cfg(test)]

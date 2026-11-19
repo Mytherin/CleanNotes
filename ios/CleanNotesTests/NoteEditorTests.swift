@@ -216,6 +216,32 @@ final class NoteEditorTests: XCTestCase {
         assertInStep(tv, c)
     }
 
+    // ---- Tab notes ----
+
+    func testATabNotesPageIsACardAboveTheText() throws {
+        let (tv, c) = newNote()
+        type("Notes", into: tv)
+        let top = tv.textContainerInset.top
+        let page = TabPage(title: "Example", url: "https://example.com/a", shortUrl: "example.com/a", site: "example.com", thumbnail: nil)
+        tv.showTabPage(page)
+        tv.layoutIfNeeded()
+        let card = try XCTUnwrap(tv.card)
+        XCTAssertGreaterThan(card.frame.height, 150, "the site in the picture's place, title, address, button")
+        XCTAssertEqual(tv.textContainerInset.top, card.frame.maxY + 14, accuracy: 0.5, "the text starts below it")
+        XCTAssertLessThanOrEqual(card.frame.maxX, tv.bounds.width)
+        XCTAssertGreaterThan(card.openButton.frame.width, 60)
+        // Typing still goes to the engine.
+        type(" here", into: tv)
+        XCTAssertEqual(c.editor.plainText(), "Notes here")
+        assertInStep(tv, c)
+        // This note isn't a tab note (the engine has no page): shown again,
+        // there's no card.
+        c.render()
+        XCTAssertNil(tv.card)
+        XCTAssertEqual(tv.textContainerInset.top, top)
+        assertInStep(tv, c)
+    }
+
     // ---- Sharing ----
 
     /// A solid picture of the given size in pixels.
