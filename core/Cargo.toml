@@ -9,7 +9,7 @@ description = "CleanNotes' shared core: notes, folders, accounts, the rich-text 
 cleanbucket = { path = "../bucket" }
 # CleanPassword's vault, which CleanNotes shows: its format, unlocking,
 # items, sync and one-time codes.
-cleanpassword-core = { git = "https://github.com/Mytherin/CleanPassword", rev = "f1ab2ab67427af16b53b4f6fb41a05e962543711" }
+cleanpassword-core = { git = "https://github.com/Mytherin/CleanPassword", rev = "bac4860bb2c1ab68ad0d7e53c5a41abc7de6f256" }
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

@@ -2102,6 +2102,9 @@ mod passwords_tests {
             kdf: vault::KdfParams::with_cost(8, 1),
             wrapped_key: String::new(),
             created: chrono::Utc::now(),
+            generation: 0,
+            key_mac: None,
+            previous_keys: Vec::new(),
         };
         let config = s3::Config { bucket: "b".into(), region: "us-east-1".into(), prefix: "CleanPassword".into(), endpoint: None, encrypted: false };
         vault::Found { account: "acct".into(), config, header, header_etag: String::new() }

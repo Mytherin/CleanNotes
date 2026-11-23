@@ -660,9 +660,14 @@ fn open_vault(found: &Found, secret: &str, password: &str, dir: Option<&Path>) -
     }
     let kept = dir.and_then(|d| std::fs::read_to_string(cache_path(d, &header.vault_id)?).ok());
     if let Some(kept) = kept {
-        let key = header.unwrap_key(password).map_err(|e| message(&e))?;
-        let key_b64 = Zeroizing::new(cleanpassword_core::crypto::b64(key.as_ref()));
-        if let Ok(mut vault) = Vault::unlock_with_key(&kept, &key_b64) {
+        // With vault.json as it is now: a master password changed on
+        // another device (which changes the vault key too) unlocks what this
+        // computer kept, and moves it to the new key.
+        let opened = Vault::unlock_with_header(&kept, header.clone(), etag.clone(), password);
+        if let Err(e @ VaultError::WrongPassword) = &opened {
+            return Err(message(e));
+        }
+        if let Ok(mut vault) = opened {
             if *vault.config() == config && vault.vault_id() == header.vault_id {
                 // The account's access key may have changed since.
                 vault.set_credentials(creds).map_err(|e| message(&e))?;

@@ -1068,6 +1068,9 @@ mod tests {
             kdf: passwords::KdfParams::with_cost(8, 1),
             wrapped_key: String::new(),
             created: chrono::Utc::now(),
+            generation: 0,
+            key_mac: None,
+            previous_keys: Vec::new(),
         };
         let config = cleannotes_core::sync::s3::Config {
             bucket: "b".into(),
