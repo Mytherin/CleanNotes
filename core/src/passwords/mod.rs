@@ -74,6 +74,10 @@ pub trait ItemExt {
     /// The name shown: the item's, or its first website's host, or its user
     /// name.
     fn title(&self) -> String;
+    /// What the lists show under its name: "Secure Note" for a note, the
+    /// key's type (`ssh-ed25519`, `ssh-rsa`…) for an SSH key, as in
+    /// CleanPassword, and otherwise its user name.
+    fn subtitle(&self) -> String;
     /// Whether every word of `query` is in its name, user name, websites,
     /// folder, notes, field names or passkeys' sites.
     fn matches(&self, query: &str) -> bool;
@@ -93,6 +97,20 @@ impl ItemExt for Item {
             return self.username.clone();
         }
         "Untitled".into()
+    }
+
+    fn subtitle(&self) -> String {
+        match self.kind {
+            ItemKind::Note => "Secure Note".into(),
+            ItemKind::SshKey => self
+                .fields
+                .iter()
+                .find(|f| f.name == cleanpassword_core::ssh::PUBLIC_KEY)
+                .and_then(|f| f.value.split_whitespace().next())
+                .unwrap_or("SSH key")
+                .to_owned(),
+            _ => self.username.clone(),
+        }
     }
 
     fn matches(&self, query: &str) -> bool {

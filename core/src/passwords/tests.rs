@@ -414,3 +414,15 @@ fn verification_codes() {
     assert_eq!(totp::spaced("287082"), "287 082");
     assert_eq!(totp::spaced("2B4C6"), "2B4C6");
 }
+
+#[test]
+fn subtitles_by_kind() {
+    let now = chrono::Utc::now();
+    let item = |data: ItemData| Item::new(data, now);
+    assert_eq!(item(login("GitHub", "https://github.com", "octocat", "pw")).subtitle(), "octocat");
+    assert_eq!(item(ItemData { kind: ItemKind::Note, name: "Wi-Fi".into(), ..Default::default() }).subtitle(), "Secure Note");
+    let public = Field { name: "Public key".into(), value: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA me@example.com".into(), hidden: false };
+    let key = |fields| item(ItemData { kind: ItemKind::SshKey, name: "Server".into(), fields, ..Default::default() });
+    assert_eq!(key(vec![public]).subtitle(), "ssh-ed25519", "the key's type, as in CleanPassword");
+    assert_eq!(key(Vec::new()).subtitle(), "SSH key");
+}

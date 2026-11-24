@@ -2032,8 +2032,7 @@ fn website_url(uri: &str) -> String {
 fn vault_row(i: &vault::Item, place: &VaultPlace) -> VaultRow {
     let subtitle = match place {
         VaultPlace::Deleted => i.deleted.map(dates::list_time).unwrap_or_default(),
-        _ if i.kind == vault::ItemKind::Note => "Secure Note".into(),
-        _ => i.username.clone(),
+        _ => i.subtitle(),
     };
     VaultRow {
         id: i.id.clone(),

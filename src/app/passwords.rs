@@ -462,8 +462,7 @@ impl App {
                 let sub = match (&view, totp::code_now(&i.totp)) {
                     (View::Codes, Some(c)) => format!("{}  ·  {}s", totp::spaced(&c.code), c.remaining),
                     (View::Deleted, _) => i.deleted.map(list_time).unwrap_or_default(),
-                    _ if i.kind == ItemKind::Note => "Secure Note".into(),
-                    _ => i.username.clone(),
+                    _ => i.subtitle(),
                 };
                 (i.id.clone(), i.title(), sub, i.uris.first().map(|u| u.uri.clone()))
             })
@@ -775,7 +774,8 @@ impl App {
                 let revealed = self.pw.revealed.clone();
                 let shown = |k: &str| revealed.contains(k);
 
-                if item.kind != ItemKind::Note || !item.username.is_empty() || !item.password.is_empty() {
+                // (Not for an item with none of them, such as an SSH key.)
+                if !item.username.is_empty() || !item.password.is_empty() || totp::code_now(&item.totp).is_some() {
                     group(ui, p, |ui| {
                         let mut first = true;
                         let mut sep = |ui: &mut Ui| {

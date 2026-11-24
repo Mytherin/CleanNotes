@@ -1039,7 +1039,7 @@ dependencies = [
 [[package]]
 name = "cleanpassword-core"
 version = "0.1.0"
-source = "git+https://github.com/Mytherin/CleanPassword?rev=bac4860bb2c1ab68ad0d7e53c5a41abc7de6f256#bac4860bb2c1ab68ad0d7e53c5a41abc7de6f256"
+source = "git+https://github.com/Mytherin/CleanPassword?rev=40597cc4dd6852895671c95f0fb1464f84bfe2ac#40597cc4dd6852895671c95f0fb1464f84bfe2ac"
 dependencies = [
  "aes",
  "argon2",
