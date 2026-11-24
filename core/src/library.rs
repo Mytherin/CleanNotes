@@ -1692,9 +1692,11 @@ impl Library {
         !self.lock.unlocked.is_empty()
     }
 
-    /// Whether a password for locked notes has been chosen.
+    /// Whether a password for locked notes has been chosen: on this device,
+    /// or on another one whose locked notes synced here (this device then
+    /// learns it from them, see [`Library::adopt_password`]).
     pub fn has_lock_password(&self) -> bool {
-        self.settings.lock_check.is_some()
+        self.settings.lock_check.is_some() || self.store.notes.iter().any(|n| lock::is_locked(&n.body))
     }
 
     /// The user did something: unlocked notes stay open another while.
@@ -1793,7 +1795,9 @@ impl Library {
         if ids.is_empty() {
             return LockNote::Locked;
         }
-        if self.settings.lock_check.is_none() {
+        // Locked notes synced from another device: their password, not a
+        // new one, so an account's notes don't end up with two.
+        if !self.has_lock_password() {
             return LockNote::ChoosePassword;
         }
         let Some((k, salt)) = self.current_keys() else { return LockNote::EnterPassword };
@@ -1878,6 +1882,9 @@ impl Library {
         if password.is_empty() {
             return Err("Enter a password.".into());
         }
+        if self.has_lock_password() {
+            return Err("Locked notes already have a password: enter it, or change it in Settings.".into());
+        }
         let salt = lock::new_salt();
         let k = lock::derive(password, &salt).map_err(|e| e.to_string())?;
         let check = lock::seal(&k, &salt, CHECK);
@@ -1908,12 +1915,17 @@ impl Library {
         let k = lock::derive(password, &salt).map_err(|e| e.to_string())?;
         let mut by_salt: HashMap<String, Option<Keys>> = HashMap::new();
         let mut changed = 0;
+        // Locked notes the old password doesn't open (locked with another
+        // one on another device, by an older version): left as they are.
+        let mut other = 0;
         let ids: Vec<String> = self.store.notes.iter().filter(|n| lock::is_locked(&n.body)).map(|n| n.id.clone()).collect();
         for id in ids {
             let Some(env) = self.store.note(&id).and_then(|n| lock::parse(&n.body)) else { continue };
             let ok = by_salt.entry(env.salt.clone()).or_insert_with(|| lock::derive_for(old, &env).ok()).clone();
-            let Some(ok) = ok else { continue };
-            let Ok(text) = lock::open(&ok, &env) else { continue };
+            let Some(text) = ok.and_then(|ok| lock::open(&ok, &env).ok()) else {
+                other += 1;
+                continue;
+            };
             let sealed = lock::seal(&k, &salt, &text);
             if let Some(n) = self.store.note_mut(&id) {
                 n.body = lock::locked_body(&text, &sealed);
@@ -1929,17 +1941,51 @@ impl Library {
         self.lock.current = Some(password.to_owned());
         self.lock.unlocked.clear();
         self.open_all();
-        self.push_notice(format!("Password changed for {changed} locked note{}.", if changed == 1 { "" } else { "s" }));
+        let others = match other {
+            0 => String::new(),
+            1 => " A locked note has a different password and wasn't changed.".to_owned(),
+            n => format!(" {n} locked notes have a different password and weren't changed."),
+        };
+        self.push_notice(format!("Password changed for {changed} locked note{}.{others}", if changed == 1 { "" } else { "s" }));
         Ok(changed)
     }
 
-    /// Checks a password against the settings' check.
+    /// Checks a password against the settings' check (or, without one, the
+    /// locked notes synced here).
     fn check_password(&mut self, password: &str) -> Result<Keys, String> {
-        let check = self.settings.lock_check.as_deref().and_then(|c| lock::decode(c).ok()).ok_or("No password is set.")?;
+        let Some(check) = self.settings.lock_check.as_deref().and_then(|c| lock::decode(c).ok()) else {
+            return self.adopt_password(password);
+        };
         let k = lock::derive_for(password, &check).map_err(|e| e.to_string())?;
         lock::open(&k, &check).map_err(|_| format!("Wrong password.{}", self.hint_suffix()))?;
         self.lock.keys.insert(check.salt.clone(), k.clone());
         Ok(k)
+    }
+
+    /// A device without a check of its own but with locked notes (synced
+    /// from another device): the password is the one that opens them, and
+    /// the check is made with the salt of the note it opened, as
+    /// [`Library::unlock`] does, so notes locked here get the same password.
+    fn adopt_password(&mut self, password: &str) -> Result<Keys, String> {
+        let mut notes: Vec<&Note> = self.store.notes.iter().filter(|n| lock::is_locked(&n.body)).collect();
+        if notes.is_empty() {
+            return Err("No password is set.".into());
+        }
+        // The newest first, each salt once (notes locked together share
+        // theirs), and only a few: every try is slow on purpose.
+        notes.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let mut salts = HashSet::new();
+        let envs: Vec<lock::Envelope> = notes.iter().filter_map(|n| lock::parse(&n.body)).filter(|e| salts.insert(e.salt.clone())).take(3).collect();
+        for env in envs {
+            let Ok(k) = lock::derive_for(password, &env) else { continue };
+            if lock::open(&k, &env).is_ok() {
+                let check = lock::seal(&k, &env.salt(), CHECK);
+                self.settings.lock_check = Some(lock::encode(&check));
+                self.lock.keys.insert(env.salt.clone(), k.clone());
+                return Ok(k);
+            }
+        }
+        Err(format!("Wrong password.{}", self.hint_suffix()))
     }
 
     /// Re-encrypts an unlocked note's edited text. `None` if `id` isn't a
@@ -2384,6 +2430,54 @@ mod tests {
         // Editing a locked note is a change.
         assert_eq!(lib.set_body(&a, "# Secret\n\nmore\n"), BodySet::Changed);
         assert!(when(&lib, &a) > wa);
+    }
+
+    #[test]
+    fn a_new_device_locks_with_the_password_its_synced_notes_have() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let a = add(&mut lib, &home, "# Old\n");
+        let b = add(&mut lib, &home, "# New\n");
+        lib.set_password("pw", "").unwrap();
+        assert_eq!(lib.lock_note(&a), LockNote::Locked);
+        // Another device: the locked note synced, the settings (and their
+        // check) didn't.
+        lib.lock_now();
+        lib.settings.lock_check = None;
+        assert!(lib.has_lock_password());
+        assert_eq!(lib.lock_note(&b), LockNote::EnterPassword, "not a new password");
+        assert!(lib.set_password("other", "").is_err());
+        assert!(lib.enter_password("other").unwrap_err().starts_with("Wrong password."));
+        assert!(lib.settings.lock_check.is_none());
+        lib.enter_password("pw").unwrap();
+        assert!(lib.settings.lock_check.is_some());
+        assert_eq!(lib.lock_note(&b), LockNote::Locked);
+        // Both open with the one password.
+        lib.lock_now();
+        lib.unlock(&b, "pw").unwrap();
+        assert!(!lib.is_closed(&a) && !lib.is_closed(&b));
+    }
+
+    #[test]
+    fn changing_the_password_tells_of_notes_with_another_one() {
+        let (mut lib, _d) = lib();
+        let home = lib.default_folder_id(LOCAL);
+        let b = add(&mut lib, &home, "# B\n");
+        lib.set_password("two", "").unwrap();
+        assert_eq!(lib.lock_note(&b), LockNote::Locked);
+        // A note locked with another password (by an older version, on
+        // another device) synced here.
+        let salt = lock::new_salt();
+        let env = lock::seal(&lock::derive("one", &salt).unwrap(), &salt, "# A\n");
+        let a = add(&mut lib, &home, &lock::locked_body("# A\n", &env));
+        lib.take_notices();
+        assert_eq!(lib.change_password("two", "three", ""), Ok(1));
+        assert_eq!(
+            lib.take_notices(),
+            vec!["Password changed for 1 locked note. A locked note has a different password and wasn't changed.".to_owned()]
+        );
+        // Still opens with its own.
+        lib.unlock(&a, "one").unwrap();
     }
 
     #[test]
