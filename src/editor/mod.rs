@@ -100,6 +100,17 @@ enum MenuChoice {
     Paste,
 }
 
+/// A choice in a picture's menu.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PictureChoice {
+    Open,
+    SaveAs,
+    Copy,
+    Cut,
+    Paste,
+    Delete,
+}
+
 /// The "Add Link" sheet.
 pub struct LinkSheet {
     pub url: String,
@@ -125,6 +136,9 @@ pub struct Editor {
     pdf_thumbs: std::collections::HashSet<String>,
     /// The attached file (its paragraph) right-clicked: its menu is shown.
     file_menu: Option<usize>,
+    /// The picture right-clicked (where it is in the note, and its
+    /// reference): its menu is shown, not the text's.
+    image_menu: Option<(Pos, String)>,
     pub rename_sheet: Option<RenameSheet>,
     /// What ⌃K last cut (⌃Y puts it back), as on macOS.
     kill: String,
@@ -219,7 +233,7 @@ impl Editor {
     }
 
     fn wrap(ed: Editing) -> Editor {
-        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, rename_sheet: None, kill: String::new(), kill_at: None, scroll_request: None, last_press: None, drag_unit: None, pointer_hidden: false, tab: None }
+        Editor { ed, goal_x: None, laid: Vec::new(), link_sheet: None, last_activity: 0.0, dragging: false, focus_requested: false, pdf_scroll: Default::default(), pdf_thumbs: Default::default(), file_menu: None, image_menu: None, rename_sheet: None, kill: String::new(), kill_at: None, scroll_request: None, last_press: None, drag_unit: None, pointer_hidden: false, tab: None }
     }
 
     pub fn id(&self) -> egui::Id {
@@ -275,6 +289,14 @@ impl Editor {
     /// The picture under a point, if any.
     fn image_at(&self, pt: Pos2) -> Option<&layout::LaidImage> {
         self.laid.iter().flat_map(|l| &l.images).find(|img| img.rect.contains(pt))
+    }
+
+    /// The picture under a point, if any: where it is in the note (its
+    /// character) and its reference.
+    fn image_pos_at(&self, pt: Pos2) -> Option<(Pos, String)> {
+        self.laid.iter().enumerate().find_map(|(i, l)| {
+            l.images.iter().enumerate().find(|(_, img)| img.rect.contains(pt)).map(|(j, img)| (Pos::new(i, j), img.name.clone()))
+        })
     }
 
     /// The attached file's card under a point, if any, and its paragraph.
@@ -1171,7 +1193,12 @@ impl Editor {
         if resp.secondary_clicked() {
             // On an attached file's card: its menu, not the text's.
             self.file_menu = pointer.and_then(|pt| self.card_at(pt)).map(|(i, _)| i);
-            if let Some(pt) = pointer.filter(|_| self.file_menu.is_none()) {
+            // On a picture: its menu, and the picture selected (as on macOS),
+            // so it's clear what the menu acts on.
+            self.image_menu = pointer.filter(|_| self.file_menu.is_none()).and_then(|pt| self.image_pos_at(pt));
+            if let Some((at, _)) = &self.image_menu {
+                self.sel = Selection { anchor: *at, caret: Pos::new(at.block, at.offset + 1) };
+            } else if let Some(pt) = pointer.filter(|_| self.file_menu.is_none()) {
                 let at = self.pos_at(pt);
                 if self.sel.is_empty() || at < self.sel.start() || at > self.sel.end() {
                     // On a word: the word, as on macOS (for Look Up, Cut…).
@@ -1432,6 +1459,60 @@ impl Editor {
         }
     }
 
+    /// A picture's menu, as a browser's.
+    fn picture_menu(ui: &mut egui::Ui, editable: bool) -> Option<PictureChoice> {
+        menu::begin(ui, 220.0);
+        let mut choice = None;
+        let mut item = |ui: &mut egui::Ui, label: &str, icon: Icon, enabled: bool, c: PictureChoice| {
+            if menu::item(label).icon(icon).enabled(enabled).show(ui).clicked() {
+                choice = Some(c);
+            }
+        };
+        item(ui, "Open Image", Icon::OpenApp, true, PictureChoice::Open);
+        item(ui, "Save Image As…", Icon::Share, true, PictureChoice::SaveAs);
+        item(ui, "Copy Image", Icon::Copy, true, PictureChoice::Copy);
+        menu::separator(ui);
+        item(ui, "Cut", Icon::Cut, editable, PictureChoice::Cut);
+        item(ui, "Paste", Icon::Paste, editable, PictureChoice::Paste);
+        item(ui, "Delete Image", Icon::Trash, editable, PictureChoice::Delete);
+        choice
+    }
+
+    /// Does what was chosen in the menu of the picture at `at` (reference
+    /// `name`). If the note changed under the menu, so that the picture
+    /// isn't there any more, nothing is done.
+    fn apply_picture_choice(&mut self, ctx: &egui::Context, at: Pos, name: &str, choice: PictureChoice, opts: &Options, out: &mut Output) {
+        let here = self.laid.get(at.block).and_then(|l| l.images.get(at.offset)).is_some_and(|img| img.name == name);
+        if !here {
+            return;
+        }
+        // (What the app names the file; it adds the picture's extension.)
+        let label = "Image".to_owned();
+        let editable = !opts.read_only;
+        let picture = Selection { anchor: at, caret: Pos::new(at.block, at.offset + 1) };
+        match choice {
+            PictureChoice::Open => out.file_action = Some((FileAction::Open, name.to_owned(), label)),
+            PictureChoice::SaveAs => out.file_action = Some((FileAction::SaveAs, name.to_owned(), label)),
+            PictureChoice::Copy => out.copy_images = vec![name.to_owned()],
+            PictureChoice::Cut if editable => {
+                self.sel = picture;
+                self.copy(ctx, out);
+                self.delete_selected();
+            }
+            PictureChoice::Delete if editable => {
+                self.sel = picture;
+                self.delete_selected();
+            }
+            // In place of the picture, as Paste does with a selection.
+            PictureChoice::Paste if editable => {
+                self.sel = picture;
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                out.paste_image = opts.can_attach;
+            }
+            _ => out.blocked_edit = true,
+        }
+    }
+
     /// The ⌄ on each card: its menu, on a click.
     fn card_menus(&mut self, ui: &mut egui::Ui, opts: &Options, out: &mut Output) {
         let editable = !opts.read_only;
@@ -1461,6 +1542,16 @@ impl Editor {
             if let Some(choice) = chosen {
                 self.apply_menu_choice(ctx, block, choice, opts, out);
                 self.file_menu = None;
+            }
+            return;
+        }
+        // Right-clicked on a picture: its menu.
+        if let Some((at, name)) = self.image_menu.clone() {
+            let mut chosen = None;
+            resp.context_menu(|ui| chosen = Self::picture_menu(ui, !opts.read_only));
+            if let Some(choice) = chosen {
+                self.apply_picture_choice(ctx, at, &name, choice, opts, out);
+                self.image_menu = None;
             }
             return;
         }
@@ -1816,6 +1907,65 @@ mod tests {
         let mut out = Output::default();
         e.apply_menu_choice(&ctx, 1, MenuChoice::Cut, &ro, &mut out);
         assert!(out.blocked_edit && out.file_action.is_none() && e.take_markdown().is_none());
+    }
+
+    #[test]
+    fn a_right_clicked_picture_has_a_menu_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (cleannotes_core::attachments::name_for(b"one", "png"), cleannotes_core::attachments::name_for(b"two", "jpg"));
+        let mut e = Editor::new("n", &format!("day\n![](attachments/{a})![](attachments/{b})\nafter\n"));
+        let cache = (images::ImageCache::new(dir.path().to_owned()), pdfs::PdfCache::new(dir.path().to_owned()));
+        let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache.0, pdfs: &cache.1, can_attach: true };
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut frame = |e: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 1400.0))), events, ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let p = crate::theme::Palette::get(ctx);
+                    e.show(ui, &p, &opts, "");
+                });
+            });
+        };
+        frame(&mut e, vec![]);
+        // Right-clicked on the second picture: it's selected, its menu shown.
+        let at = e.laid[1].images[1].rect.center();
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        frame(&mut e, vec![egui::Event::PointerMoved(at), button(true)]);
+        frame(&mut e, vec![button(false)]);
+        assert_eq!(e.image_menu, Some((Pos::new(1, 1), b.clone())));
+        assert_eq!(e.sel, Selection { anchor: Pos::new(1, 1), caret: Pos::new(1, 2) });
+        // On text: the text's menu.
+        let text = e.laid[2].rect.left_center() + Vec2::new(4.0, 0.0);
+        let button = |pressed| egui::Event::PointerButton { pos: text, button: egui::PointerButton::Secondary, pressed, modifiers: Default::default() };
+        frame(&mut e, vec![egui::Event::PointerMoved(text), button(true)]);
+        frame(&mut e, vec![button(false)]);
+        assert!(e.image_menu.is_none());
+
+        // The choices.
+        let ctx = egui::Context::default();
+        let mut out = Output::default();
+        e.apply_picture_choice(&ctx, Pos::new(1, 1), &b, PictureChoice::SaveAs, &opts, &mut out);
+        assert_eq!(out.file_action, Some((FileAction::SaveAs, b.clone(), "Image".to_owned())));
+        e.apply_picture_choice(&ctx, Pos::new(1, 1), &b, PictureChoice::Open, &opts, &mut out);
+        assert_eq!(out.file_action, Some((FileAction::Open, b.clone(), "Image".to_owned())));
+        e.apply_picture_choice(&ctx, Pos::new(1, 0), &a, PictureChoice::Copy, &opts, &mut out);
+        assert_eq!(out.copy_images, vec![a.clone()]);
+        // Not in a deleted note; nor for a picture no longer where it was.
+        let ro = Options { read_only: true, ..opts };
+        let mut out = Output::default();
+        e.apply_picture_choice(&ctx, Pos::new(1, 1), &b, PictureChoice::Delete, &ro, &mut out);
+        assert!(out.blocked_edit && e.take_markdown().is_none());
+        e.apply_picture_choice(&ctx, Pos::new(1, 1), &a, PictureChoice::Delete, &opts, &mut out);
+        assert!(e.take_markdown().is_none());
+        // Cut: on the clipboard, and gone; Delete: gone.
+        let mut out = Output::default();
+        e.apply_picture_choice(&ctx, Pos::new(1, 1), &b, PictureChoice::Cut, &opts, &mut out);
+        assert_eq!(out.copy_images, vec![b.clone()]);
+        let md = e.take_markdown().unwrap();
+        assert!(md.contains(&a) && !md.contains(&b), "{md}");
+        e.apply_picture_choice(&ctx, Pos::new(1, 0), &a, PictureChoice::Delete, &opts, &mut out);
+        assert!(!e.take_markdown().unwrap().contains(&a));
     }
 
     #[test]
