@@ -1918,7 +1918,7 @@ mod tests {
         let opts = Options { text_size: 15.0, sort_checked: false, read_only: false, highlight: "", images: &cache.0, pdfs: &cache.1, can_attach: true };
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
-        let mut frame = |e: &mut Editor, events: Vec<egui::Event>| {
+        let frame = |e: &mut Editor, events: Vec<egui::Event>| {
             let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 1400.0))), events, ..Default::default() };
             let _ = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
