@@ -161,7 +161,14 @@ impl App {
             self.push_notice(format!("{label} can't be saved: it isn't on this device yet."));
             return;
         };
-        let Some(path) = rfd::FileDialog::new().set_title("Save As").set_file_name(label.trim()).save_file() else { return };
+        // A picture's label ("Image") has no extension: its type's.
+        let mut file = label.trim().to_owned();
+        if std::path::Path::new(&file).extension().is_none() {
+            if let Some(ext) = cleannotes_core::attachments::image_ext(&data) {
+                file = format!("{file}.{ext}");
+            }
+        }
+        let Some(path) = rfd::FileDialog::new().set_title("Save As").set_file_name(&file).save_file() else { return };
         if let Err(e) = std::fs::write(&path, data) {
             self.push_notice(format!("{label} can't be saved: {e}."));
         }
