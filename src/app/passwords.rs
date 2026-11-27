@@ -489,7 +489,7 @@ impl App {
             }
             x += 40.0;
         }
-        let title = truncate(&view_title(&view), bar.right() - x - 16.0, ui);
+        let title = truncate(&view_title(&view), bar.right() - x - 16.0, theme::bold_font(15.0), ui);
         ui.painter().text(Pos2::new(x, y - 8.0), Align2::LEFT_CENTER, title, theme::bold_font(15.0), p.text);
         let n = rows.len();
         let count = if !unlocked {
@@ -548,8 +548,8 @@ impl App {
                 let subc = if active { theme::blend(p.selection, p.selection_text, 0.6) } else { p.secondary };
                 let x = inner.left() + 52.0;
                 let w = inner.right() - x - 10.0;
-                painter.text(Pos2::new(x, rect.center().y - 9.0), Align2::LEFT_CENTER, truncate(title, w, ui), theme::bold_font(13.5), text);
-                painter.text(Pos2::new(x, rect.center().y + 10.0), Align2::LEFT_CENTER, truncate(sub, w, ui), theme::font(12.5), subc);
+                painter.text(Pos2::new(x, rect.center().y - 9.0), Align2::LEFT_CENTER, truncate(title, w, theme::bold_font(13.5), ui), theme::bold_font(13.5), text);
+                painter.text(Pos2::new(x, rect.center().y + 10.0), Align2::LEFT_CENTER, truncate(sub, w, theme::font(12.5), ui), theme::font(12.5), subc);
                 if self.pw.selected.as_deref() == Some(id) && self.scroll_list {
                     ui.scroll_to_rect(rect, None);
                 }

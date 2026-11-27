@@ -438,7 +438,7 @@ impl App {
         let font = theme::font(14.0);
         let galley = painter.layout(label.to_owned(), font.clone(), text_color, max_w.max(10.0));
         let galley = if galley.rows.len() > 1 {
-            painter.layout_no_wrap(truncate(label, max_w, ui), font, text_color)
+            painter.layout_no_wrap(truncate(label, max_w, font.clone(), ui), font, text_color)
         } else {
             galley
         };
@@ -496,9 +496,9 @@ impl App {
     }
 }
 
-/// Text cut to fit `max_w` with an ellipsis.
-pub fn truncate(text: &str, max_w: f32, ui: &Ui) -> String {
-    let font = theme::font(13.5);
+/// Text cut to fit `max_w` with an ellipsis, measured in the `font` it is
+/// painted in (bold runs wider than regular, more so on some platforms).
+pub fn truncate(text: &str, max_w: f32, font: egui::FontId, ui: &Ui) -> String {
     let w = |s: &str| ui.painter().layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE).size().x;
     if w(text) <= max_w {
         return text.to_owned();

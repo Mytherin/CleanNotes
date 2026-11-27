@@ -41,7 +41,7 @@ impl App {
         }
         let n = self.shown.len();
         let max_w = (more_x - 24.0 - x).max(40.0);
-        let title = truncate(&self.location_title(), max_w, ui);
+        let title = truncate(&self.location_title(), max_w, theme::bold_font(15.0), ui);
         ui.painter().text(Pos2::new(x, y - 8.0), Align2::LEFT_CENTER, title, theme::bold_font(15.0), p.text);
         let noun = if self.location.is_tabs() { "tab" } else { "note" };
         let count = if n == 1 { format!("1 {noun}") } else { format!("{n} {noun}s") };
@@ -179,7 +179,7 @@ impl App {
             w -= side + 8.0;
         }
         let painter = ui.painter();
-        let title_line = truncate(&title, w, ui);
+        let title_line = truncate(&title, w, theme::bold_font(13.5), ui);
         painter.text(Pos2::new(x, rect.top() + 18.0), Align2::LEFT_CENTER, title_line, theme::bold_font(13.5), text);
         let tg = painter.layout_no_wrap(time.clone(), theme::bold_font(12.5), text);
         let tw = tg.size().x;
@@ -189,7 +189,7 @@ impl App {
             crate::icons::paint(painter, Icon::Lock, Rect::from_center_size(Pos2::new(sx + 5.0, rect.top() + 38.0), Vec2::splat(11.0)), sub);
             sx += 14.0;
         }
-        let snip = truncate(&snippet, w - tw - 8.0 - (sx - x - tw - 7.0), ui);
+        let snip = truncate(&snippet, w - tw - 8.0 - (sx - x - tw - 7.0), theme::font(12.5), ui);
         painter.text(Pos2::new(sx, rect.top() + 38.0), Align2::LEFT_CENTER, snip, theme::font(12.5), sub);
         if let Some(f) = folder {
             crate::icons::paint(painter, Icon::Folder, Rect::from_center_size(Pos2::new(x + 6.0, rect.top() + 58.0), Vec2::splat(12.0)), sub);
@@ -404,11 +404,11 @@ impl App {
         }
         let title = tab.as_ref().map_or_else(|| n.title(), |t| t.title.clone());
         let title = if title.is_empty() { "New Note".to_owned() } else { title };
-        let t = truncate(&title, r.width(), ui);
+        let t = truncate(&title, r.width(), theme::bold_font(12.5), ui);
         painter.text(Pos2::new(r.center().x, r.bottom() + 14.0), Align2::CENTER_CENTER, t, theme::bold_font(12.5), p.text);
         // A website says where it is; a note when it was edited.
         let sub = match &tab {
-            Some(t) => truncate(&super::tabs::site(t), r.width(), ui),
+            Some(t) => truncate(&super::tabs::site(t), r.width(), theme::font(11.5), ui),
             None => list_time(n.modified),
         };
         painter.text(Pos2::new(r.center().x, r.bottom() + 31.0), Align2::CENTER_CENTER, sub, theme::font(11.5), p.secondary);

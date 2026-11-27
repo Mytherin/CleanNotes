@@ -55,7 +55,7 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
         let painter = ui.painter();
         let title = if several { format!("CleanTabs · {owner}") } else { "CleanTabs".to_owned() };
-        let title = truncate(&title, rect.width() - 50.0, ui);
+        let title = truncate(&title, rect.width() - 50.0, theme::bold_font(12.0), ui);
         painter.text(Pos2::new(rect.left() + 16.0, rect.center().y + 2.0), Align2::LEFT_CENTER, title, theme::bold_font(12.0), p.secondary);
         let right = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.center().y + 2.0), Vec2::splat(12.0));
         let error = self.lib.sync_errors.get(account).cloned();
@@ -233,7 +233,7 @@ pub fn card(ui: &mut Ui, p: &Palette, note_id: &str, tab: &TabNote, header: &str
     let title_h = title.size().y;
     painter.galley(Pos2::new(left, y), title, p.text);
     y += title_h + 6.0;
-    let address = truncate(&tabs::short_url(&tab.url), width - 22.0, ui);
+    let address = truncate(&tabs::short_url(&tab.url), width - 22.0, theme::font(13.5), ui);
     icons::paint(&painter, Icon::Link, Rect::from_center_size(Pos2::new(left + 7.0, y + 9.0), Vec2::splat(13.0)), p.secondary);
     painter.text(Pos2::new(left + 20.0, y + 9.0), Align2::LEFT_CENTER, address, theme::font(13.5), p.secondary);
     y += 18.0 + 14.0;

@@ -247,7 +247,7 @@ impl App {
             painter.rect(r, 10.0, p.card, egui::Stroke::new(1.0_f32, p.separator));
             if i == 0 {
                 let title = self.lib.store.note(&self.multi[0]).map(|n| n.title()).unwrap_or_default();
-                let t = super::sidebar::truncate(&title, 100.0, ui);
+                let t = super::sidebar::truncate(&title, 100.0, theme::bold_font(10.5), ui);
                 painter.text(r.left_top() + Vec2::new(10.0, 14.0), Align2::LEFT_CENTER, t, theme::bold_font(10.5), p.text);
                 for k in 0..5 {
                     let y = r.top() + 32.0 + k as f32 * 12.0;
